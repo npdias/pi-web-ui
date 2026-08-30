@@ -723,29 +723,40 @@ wss.on("connection", (ws) => {
 				void cs.saveCommands(msg.commands);
 				break;
 			case "set_goal":
+			case "clear_goal":
+			case "start_goal_wizard":
+			case "set_goal_prefs":
+				if (process.env.PI_WEB_ENABLE_LEGACY_GOAL_REVIEW !== "1") {
+					break;
+				}
+				if (msg.type === "set_goal") {
 				void cs.setGoal(msg.goal, {
 					reviewModel: msg.reviewModel,
 					maxRounds: msg.maxRounds,
 					locked: msg.locked,
 				});
 				break;
-			case "clear_goal":
+				}
+				if (msg.type === "clear_goal") {
 				void cs.clearGoal();
 				break;
-			case "start_goal_wizard":
+				}
+				if (msg.type === "start_goal_wizard") {
 				void cs.startGoalWizard(msg.text, {
 					wizardModel: msg.wizardModel,
 					maxRounds: msg.maxRounds,
 					locked: msg.locked,
 				});
 				break;
-			case "set_goal_prefs":
+				}
+				if (msg.type === "set_goal_prefs") {
 				void cs.setGoalPrefs({
 					reviewModel: msg.reviewModel,
 					maxRounds: msg.maxRounds,
 					locked: msg.locked,
 				});
 				break;
+				}
 			case "get_settings":
 				cs.pushSettings();
 				break;

@@ -23,6 +23,10 @@ import {
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 import type { GoalStatus, ServerMessage } from "./protocol.js";
+
+/** Legacy Goal Review stays off until a migration explicitly opts in. */
+export const legacyGoalReviewEnabled = (): boolean =>
+	process.env.PI_WEB_ENABLE_LEGACY_GOAL_REVIEW === "1";
 import type { ClientStateStore } from "./client-state.js";
 import { parseModelSpec } from "./attachments.js";
 import type { WebUIContext } from "./webui-context.js";
@@ -673,6 +677,7 @@ export class GoalService {
 	 * notice text for the host to emit (manual-stop case), or null.
 	 */
 	onAgentEnd(conv: GoalConversation, aborted: boolean): string | null {
+		if (!legacyGoalReviewEnabled()) return null;
 		const g = conv.goal;
 		if (aborted) {
 			if (g.goal && g.conversationId === conv.id) {
