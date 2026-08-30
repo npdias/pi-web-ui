@@ -437,6 +437,7 @@ try {
 
 	// -- settings: pick a specific vision model ------------------------------
 	// settings_state must carry the vision-bridge fields + the model picker list
+	c.send({ type: "get_settings" });
 	const ss = await c.waitFor(
 		"settings_state",
 		10000,
