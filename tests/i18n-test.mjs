@@ -81,6 +81,7 @@ async function main() {
 	await page.waitForSelector(".brand", { timeout: 5000 });
 	const enNewChat = await page.locator(".topbar .newchat span").textContent();
 	check(`UI starts in English ("New chat")`, enNewChat?.includes("New chat"));
+	check("document title is English", (await page.title()) === "pi-web-ui — pi coding agent");
 	const enTab = await page
 		.locator(".view-switch button span")
 		.first()
@@ -150,6 +151,7 @@ async function main() {
 		"mobile More has no upstream GitHub link",
 		(await mobileMenu.locator('a[href*="xing-shuyin/pi-web-ui"]').count()) === 0,
 	);
+	check("mobile theme labels contain no CJK", !/[\u3400-\u9fff]/.test(mobileMenuText ?? ""));
 
 	const errs = consoleErrors.filter(
 		(e) => !e.includes("favicon") && !e.includes("ResizeObserver"),
