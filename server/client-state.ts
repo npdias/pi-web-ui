@@ -27,7 +27,7 @@ export interface ClientSettings {
 	terminalBash: boolean;
 	/** 接管模式下 bash 的静默解阻阈值（毫秒，默认 15000；0 = 一直等到结束）。 */
 	terminalBashIdleMs: number;
-	/** Vision bridge on/off (default on). Off → images are sent as-is. */
+	/** Vision bridge on/off (default off). Off → images are sent as-is. */
 	visionBridgeEnabled: boolean;
 	/** Preferred vision model as "provider/id", or null = auto-detect first. */
 	visionBridgeModel: string | null;
@@ -287,7 +287,7 @@ export class ClientStateStore {
 			terminalBashIdleMs: s?.settings?.terminalBashIdleMs ?? 15_000,
 			thinkingWrap: s?.settings?.thinkingWrap ?? false,
 			toolsWrap: s?.settings?.toolsWrap ?? true,
-			visionBridgeEnabled: s?.settings?.visionBridgeEnabled ?? true,
+			visionBridgeEnabled: s?.settings?.visionBridgeEnabled ?? false,
 			visionBridgeModel: s?.settings?.visionBridgeModel ?? null,
 			visionBridgePromptMode:
 				s?.settings?.visionBridgePromptMode === "replace" ? "replace" : "append",
@@ -317,7 +317,7 @@ export class ClientStateStore {
 			thinkingWrap: settings.thinkingWrap ?? cur.thinkingWrap ?? false,
 			toolsWrap: settings.toolsWrap ?? cur.toolsWrap ?? true,
 			visionBridgeEnabled:
-				settings.visionBridgeEnabled ?? cur.visionBridgeEnabled ?? true,
+				settings.visionBridgeEnabled ?? cur.visionBridgeEnabled ?? false,
 			visionBridgeModel: settings.visionBridgeModel ?? cur.visionBridgeModel ?? null,
 			visionBridgePromptMode:
 				settings.visionBridgePromptMode ??

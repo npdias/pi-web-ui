@@ -2,23 +2,23 @@
 
 # 💬 pi-web-ui
 
-**English** | [Chinese (Simplified)](https://github.com/xing-shuyin/pi-web-ui/blob/main/README.zh-CN.md)
+**English**
 
 *The polished browser cockpit for the [pi coding agent](https://pi.dev).*
 
 <p>
   <a href="https://www.npmjs.com/package/pi-web-ui"><img src="https://img.shields.io/npm/v/pi-web-ui?color=cb3837&logo=npm&label=pi-web-ui" alt="npm version"></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/node/v/pi-web-ui?logo=node.js&logoColor=white" alt="Node.js"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/xing-shuyin/pi-web-ui" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/npdias/pi-web-ui" alt="License"></a>
   <a href="https://www.npmjs.com/package/pi-web-ui"><img src="https://img.shields.io/npm/dm/pi-web-ui?label=downloads" alt="npm downloads"></a>
-  <a href="https://github.com/xing-shuyin/pi-web-ui/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/xing-shuyin/pi-web-ui/ci.yml?branch=main&label=CI" alt="CI status"></a>
-  <a href="https://github.com/xing-shuyin/pi-web-ui/stargazers"><img src="https://img.shields.io/github/stars/xing-shuyin/pi-web-ui?style=social" alt="GitHub stars"></a>
-  <a href="https://github.com/xing-shuyin/pi-web-ui/fork"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat" alt="PRs welcome"></a>
+  <a href="https://github.com/npdias/pi-web-ui/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/npdias/pi-web-ui/ci.yml?branch=main&label=CI" alt="CI status"></a>
+  <a href="https://github.com/npdias/pi-web-ui/stargazers"><img src="https://img.shields.io/github/stars/npdias/pi-web-ui?style=social" alt="GitHub stars"></a>
+  <a href="https://github.com/npdias/pi-web-ui/fork"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat" alt="PRs welcome"></a>
 </p>
 
 Stream conversations, inspect tool calls, manage files, and run your workspace — all from one place.
 
-![Git source control panel](https://raw.githubusercontent.com/xing-shuyin/pi-web-ui/main/assets/shot4.jpeg)
+![Git source control panel](assets/shot4.jpeg)
 
 </div>
 
@@ -72,7 +72,7 @@ theme switching, and a full settings panel — tuned for daily development.
 
 - Three attachment modes: `inline` (≤12 KB), `reference` (path only), `lines` (selected ranges) — over-limit ones degrade automatically.
 - Paste / drag-drop / upload images — resized client-side and sent as image content when the model supports vision (warning otherwise).
-- **Vision bridge** — when the current model is text-only, images are transcribed into text evidence by an auto-discovered vision model (cached per batch; model & on/off configurable in Settings).
+- **Vision bridge** — off by default; opt in from Settings when a text-only model needs image transcription.
 - Attach arbitrary files without a workspace path — stored in a global uploads dir, inlined when small, referenced by absolute path otherwise.
 - File preview — line numbers, click/drag/Shift selection (add to chat as `lines`), GBK fallback decoding, binary hex view, media preview over HTTP with Range support, and a download button.
 - Live file tree — the server watches the listed directory (`fs.watch`) and re-lists on change; oversized directories show a truncation warning.
@@ -90,12 +90,6 @@ theme switching, and a full settings panel — tuned for daily development.
 - First-run setup wizard.
 - Settings panel — system prompt (append or replace), toggle skills/extensions on/off with immediate effect, save/apply/delete settings presets, and vision-bridge model & switch.
 
-### 🎯 Goal mode
-
-- Goal bar — set a target with a review model, max rounds and a lock switch.
-- Goal wizard (**AI Refine**) — turns a raw request into a concrete goal through a guided questionnaire.
-- Automatic review loop — after each turn an independent review session checks the goal against the final text and `git diff HEAD`; on fail the feedback is injected as steer until it passes (or the round cap is hit).
-
 ### ⚙️ Background tasks
 
 - Background-task panel — servers launched by the agent are detected via port snapshots and listed (port/pid/name); stop one or kill all.
@@ -108,24 +102,23 @@ theme switching, and a full settings panel — tuned for daily development.
 - WebSocket Origin/Host same-authority check — cross-origin pages are rejected (403); `PI_WEB_ALLOW_ORIGINS` whitelist for reverse proxies.
 - Quiesce drain mode via a local control socket (`server status|quiesce|unquiesce`).
 - Credentials stay server-side — provider headers are never sent to the browser.
-- Sound alerts, Chinese/English UI, and a recent-projects list (click to switch workspace).
+- Sound alerts and a recent-projects list (click to switch workspace).
 
-### 🚢 Deploy & update
+### 🚢 Deploy
 
 - Foreground, global npm install, Docker (docker-compose), macOS launchd, Linux systemd, Windows Task Scheduler, and a desktop shortcut (`server shortcut`).
-- In-app self-update — checks the npm registry, installs and auto-restarts the service.
 
 
 ## Screenshots
 
 <table>
   <tr>
-    <td align="center"><img src="https://raw.githubusercontent.com/xing-shuyin/pi-web-ui/main/assets/shot1.png" alt="Settings panel"><br><sub>Settings panel</sub></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/xing-shuyin/pi-web-ui/main/assets/shot2.jpeg" alt="Built-in terminal"><br><sub>Built-in terminal</sub></td>
+    <td align="center"><img src="assets/shot1.png" alt="Settings panel"><br><sub>Settings panel</sub></td>
+    <td align="center"><img src="assets/shot2.jpeg" alt="Built-in terminal"><br><sub>Built-in terminal</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="https://raw.githubusercontent.com/xing-shuyin/pi-web-ui/main/assets/shot3.jpeg" alt="Chat interface"><br><sub>Chat interface</sub></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/xing-shuyin/pi-web-ui/main/assets/shot4.jpeg" alt="Git source control panel"><br><sub>Git source control panel</sub></td>
+    <td align="center"><img src="assets/shot3.jpeg" alt="Chat interface"><br><sub>Chat interface</sub></td>
+    <td align="center"><img src="assets/shot4.jpeg" alt="Git source control panel"><br><sub>Git source control panel</sub></td>
   </tr>
 </table>
 
@@ -161,13 +154,6 @@ PI_WEB_PORT=9000 PI_WEB_CWD=/path/to/project pi-web-ui     # custom port / works
 
 - **Foreground**: press `Ctrl+C` in the terminal running it.
 - **As a service**: `pi-web-ui server stop` (stops the instance; auto-start stays until `server uninstall`).
-
-**Update**
-
-```bash
-npm i -g pi-web-ui@latest     # upgrade to the latest published version
-pi-web-ui server restart      # restart the service to apply it (foreground: restart manually)
-```
 
 **Uninstall**
 
@@ -224,15 +210,15 @@ straight from GitHub:
 
 | Plugin | What it does |
 | --- | --- |
-| 📬 [webmail](https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/webmail) | IMAP inbox browsing / search / read / mark / delete + SMTP sending, new-mail notifications, and an optional "allow AI to manage my mailbox" switch (six `mail_*` agent tools). Auto-installs its npm deps on first activation. |
-| 🗄️ [db-client](https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/db-client) | Database workbench: connection manager + schema tree for MySQL / PostgreSQL / SQLite / SQL Server / MongoDB / Redis — table structure, paginated data with sorting, SQL editor, and row editing. Drivers auto-install on first use. |
-| 📝 [vscode-editor](https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/vscode-editor) | VS Code-like workbench: multi-root file tree (local + SSH hosts), CodeMirror multi-tab editor, Remote-SSH remote file browsing/editing, draggable multi-terminal panel (xterm.js), SFTP sync & upload/download to your computer. Auto-installs `ssh2`. |
-| 📬 [demo-mailbox](https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/demo-mailbox) | Minimal example plugin demonstrating the server entry + client view + two-way message protocol. Doubles as the plugin test fixture — start here if you want to write your own. |
+| 📬 [webmail](dev/plugins/webmail) | IMAP inbox browsing / search / read / mark / delete + SMTP sending, new-mail notifications, and an optional "allow AI to manage my mailbox" switch (six `mail_*` agent tools). Auto-installs its npm deps on first activation. |
+| 🗄️ [db-client](dev/plugins/db-client) | Database workbench: connection manager + schema tree for MySQL / PostgreSQL / SQLite / SQL Server / MongoDB / Redis — table structure, paginated data with sorting, SQL editor, and row editing. Drivers auto-install on first use. |
+| 📝 [vscode-editor](dev/plugins/vscode-editor) | VS Code-like workbench: multi-root file tree (local + SSH hosts), CodeMirror multi-tab editor, Remote-SSH remote file browsing/editing, draggable multi-terminal panel (xterm.js), SFTP sync & upload/download to your computer. Auto-installs `ssh2`. |
+| 📬 [demo-mailbox](dev/plugins/demo-mailbox) | Minimal example plugin demonstrating the server entry + client view + two-way message protocol. Doubles as the plugin test fixture — start here if you want to write your own. |
 
 Example — install the webmail plugin:
 
 ```bash
-pi-web-ui install https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/webmail
+pi-web-ui install https://github.com/npdias/pi-web-ui/tree/main/dev/plugins/webmail
 ```
 
 Each plugin's directory in the repo has its own `README.md` with full feature
@@ -271,7 +257,7 @@ Re-run `install` against the same source with `--force`:
 
 ```bash
 # example: update the webmail plugin to the latest version in the repo
-pi-web-ui install https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins/webmail --force
+pi-web-ui install https://github.com/npdias/pi-web-ui/tree/main/dev/plugins/webmail --force
 ```
 
 - The upgrade preserves the plugin's local `config.json` automatically.
@@ -333,7 +319,7 @@ Easiest way to write one: copy a built-in palette (e.g. `themes/white.css` from 
 
 ### Contributing a theme to the repository (GitHub)
 
-Want your theme shipped to everyone? Open a pull request at [github.com/xing-shuyin/pi-web-ui](https://github.com/xing-shuyin/pi-web-ui):
+Want your theme shipped to everyone? Open a pull request at [github.com/npdias/pi-web-ui](https://github.com/npdias/pi-web-ui):
 
 1. Fork the repo and clone it.
 2. Create your theme as `themes/<id>.css` — a pure `:root` palette. Copy `themes/white.css` (or `themes/cyberpunk.css` for a dark palette) as the starting template.
@@ -435,11 +421,11 @@ pi-web-ui is a small open-source project — **your contributions are what make 
 
 | Way to contribute | How to get started |
 | --- | --- |
-| 🧩 **Write a plugin** | Build your own UI tab + agent tools. Copy `dev/plugins/demo-mailbox` as the minimal template (it doubles as the test fixture), develop locally, then either open a PR to ship it in the [catalog](#plugin-catalog) or [publish it standalone](https://github.com/xing-shuyin/pi-web-ui/tree/main/dev/plugins). |
+| 🧩 **Write a plugin** | Build your own UI tab + agent tools. Copy `dev/plugins/demo-mailbox` as the minimal template (it doubles as the test fixture), develop locally, then either open a PR to ship it in the [catalog](#plugin-catalog) or publish it standalone. |
 | 🎨 **Contribute a theme** | Copy `themes/white.css` (light) or `themes/cyberpunk.css` (dark) as a pure-palette template, tweak the `:root` palette + `--term-*` + `.hljs`, verify with `npm run dev`, then open a PR — full walkthrough in [Contributing a theme](#contributing-a-theme-to-the-repository-github). |
-| 💻 **Fix a bug / add a feature** | Look for [open issues](https://github.com/xing-shuyin/pi-web-ui/issues) or propose something new. Fork → branch → PR. Keep the code conventions in `AGENTS.md` (tabs, i18n keys in both languages, protocol changes in `server/protocol.ts`). |
+| 💻 **Fix a bug / add a feature** | Look for [open issues](https://github.com/npdias/pi-web-ui/issues) or propose something new. Fork → branch → PR. Keep the code conventions in `AGENTS.md` (tabs, protocol changes in `server/protocol.ts`). |
 | 📖 **Docs & translations** | Improve the READMEs, write plugin docs, fix typos, or help translate the UI / docs into more languages. |
-| 💡 **Ideas & feedback** | Open an [issue](https://github.com/xing-shuyin/pi-web-ui/issues) or start a [discussion](https://github.com/xing-shuyin/pi-web-ui/discussions) — feature requests, bug reports, UI polish ideas, deployment experience reports. |
+| 💡 **Ideas & feedback** | Open an [issue](https://github.com/npdias/pi-web-ui/issues) or start a [discussion](https://github.com/npdias/pi-web-ui/discussions) — feature requests, bug reports, UI polish ideas, deployment experience reports. |
 
 **Before opening a PR**, a quick sanity pass keeps reviewers happy:
 

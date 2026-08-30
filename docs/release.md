@@ -17,7 +17,7 @@ npm run build
 git add -A
 git commit -m "feat(files): <一句话描述>"
 
-# 4) 推送 GitHub（仓库公开：xing-shuyin/pi-web-ui，分支 main）
+# 4) 推送 GitHub（仓库：npdias/pi-web-ui，分支 main）
 git push origin main
 
 # 5) 发布 npm（会自动跑 prepublishOnly 构建）
@@ -34,7 +34,7 @@ curl -s https://registry.npmjs.org/pi-web-ui/latest | jq .version
 - 提交信息不要带 `Co-authored-by`（P1 规则，仓库 hook 会拦）。
 - `.pi/commands.json` 是**每个项目各自**的个人命令（当前 cwd 的 `.pi/ 下），已被 gitignore，永远不会进公开仓库；切换 cwd 时命令列表自动刷新为该项目的命令。
 - 大改动发布前先问用户是否要 `npm publish`（会真实消耗账号权限、触发构建）。
-- **升级后的重启**：`npm i -g` 只更新磁盘文件，已运行进程内存里还是旧代码——前端是每次请求实时读盘的（会先变新），但 WS 消息处理是进程内旧逻辑，新旧混跑会表现为「界面是新的、某功能一直加载中」。界面内「立即更新」（顶栏更新下拉）现在是在可见终端 tab 中跑 `npm i -g pi-web-ui@latest`（复用 SCM/插件卸载同款 tab 模式），完成后需手动重启服务生效：`pi-web-ui server restart`（launchd/systemd 由服务管理器拉起；Docker 需 `docker compose restart`）。服务端保留 `PI_WEB_RESTART_CHILD` 端口等待握手（restart-handoff-test 回归），供外部编排的替换子进程使用。
+- **Fork releases**：this fork has no release channel. Build and restart from the checked-out branch. `PI_WEB_RESTART_CHILD` remains for external replacement orchestration.
 - **发布前检查示例文件不泄密**：`deploy/`、`README` 等随 npm 包（`files` 白名单含 `deploy/`）和 GitHub 分发的文件**绝不放真实 IP / 域名 / 密钥**——用占位符（如 `<LAN_IP>`、`<PUBLIC_IP>:<PUBLIC_PORT>`、`your-host`）。真实环境配置只在本地改，不进仓库。
 
 ## 历史 IP 泄露的清理方法

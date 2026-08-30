@@ -8,7 +8,7 @@
  * 不收录的脚本及原因：
  *   - 浏览器 E2E（playwright/chromium，路径写死本机）：*-browser*、scm-test、
  *     freeze、goal-pill/ui/rounds、panel/left/sound/settings-ui 等 → 本地手动跑；
- *   - 真模型 live：goal-review-loop、live-test（需已运行 server）、update-test。
+ *   - 真模型 live：goal-review-loop、live-test（需已运行 server）。
  *
  * 用法：node tests/run-smoke.mjs [name1 name2 …]   # 无参 = 全量
  */

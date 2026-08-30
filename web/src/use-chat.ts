@@ -33,17 +33,6 @@ import { PROTOCOL_VERSION } from "./protocol-version";
 
 export type ConnStatus = "connecting" | "open" | "closed";
 
-/** One component in an all-source update check (update_status_all). */
-export interface UpdateAllItem {
-	name: string;
-	kind: "webui" | "pi-core" | "package";
-	current: string;
-	latest: string | null;
-	latestPublishedAt?: string | null;
-	upToDate: boolean;
-	error?: string;
-}
-
 export interface Notice {
 	id: number;
 	level: "info" | "warning" | "error";
@@ -99,16 +88,6 @@ export interface ChatState {
 	installResult: { ok: boolean; detail: string } | null;
 	/** Path completions for the cwd input. */
 	pathCompletions: { name: string; path: string; type: "dir" | "file" }[];
-	/** Self-update status (result of check_update). */
-	update: {
-		current: string;
-		latest: string | null;
-		latestPublishedAt: string | null;
-		upToDate: boolean;
-		error?: string;
-	} | null;
-	/** All-source update check (webui + pi core + installed packages). */
-	updatesAll: UpdateAllItem[] | null;
 	/** Extension widgets (TUI overlays bridged to the web UI). */
 	widgets: { key: string; lines: string[] }[];
 	/** Extension footer statuses (setStatus bridge). */
@@ -241,18 +220,6 @@ type Action =
 			type: "path_completions";
 			completions: { name: string; path: string; type: "dir" | "file" }[];
 	  }
-	| {
-			type: "update_status";
-			status: {
-				current: string;
-				latest: string | null;
-				latestPublishedAt: string | null;
-				upToDate: boolean;
-				error?: string;
-			};
-	  }
-	| { type: "update_status_all"; items: UpdateAllItem[] }
-	| { type: "updates_check_started" }
 	| { type: "widgets"; widgets: { key: string; lines: string[] }[] }
 	| { type: "statuses"; statuses: { key: string; text: string | undefined }[] }
 	| {
@@ -555,13 +522,6 @@ function reducer(state: ChatState, action: Action): ChatState {
 			return { ...state, scmDirty: state.scmDirty + 1 };
 		case "path_completions":
 			return { ...state, pathCompletions: action.completions };
-		case "update_status":
-			return { ...state, update: action.status };
-		case "update_status_all":
-			return { ...state, updatesAll: action.items };
-		case "updates_check_started":
-			// Forced re-check: clear stale rows so the "checking" state renders.
-			return { ...state, updatesAll: null };
 		case "widgets":
 			return { ...state, widgets: action.widgets };
 		case "statuses":
@@ -692,8 +652,6 @@ export function useChat() {
 		providers: [],
 		installResult: null,
 		pathCompletions: [],
-		update: null,
-		updatesAll: null,
 		widgets: [],
 		statuses: [],
 		dialog: null,
@@ -773,11 +731,6 @@ export function useChat() {
 	const send = useCallback((msg: ClientMessage) => {
 		const ws = wsRef.current;
 		if (ws && ws.readyState === WebSocket.OPEN) {
-			// Forced re-check: drop stale rows immediately so the "checking"
-			// state renders instead of the cached list.
-			if (msg.type === "check_updates_all" && msg.force === true) {
-				dispatch({ type: "updates_check_started" });
-			}
 			ws.send(JSON.stringify(msg));
 			return true;
 		}
@@ -839,12 +792,6 @@ export function useChat() {
 					);
 					ws.send(
 						JSON.stringify({ type: "get_commands" } satisfies ClientMessage),
-					);
-					ws.send(
-						JSON.stringify({ type: "check_update" } satisfies ClientMessage),
-					);
-					ws.send(
-						JSON.stringify({ type: "check_updates_all" } satisfies ClientMessage),
 					);
 					break;
 				case "snapshot":
@@ -988,12 +935,6 @@ export function useChat() {
 					break;
 				case "path_completions":
 					dispatch({ type: "path_completions", completions: msg.completions });
-					break;
-				case "update_status":
-					dispatch({ type: "update_status", status: msg });
-					break;
-				case "update_status_all":
-					dispatch({ type: "update_status_all", items: msg.items });
 					break;
 				case "widgets":
 					dispatch({ type: "widgets", widgets: msg.widgets });

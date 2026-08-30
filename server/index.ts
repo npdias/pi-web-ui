@@ -285,18 +285,16 @@ if (existsSync(webDist)) {
 		// with an unhandled ENOENT stack trace.
 		res.sendFile(join(webDist, "index.html"), (err) => {
 			if (err && !res.headersSent) {
-				res.status(503).send("正在更新 pi-web-ui，请稍后刷新…");
+				res.status(503).send("Web UI assets are unavailable. Rebuild this checkout and restart the server.");
 			}
 		});
 	});
 } else if (process.env[RESTART_CHILD_ENV]) {
-	// Auto-restart replacement of a self-update whose npm install did not
-	// complete (Windows: locked files / rollback can leave the global package
-	// without web/dist). Fail loudly with a repair hint instead of serving a
-	// UI-less 404 with no explanation.
+	// An externally orchestrated replacement can start before assets are
+	// available. Fail loudly instead of serving a UI-less 404.
 	console.error(
-		"✖ 更新后的安装不完整（缺少 web/dist/index.html）。\n" +
-			"  请手动执行 npm i -g pi-web-ui@latest 修复后重新启动。",
+		"✖ Web UI assets are incomplete (missing web/dist/index.html).\n" +
+			"  Rebuild this checkout and restart the server.",
 	);
 	process.exit(1);
 }
@@ -431,14 +429,6 @@ service.pluginStopBgTask = (taskId) => pluginMgr.stopPluginBgTask(taskId);
 // 插件宿主工作区实时跟随当前项目：任意客户端 set_cwd 成功后同步给
 // PluginManager，编辑器等工作区跟随型插件随即切根（详见 plugins.ts notifyCwd）。
 service.onClientCwdChanged = (cwd) => pluginMgr.notifyCwd(cwd);
-
-// ---------------------------------------------------------------------------
-// Self-update
-// ---------------------------------------------------------------------------
-// In-app updates now run `npm i -g pi-web-ui@latest` in a visible terminal
-// tab (frontend-initiated); after it finishes the user restarts via
-// `pi-web-ui server restart`. The PI_WEB_RESTART_CHILD port-wait handshake
-// below stays: an externally orchestrated replacement child still needs it.
 
 function scheduleQuit(): boolean {
 	const isLaunchd = process.platform === "darwin" && process.ppid === 1;
@@ -663,12 +653,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "complete_path":
 				void cs.completePath(msg.path);
-				break;
-			case "check_update":
-				void cs.checkUpdate();
-				break;
-			case "check_updates_all":
-				void cs.checkUpdatesAll(msg.force === true);
 				break;
 			case "dialog_response":
 				cs.resolveDialog(msg.id, msg.value);

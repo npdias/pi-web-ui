@@ -1,8 +1,8 @@
 // Vision bridge — settings-panel UI test (no model calls).
 // Opens the ⚙ settings modal and verifies the vision-bridge section:
-// toggle switch reflects server state, the model picker lists the configured
-// vision models, picking one round-trips through set_settings → settings_state,
-// and turning the bridge off hides the picker.
+// toggle switch defaults off, the model picker lists the configured vision
+// models after opt-in, picking one round-trips through set_settings →
+// settings_state, and turning the bridge off hides the picker.
 // Usage: npm run build && node vision-bridge-ui-test.mjs
 import { chromium } from "playwright-core";
 import { CHROME_PATH } from "./lib/chrome.mjs";
@@ -116,10 +116,16 @@ async function run() {
 	check("vision bridge section rendered", (await heading.count()) > 0);
 	await heading.first().scrollIntoViewIfNeeded();
 
-	// Toggle switch present and ON by default.
-	const sw = page.locator(".set-switch").last();
-	const swOn = await sw.evaluate((el) => el.classList.contains("on"));
-	check("toggle starts enabled", swOn);
+// Toggle switch present and OFF by default.
+const sw = page.locator(".set-switch").last();
+const swOn = await sw.evaluate((el) => el.classList.contains("on"));
+check("toggle starts disabled", !swOn);
+
+// Opt in before configuring the bridge.
+await sw.click();
+await page.waitForFunction(
+	() => document.querySelector(".set-switch")?.classList.contains("on"),
+);
 
 	// Model picker lists both vision models + auto option. (The vision-bridge
 	// section now has TWO selects — model + prompt mode — so scope to the

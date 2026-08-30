@@ -20,8 +20,7 @@ import {
 	mkdirSync,
 	watch,
 } from "node:fs";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { basename, join, relative, resolve, sep } from "node:path";
 import {
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
@@ -44,12 +43,6 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { BgServerTracker } from "./bg-servers.js";
-import {
-	checkAll as checkAllUpdates,
-	collectTargets,
-	compareVersions as compareSemver,
-	type UpdateItem,
-} from "./update-check.js";
 import { hasPendingWaitSubscription, shouldRetainActive } from "./wait-subscription-scan.js";
 import type { PluginAgentTool, PluginCommandDef, PluginToolEvent } from "./plugins.js";
 import { syncPluginToolsIntoSession } from "./plugins.js";
@@ -1802,121 +1795,12 @@ export class ClientSession {
 	 * form or by running `pi` in a terminal.
 	 */
 
-	/**
-	 * Version of the RUNNING pi-web-ui package (read from its own package.json,
-	 * resolved from this compiled module: <pkg>/dist/server → <pkg>).
-	 */
-	private static currentAppVersion(): string {
-		try {
-			const here = dirname(fileURLToPath(import.meta.url));
-			const pkgRoot = resolve(here, "..", "..");
-			const pkg = JSON.parse(
-				readFileSync(join(pkgRoot, "package.json"), "utf8"),
-			) as { version?: string };
-			return pkg.version ?? "0.0.0";
-		} catch {
-			return "0.0.0";
-		}
-	}
-
-	/** Simple numeric semver compare: >0 means a newer than b. */
-	private static compareVersions(a: string, b: string): number {
-		return compareSemver(a, b);
-	}
-
 	/** Set by index.ts: called when /pi-web-ui:quit is invoked. */
 	onQuit: (() => boolean) | undefined = undefined;
 	/** 本客户端成功切换工作区（set_cwd）后触发，参数为新绝对路径。
 	 *  attach 时由 AgentService 接到全局 onClientCwdChanged —— 编辑器等
 	 *  工作区跟随型插件借此把根目录切到用户当前项目。 */
 	onCwdChanged: ((abs: string) => void) | undefined = undefined;
-
-	/** Ask the npm registry for the latest pi-web-ui version and report it. */
-	async checkUpdate(): Promise<void> {
-		const current = ClientSession.currentAppVersion();
-		try {
-			// Fetch the full package doc (not /latest): it carries the per-version
-			// publish timestamps so the UI can hint when a version was JUST
-			// published and the registry/CDN caches may not have caught up yet.
-			const res = await fetch("https://registry.npmjs.org/pi-web-ui", {
-				signal: AbortSignal.timeout(8_000),
-			});
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data = (await res.json()) as {
-				"dist-tags"?: { latest?: string };
-				time?: Record<string, string>;
-			};
-			const latest = data["dist-tags"]?.latest ?? null;
-			const latestPublishedAt =
-				latest && data.time ? (data.time[latest] ?? null) : null;
-			const upToDate =
-				latest === null || ClientSession.compareVersions(current, latest) >= 0;
-			this.emit({
-				type: "update_status",
-				current,
-				latest,
-				latestPublishedAt,
-				upToDate,
-			});
-		} catch (err) {
-			this.emit({
-				type: "update_status",
-				current,
-				latest: null,
-				latestPublishedAt: null,
-				upToDate: false,
-				error: `检查更新失败：${(err as Error).message}`,
-			});
-		}
-	}
-
-	/** Cache window for the all-source check: 30 minutes. */
-	static UPDATE_ALL_CACHE_MS = 30 * 60_000;
-	private updatesAllCache: { at: number; items: UpdateItem[] } | null = null;
-
-	/**
-	 * All-source update check: pi-web-ui + the pi core + direct pi extensions
-	 * from the agent manifest (fallback: raw walk). Re-emits the cached list
-	 * within UPDATE_ALL_CACHE_MS; pass force=true (explicit refresh) to bypass.
-	 */
-	async checkUpdatesAll(force = false): Promise<void> {
-		if (
-			!force &&
-			this.updatesAllCache &&
-			Date.now() - this.updatesAllCache.at <
-				ClientSession.UPDATE_ALL_CACHE_MS
-		) {
-			this.emit({
-				type: "update_status_all",
-				items: this.updatesAllCache.items,
-			});
-			return;
-		}
-		try {
-			const targets = collectTargets(
-				this.agentDir,
-				ClientSession.currentAppVersion(),
-			);
-			const items = await checkAllUpdates(targets);
-			this.updatesAllCache = { at: Date.now(), items };
-			this.emit({ type: "update_status_all", items });
-		} catch (err) {
-			// checkAll degrades per-item; only local enumeration blowing up lands
-			// here — still report a usable (webui-only) error item.
-			const items: UpdateItem[] = [
-				{
-					name: "pi-web-ui",
-					kind: "webui",
-					current: ClientSession.currentAppVersion(),
-					latest: null,
-					latestPublishedAt: null,
-					upToDate: false,
-					error: `检查更新失败：${(err as Error).message}`,
-				},
-			];
-			this.emit({ type: "update_status_all", items });
-		}
-	}
 
 	async installPiAgent(): Promise<void> {
 		try {

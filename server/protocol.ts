@@ -344,10 +344,6 @@ export type ClientMessage =
 	| { type: "set_cwd"; path: string }
 	| { type: "complete_path"; path: string }
 	| { type: "dialog_response"; id: number; value: string | boolean | null }
-	// -- self-update ----------------------------------------------------------
-	/** Check the npm registry for a newer pi-web-ui version. */
-	| { type: "check_update" }
-	| { type: "check_updates_all"; force?: true } // webui + direct pi extensions (manifest)
 	// -- pi agent setup ------------------------------------------------------
 	/** Auto-install the pi agent (mkdir config dir + npm i -g the CLI). */
 	| { type: "install_pi_agent" }
@@ -1077,34 +1073,6 @@ export type ServerMessage =
 	  }
 	/** The server resolved (or abandoned) a dialog — the client must close it. */
 	| { type: "dialog_closed"; id: number }
-	// -- self-update ----------------------------------------------------------
-	/** Result of a check_update run (current/latest from the npm registry). */
-	| {
-			type: "update_status";
-			/** Version of the RUNNING process (from its own package.json). */
-			current: string;
-			latest: string | null;
-			/** Publish timestamp (ISO) of the latest version — lets the UI hint
-			 * when it was just published and registry caches may lag. */
-			latestPublishedAt: string | null;
-			upToDate: boolean;
-			error?: string;
-	  }
-	/** Result of a check_updates_all run — one item per checked component
-	 *  (webui, the pi core, direct pi extensions). Failed lookups degrade
-	 *  per-item. */
-	| {
-			type: "update_status_all";
-			items: {
-				name: string;
-				kind: "webui" | "pi-core" | "package";
-				current: string;
-				latest: string | null;
-				latestPublishedAt?: string | null;
-				upToDate: boolean;
-				error?: string;
-			}[];
-	  }
 	// -- goal / review -------------------------------------------------------
 	/** Goal status pushed whenever it changes (set / review start-end / verdict).
 	 *  Review result CARDS are inserted into the main conversation flow as real

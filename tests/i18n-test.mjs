@@ -1,5 +1,5 @@
-/* i18n smoke test: boots the compiled server, opens the built UI, verifies the
- * language switcher defaults to Chinese and switches to English.
+/* English-only UI smoke: boots the compiled server, opens the built UI, verifies
+ * every user starts in English and no language selector is rendered.
  * Run:  npm run build && node i18n-test.mjs */
 import { CHROME_PATH } from "./lib/chrome.mjs";
 import { spawn } from "node:child_process";
@@ -77,68 +77,79 @@ async function main() {
 	await page.waitForSelector(".topbar", { timeout: 5000 });
 	console.log("app booted");
 
-	// -- default language is Chinese -----------------------------------------
+	// -- English is mandatory -------------------------------------------------
 	await page.waitForSelector(".brand", { timeout: 5000 });
-	const zhNewChat = await page.locator(".topbar .newchat span").textContent();
-	check(`default UI is Chinese ("新对话")`, zhNewChat?.includes("新对话"));
-	const zhLangChip = await page
-		.locator(".topbar-actions .chip-sub")
-		.last()
-		.textContent();
-	check(`language chip shows 中文`, zhLangChip?.includes("中文"));
-
-	// -- switch to English ----------------------------------------------------
-	await page
-		.locator(".topbar-actions .dropdown")
-		.last()
-		.locator("button.chip")
-		.click();
-	await page.waitForSelector(".dd-item:has-text('English')", { timeout: 3000 });
-	await page.locator(".dd-item:has-text('English')").click();
-	await sleep(400);
-
 	const enNewChat = await page.locator(".topbar .newchat span").textContent();
-	check(`UI switched to English ("New chat")`, enNewChat?.includes("New chat"));
+	check(`UI starts in English ("New chat")`, enNewChat?.includes("New chat"));
 	const enTab = await page
 		.locator(".view-switch button span")
 		.first()
 		.textContent();
 	check(`view tab shows "Chat"`, enTab?.includes("Chat"));
-
-	// model dropdown header translated
-	await page
-		.locator(".topbar-actions .dropdown")
-		.first()
-		.locator("button.chip")
-		.click();
-	await page.waitForSelector(".dd-header", { timeout: 3000 });
-	const ddHeader = await page.locator(".dd-header").first().textContent();
 	check(
-		`model dropdown header is "Available models"`,
-		ddHeader?.includes("Available models"),
+		"no language selector is rendered",
+		(await page.locator("text=Language").count()) === 0 &&
+			(await page.locator("text=中文").count()) === 0,
 	);
-	await page.keyboard.press("Escape");
 
-	// -- persistence: reload keeps English ------------------------------------
+	// -- reload cannot restore a saved non-English locale ---------------------
+	await page.evaluate(() => localStorage.setItem("pi-web-ui:lang", "zh"));
 	await page.reload();
 	await page.waitForSelector(".topbar", { timeout: 15000 });
 	await sleep(500);
 	const enAfterReload = await page
 		.locator(".topbar .newchat span")
 		.textContent();
-	check(`English persists across reload`, enAfterReload?.includes("New chat"));
+	check(`saved Chinese locale is ignored after reload`, enAfterReload?.includes("New chat"));
+	check(
+		"desktop has no upstream GitHub link or update control",
+		(await page.locator('a[href*="xing-shuyin/pi-web-ui"]').count()) === 0 &&
+			(await page.locator('[title*="update" i]').count()) === 0,
+	);
 
-	// -- switch back to Chinese -----------------------------------------------
-	await page
-		.locator(".topbar-actions .dropdown")
-		.last()
-		.locator("button.chip")
-		.click();
-	await page.waitForSelector(".dd-item:has-text('中文')", { timeout: 3000 });
-	await page.locator(".dd-item:has-text('中文')").first().click();
-	await sleep(400);
-	const zhAgain = await page.locator(".topbar .newchat span").textContent();
-	check(`switched back to Chinese`, zhAgain?.includes("新对话"));
+	// Settings retain UI Plugins and Presets, omit Goal Review.
+	await page.locator('button[title="Settings"]').click();
+	await page.waitForSelector(".settings-modal", { timeout: 5000 });
+	check(
+		"Goal Review is absent from settings",
+		(await page.locator(".settings-tab", { hasText: "Goal review" }).count()) === 0,
+	);
+	check(
+		"goal-review controls are absent from chat",
+		(await page.locator(".goalbar").count()) === 0,
+	);
+	const uiPluginsTab = page.locator(".settings-tab", { hasText: "UI plugins" });
+	const presetsTab = page.locator(".settings-tab", { hasText: "Presets" });
+	check("UI Plugins settings tab remains visible", (await uiPluginsTab.count()) === 1);
+	check("Presets settings tab remains visible", (await presetsTab.count()) === 1);
+	await uiPluginsTab.click();
+	check("UI Plugins tab opens", await uiPluginsTab.evaluate((el) => el.classList.contains("active")));
+	await presetsTab.click();
+	check("Presets tab opens", await presetsTab.evaluate((el) => el.classList.contains("active")));
+	const visionTab = page.locator(".settings-tab", { hasText: "Vision bridge" });
+	await visionTab.click();
+	const visionSwitch = page.locator(".set-switch").last();
+	check(
+		"Vision Bridge defaults off for a fresh client",
+		!(await visionSwitch.evaluate((el) => el.classList.contains("on"))),
+	);
+	await page.locator(".modal-close").click();
+
+	// Mobile More menu also excludes language, update, and upstream links.
+	await page.setViewportSize({ width: 390, height: 844 });
+	const more = page.locator(".topbar-more button.chip");
+	await more.click();
+	await page.waitForSelector(".topbar-more .dd-menu", { timeout: 3000 });
+	const mobileMenu = page.locator(".topbar-more .dd-menu");
+	const mobileMenuText = await mobileMenu.textContent();
+	check(
+		"mobile More has no language or update controls",
+		!mobileMenuText?.includes("Language") && !mobileMenuText?.includes("Update"),
+	);
+	check(
+		"mobile More has no upstream GitHub link",
+		(await mobileMenu.locator('a[href*="xing-shuyin/pi-web-ui"]').count()) === 0,
+	);
 
 	const errs = consoleErrors.filter(
 		(e) => !e.includes("favicon") && !e.includes("ResizeObserver"),

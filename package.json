@@ -35,7 +35,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xing-shuyin/pi-web-ui.git"
+    "url": "git+https://github.com/npdias/pi-web-ui.git"
   },
   "pi": {
     "extensions": [

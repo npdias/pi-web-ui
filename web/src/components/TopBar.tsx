@@ -1,10 +1,7 @@
 import { useState } from "react";
 import {
-	FiDownload,
 	FiFolder,
 	FiGitBranch,
-	FiGithub,
-	FiGlobe,
 	FiMenu,
 	FiMessageSquare,
 	FiMoreHorizontal,
@@ -16,33 +13,16 @@ import {
 	FiTerminal,
 	FiVolume2,
 } from "react-icons/fi";
-import type { ChatState, UpdateAllItem } from "../use-chat";
-import type { ClientMessage, CommandDef } from "../types";
-import { buildUpdateCommand } from "../update-command";
-import { randomUuid } from "../uuid";
+import type { ChatState } from "../use-chat";
+import type { ClientMessage } from "../types";
 import { Dropdown, DropdownItem } from "./Dropdown";
 import { SoundSettingsPanel } from "./SoundSettings";
 import type { SoundKind, SoundSettings } from "../sounds";
-import { useI18n, type Locale } from "../i18n";
+import { useT } from "../i18n";
 
 interface TopBarProps {
 	chat: ChatState;
 	send: (msg: ClientMessage) => boolean;
-	/** Minimal terminal-tab bridge (same shape SCMPanel uses) — updates run there. */
-	terminal: {
-		create: (meta: {
-			id: string;
-			conversationId: string;
-			title: string;
-			cwd: string;
-			cols: number;
-			rows: number;
-			running: boolean;
-			exitCode: number | null;
-			command?: CommandDef;
-		}) => void;
-		restart: (id: string) => void;
-	};
 	view: "chat" | "terminal" | "git" | `plugin:${string}`;
 	onViewChange: (view: "chat" | "terminal" | "git" | `plugin:${string}`) => void;
 	/** Installed optional plugins (<dataDir>/plugins) — one view tab each. */
@@ -68,7 +48,6 @@ interface TopBarProps {
 export function TopBar({
 	chat,
 	send,
-	terminal,
 	view,
 	plugins,
 	onViewChange,
@@ -83,17 +62,10 @@ export function TopBar({
 	theme,
 	onThemeChange,
 }: TopBarProps) {
-	const { locale, setLocale, t } = useI18n();
+	const t = useT();
 	const [soundOpen, setSoundOpen] = useState(false);
-	const [langOpen, setLangOpen] = useState(false);
 	const [themeOpen, setThemeOpen] = useState(false);
-	const [updateOpen, setUpdateOpen] = useState(false);
 	const [moreOpen, setMoreOpen] = useState(false);
-
-	const LANGUAGES: { value: Locale; label: string }[] = [
-		{ value: "zh", label: t("langZh") },
-		{ value: "en", label: t("langEn") },
-	];
 
 	const connLabel = chat.ready
 		? t("connected")
@@ -102,244 +74,6 @@ export function TopBar({
 			: t("connecting");
 	const connClass = chat.ready ? "ok" : "busy";
 
-	/** Run `npm i -g pi-web-ui@latest` in a visible terminal tab (SCM-style):
-	 *  reuse the tab with the same title, otherwise create one; switch to the
-	 *  terminal view so the user watches the install live. */
-	const runUpdate = () => {
-		if (!chat.ready) return;
-		const title = t("updateTabTitle");
-		const cmd: CommandDef = {
-			name: title,
-			command: "npm i -g pi-web-ui@latest",
-			cwd: "${pwd}",
-		};
-		const existing = chat.terminals.find((tm) => tm.title === title);
-		if (existing) {
-			terminal.restart(existing.id);
-			send({
-				type: "run_command",
-				terminalId: existing.id,
-				conversationId: existing.conversationId,
-				command: cmd,
-				cols: 80,
-				rows: 24,
-			});
-		} else {
-			terminal.create({
-				id: randomUuid(),
-				conversationId:
-					chat.activeConversationId || chat.state?.conversationId || "",
-				title,
-				cwd: chat.state?.cwd ?? "",
-				cols: 80,
-				rows: 24,
-				running: true,
-				exitCode: null,
-				command: cmd,
-			});
-		}
-		setUpdateOpen(false);
-		setMoreOpen(false);
-		onViewChange("terminal");
-	};
-
-	/** Run the right update command for one or more components in a visible
-	 *  terminal tab (same SCM-style pattern as the self-update above): pi
-	 *  extensions go through `pi update npm:<name>` (they live under
-	 *  <agentDir>/npm), everything globally installed via `npm i -g`.
-	 *  Multi-target runs are chained with `;` so one failing step never
-	 *  blocks the rest. Reuses the tab with the same title, else creates one. */
-	const runPkgUpdate = (items: UpdateAllItem[], title: string) => {
-		if (!chat.ready || items.length === 0) return;
-		const cmd: CommandDef = {
-			name: title,
-			command: buildUpdateCommand(items),
-			cwd: "${pwd}",
-		};
-		const existing = chat.terminals.find((tm) => tm.title === title);
-		if (existing) {
-			terminal.restart(existing.id);
-			send({
-				type: "run_command",
-				terminalId: existing.id,
-				conversationId: existing.conversationId,
-				command: cmd,
-				cols: 80,
-				rows: 24,
-			});
-		} else {
-			terminal.create({
-				id: randomUuid(),
-				conversationId:
-					chat.activeConversationId || chat.state?.conversationId || "",
-				title,
-				cwd: chat.state?.cwd ?? "",
-				cols: 80,
-				rows: 24,
-				running: true,
-				exitCode: null,
-				command: cmd,
-			});
-		}
-		setUpdateOpen(false);
-		setMoreOpen(false);
-		onViewChange("terminal");
-	};
-
-	// Shared by the desktop update dropdown and the mobile "⋯" panel.
-	const allUpdates = chat.updatesAll ?? [];
-	// Pure errors don't count as "updates" — they're shown as failed rows.
-	const updatesCount = allUpdates.filter((i) => !i.upToDate && !i.error).length;
-	// Packages (+ the pi core) with a real newer version — targets of the
-	// per-row and "update all" buttons. The web UI itself is excluded: it has
-	// its own dedicated update flow above the all-components section.
-	const updatable = allUpdates.filter(
-		(i) => !i.upToDate && !i.error && i.kind !== "webui",
-	);
-	const renderAllUpdatesBody = () => (
-		<div className="dd-updates-all">
-			<div className="dd-header">{t("updatesAllTitle")}</div>
-			{chat.updatesAll === null ? (
-				<div className="dd-note">{t("checkingUpdate")}</div>
-			) : allUpdates.length === 0 ? (
-				<div className="dd-note">{t("updatesAllUpToDate")}</div>
-			) : (
-				<ul className="dd-all-list">
-					{allUpdates.map((item) => (
-						<li
-							key={`${item.kind}:${item.name}`}
-							className={`dd-all-item${item.error ? " err" : item.upToDate ? "" : " warn"}`}
-						>
-							<span className="dd-all-name" title={item.name}>
-								{item.name}
-							</span>
-							<span className="dd-all-kind">
-								{item.kind === "webui"
-									? t("kindWebUi")
-									: item.kind === "pi-core"
-										? t("kindPiCore")
-										: t("kindPackage")}
-							</span>
-							<span className="dd-all-vers">
-								{item.error ? (
-									t("updateCheckFailed")
-								) : item.upToDate ? (
-									`v${item.current}`
-								) : (
-									<>
-										v{item.current} → v{item.latest}
-									</>
-								)}
-							</span>
-							{item.kind !== "webui" && !item.upToDate && !item.error && (
-								<button
-									type="button"
-									className="dd-update-btn"
-									onClick={() =>
-										runPkgUpdate(
-											[item],
-											t("updatePkgTabTitle", { name: item.name }),
-										)
-									}
-								>
-									{t("updateBtn")}
-								</button>
-							)}
-						</li>
-					))}
-				</ul>
-			)}
-			<div className="dd-actions">
-				{updatable.length > 0 && (
-					<button
-						type="button"
-						className="dd-refresh accent"
-						style={{ flex: 1 }}
-						onClick={() =>
-								runPkgUpdate(
-									updatable,
-									t("updateAllTabTitle"),
-								)
-						}
-					>
-						{t("updateAllBtn")}
-					</button>
-				)}
-				<button
-					type="button"
-					className="dd-refresh"
-					style={updatable.length > 0 ? { flex: 1 } : undefined}
-					onClick={() => send({ type: "check_updates_all", force: true })}
-				>
-					{t("updatesAllRefresh")}
-				</button>
-			</div>
-		</div>
-	);
-	const renderUpdateBody = () => (
-		<>
-			<div className="dd-update">
-				<div className="dd-row">
-					<span>{t("currentVersion")}</span>
-					<b>v{chat.update?.current ?? "…"}</b>
-				</div>
-				<div className="dd-row">
-					<span>{t("latestVersion")}</span>
-					<b>
-						{chat.update === null
-							? t("checkingUpdate")
-							: chat.update.error
-								? chat.update.error
-								: chat.update.latest
-									? `v${chat.update.latest}`
-									: t("checkingUpdate")}
-					</b>
-				</div>
-				{chat.update && chat.update.upToDate && (
-					<div className="dd-note ok">{t("upToDate")}</div>
-				)}
-				{chat.update &&
-					!chat.update.upToDate &&
-					chat.update.latest && (
-						<div className="dd-note warn">
-							{t("updateAvailable", { version: chat.update.latest })}
-						</div>
-					)}
-				{chat.update?.latestPublishedAt &&
-					Date.now() - new Date(chat.update.latestPublishedAt).getTime() <
-						30 * 60_000 && (
-						<div className="dd-note warn">
-							{t("updateJustPublished", {
-								version: chat.update.latest ?? "",
-							})}
-						</div>
-					)}
-				{chat.update && !chat.update.upToDate && chat.update.latest && (
-					<div className="dd-note">{t("updateTerminalHint")}</div>
-				)}
-			</div>
-			<div className="dd-actions">
-				<button
-					type="button"
-					className="dd-refresh"
-					onClick={() => send({ type: "check_update" })}
-				>
-					{chat.update === null ? t("checkingUpdate") : t("checkUpdate")}
-				</button>
-				{chat.update &&
-					!chat.update.upToDate &&
-					chat.update.latest && (
-						<button
-							type="button"
-							className="dd-refresh accent"
-							onClick={runUpdate}
-						>
-							{t("updateNow")}
-						</button>
-					)}
-			</div>
-		</>
-	);
 
 	return (
 		<header className="topbar">
@@ -417,8 +151,7 @@ export function TopBar({
 					})}
 				</div>
 
-				{/* Desktop toolbar — hidden on mobile (model/thinking move into the
-				    input row; sound/lang/update/github fold into "⋯" below). */}
+				{/* Desktop toolbar — model/thinking move into input row on mobile. */}
 				<div className="topbar-desktop">
 					{/* Global search — sessions / projects / workspace files. */}
 					<button
@@ -475,33 +208,6 @@ export function TopBar({
 					<Dropdown
 						trigger={
 							<>
-								<FiGlobe />
-								<span className="chip-sub">
-									{locale === "zh" ? t("langZh") : "EN"}
-								</span>
-							</>
-						}
-						open={langOpen}
-						onOpenChange={setLangOpen}
-					>
-						<div className="dd-header">{t("language")}</div>
-						{LANGUAGES.map((l) => (
-							<DropdownItem
-								key={l.value}
-								active={locale === l.value}
-								onClick={() => {
-									setLocale(l.value);
-									setLangOpen(false);
-								}}
-							>
-								{l.label}
-							</DropdownItem>
-						))}
-					</Dropdown>
-
-					<Dropdown
-						trigger={
-							<>
 								<FiSun />
 								<span className="chip-sub">{t("theme")}</span>
 							</>
@@ -533,51 +239,6 @@ export function TopBar({
 						))}
 					</Dropdown>
 
-					<Dropdown
-						trigger={
-							<>
-								<FiDownload />
-								<span className="chip-sub">v{chat.update?.current ?? "…"}</span>
-								{chat.update &&
-									!chat.update.upToDate && (
-										<span
-											className="update-dot"
-											title={t("updateAvailable", {
-												version: chat.update.latest ?? "",
-											})}
-										/>
-									)}
-								{updatesCount > 0 && (
-									<span className="update-badge">
-										{t("updatesAllBadge", { n: updatesCount })}
-									</span>
-								)}
-							</>
-						}
-						open={updateOpen}
-						onOpenChange={(v) => {
-							setUpdateOpen(v);
-							if (v) {
-								send({ type: "check_update" });
-								send({ type: "check_updates_all" });
-							}
-						}}
-						fit
-					>
-						<div className="dd-header">{t("update")}</div>
-						{renderUpdateBody()}
-						{renderAllUpdatesBody()}
-					</Dropdown>
-
-					<a
-						className="chip github"
-						href="https://github.com/xing-shuyin/pi-web-ui"
-						target="_blank"
-						rel="noreferrer noopener"
-						title={t("githubRepo")}
-					>
-						<FiGithub />
-					</a>
 				</div>
 
 				<button
@@ -590,28 +251,17 @@ export function TopBar({
 					<span>{t("newChat")}</span>
 				</button>
 
-				{/* Mobile "⋯" panel — folds sound / language / update / GitHub.
-				    Hidden on desktop (each stays its own chip up there). */}
+				{/* Mobile "⋯" panel. */}
 				<div className="topbar-more">
 					<Dropdown
 						trigger={
 							<>
 								<FiMoreHorizontal />
 								<span className="chip-sub">{t("more")}</span>
-								{chat.update &&
-									!chat.update.upToDate && (
-										<span className="update-dot" />
-									)}
 							</>
 						}
 						open={moreOpen}
-						onOpenChange={(v) => {
-							setMoreOpen(v);
-							if (v) {
-								send({ type: "check_update" });
-								send({ type: "check_updates_all" });
-							}
-						}}
+						onOpenChange={setMoreOpen}
 					>
 						<div className="dd-header">{t("sound")}</div>
 						<div className="dd-header">{t("settings")}</div>
@@ -647,16 +297,6 @@ export function TopBar({
 							onChange={onSoundChange}
 							onPreview={onSoundPreview}
 						/>
-						<div className="dd-header">{t("language")}</div>
-						{LANGUAGES.map((l) => (
-							<DropdownItem
-								key={l.value}
-								active={locale === l.value}
-								onClick={() => setLocale(l.value)}
-							>
-								{l.label}
-							</DropdownItem>
-						))}
 						<div className="dd-header">{t("theme")}</div>
 						<DropdownItem
 							active={theme === null}
@@ -679,17 +319,6 @@ export function TopBar({
 								{th.name}
 							</DropdownItem>
 						))}
-						<div className="dd-header">{t("update")}</div>
-						{renderUpdateBody()}
-						{renderAllUpdatesBody()}
-						<a
-							className="dd-refresh dd-more-link"
-							href="https://github.com/xing-shuyin/pi-web-ui"
-							target="_blank"
-							rel="noreferrer noopener"
-						>
-							<FiGithub /> {t("githubRepo")}
-						</a>
 					</Dropdown>
 				</div>
 

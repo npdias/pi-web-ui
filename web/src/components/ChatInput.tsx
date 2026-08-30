@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { FiSend, FiSquare, FiPaperclip, FiArrowUp, FiGrid } from "react-icons/fi";
 import type { ClientMessage, ModelInfo, SlashCommandInfo, UiMessage, UiState } from "../types";
-import { useT, useI18n } from "../i18n";
+import { useT } from "../i18n";
 import { isRasterImage } from "../image-paste";
 import { recordModelUsage } from "../model-usage";
 
@@ -74,13 +74,12 @@ export const ChatInput = memo(function ChatInput({
 	onManageModels,
 }: ChatInputProps) {
 	const t = useT();
-	const { locale } = useI18n();
 	/** 打开模板库（对话中途也可随时取用提示词模板）。 */
 	const { openPicker } = useTemplates();
 	const slashDesc = (c: SlashCommandInfo) =>
-		locale === "en" && c.descriptionEn ? c.descriptionEn : (c.description ?? "");
+		c.descriptionEn ?? c.description ?? "";
 	const slashHint = (c: SlashCommandInfo) =>
-		locale === "en" && c.argumentHintEn ? c.argumentHintEn : (c.argumentHint ?? "");
+		c.argumentHintEn ?? c.argumentHint ?? "";
 	const [text, setText] = useState("");
 	const [dragOver, setDragOver] = useState(false);
 	/** Slash-command picker: non-null while open (filtered by the current input). */
