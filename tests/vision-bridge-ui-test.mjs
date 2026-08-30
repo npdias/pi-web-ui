@@ -108,35 +108,35 @@ async function run() {
 
 	// Sidebar navigation: the settings modal is now tabbed (left rail), only
 	// the active group is rendered — open the vision-bridge tab first.
-	await page.locator(".settings-tab", { hasText: "视觉桥" }).click();
+	await page.locator(".settings-tab", { hasText: "Vision bridge" }).click();
 	await page.waitForSelector(".set-section-title", { timeout: 5000 });
 
 	// Vision bridge section heading.
-	const heading = page.locator(".set-section-title", { hasText: "视觉桥" });
+	const heading = page.locator(".set-section-title", { hasText: "Vision bridge" });
 	check("vision bridge section rendered", (await heading.count()) > 0);
 	await heading.first().scrollIntoViewIfNeeded();
 
 // Toggle switch present and OFF by default.
-const sw = page.locator(".set-switch").last();
-const swOn = await sw.evaluate((el) => el.classList.contains("on"));
-check("toggle starts disabled", !swOn);
+	const sw = page.locator(".set-switch").last();
+	const swOn = await sw.evaluate((el) => el.classList.contains("on"));
+	check("toggle starts disabled", !swOn);
 
-// Opt in before configuring the bridge.
-await sw.click();
-await page.waitForFunction(
-	() => document.querySelector(".set-switch")?.classList.contains("on"),
-);
+	// Opt in before configuring the bridge.
+	await sw.click();
+	await page.waitForFunction(
+		() => document.querySelector(".set-switch")?.classList.contains("on"),
+	);
 
 	// Model picker lists both vision models + auto option. (The vision-bridge
 	// section now has TWO selects — model + prompt mode — so scope to the
 	// first one inside the section.)
-	const vbSection = page.locator(".set-section", { hasText: "视觉桥" });
+	const vbSection = page.locator(".set-section", { hasText: "Vision bridge" });
 	const modelSelect = vbSection.locator("select").first();
 	await modelSelect.waitFor({ timeout: 5000 });
 	const opts = await modelSelect.locator("option").allTextContents();
 	check(
 		"picker lists auto + 2 vision models",
-		opts.length === 3 && opts.some((o) => o.includes("自动")),
+		opts.length === 3 && opts.some((o) => o.includes("Auto (in order)")),
 		JSON.stringify(opts),
 	);
 
@@ -145,7 +145,7 @@ await page.waitForFunction(
 	await page.waitForFunction(
 		() => {
 			const sections = [...document.querySelectorAll(".set-section")];
-			const vb = sections.find((el) => el.textContent.includes("视觉桥"));
+			const vb = sections.find((el) => el.textContent.includes("Vision bridge"));
 			const sel = vb?.querySelector("select");
 			return sel instanceof HTMLSelectElement && sel.value === "vision/glm-vl";
 		},
@@ -158,7 +158,7 @@ await page.waitForFunction(
 	await page.waitForSelector(".settings-modal", { timeout: 5000 });
 	await sleep(800);
 	const pickerInVb = await vbSection.locator("select").count();
-	const hint = await page.locator(".set-hint", { hasText: "已关闭" }).count();
+	const hint = await page.locator(".set-hint", { hasText: "Disabled" }).count();
 	check("disabling hides picker + shows off hint", pickerInVb === 0 && hint > 0);
 
 	// -- replace-mode prefills the built-in default prompts --------------------
@@ -172,7 +172,7 @@ await page.waitForFunction(
 	await page.waitForFunction(
 		() => {
 			const sections = [...document.querySelectorAll(".set-section")];
-			const vb = sections.find((el) => el.textContent.includes("视觉桥"));
+			const vb = sections.find((el) => el.textContent.includes("Vision bridge"));
 			const ta = vb?.querySelector(".set-prompt-input");
 			return (
 				ta instanceof HTMLTextAreaElement &&
@@ -187,14 +187,14 @@ await page.waitForFunction(
 	// sidebar group is rendered), then flip to "replace" — the textarea must
 	// show the built-in default system prompt (the SDK's default, since the
 	// test agent dir has no system-prompt file).
-	await page.locator(".settings-tab", { hasText: "系统提示词" }).click();
-	const sysSection = page.locator(".set-section", { hasText: "系统提示词" });
+	await page.locator(".settings-tab", { hasText: "System prompt" }).click();
+	const sysSection = page.locator(".set-section", { hasText: "System prompt" });
 	const sysModeSelect = sysSection.locator("select").first();
 	await sysModeSelect.selectOption("replace");
 	await page.waitForFunction(
 		() => {
 			const sections = [...document.querySelectorAll(".set-section")];
-			const sys = sections.find((el) => el.textContent.includes("系统提示词"));
+			const sys = sections.find((el) => el.textContent.includes("System prompt"));
 			const ta = sys?.querySelector(".set-prompt-input");
 			return (
 				ta instanceof HTMLTextAreaElement &&
