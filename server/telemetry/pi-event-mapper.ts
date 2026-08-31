@@ -22,6 +22,7 @@ export interface PiEventMapperOptions {
 	source: PiTelemetrySource;
 	sessionId: string;
 	conversationId: string;
+	idNamespace?: string;
 	wallNow?: () => number;
 	monotonicNow?: () => number;
 }
@@ -447,6 +448,8 @@ export class PiEventMapper {
 	private readonly source: PiTelemetrySource;
 	private readonly sessionId: string;
 	private readonly conversationId: string;
+	private readonly idNamespace: string;
+	private readonly namespaceToolCallIds: boolean;
 	private readonly wallNow: () => number;
 	private readonly monotonicNow: () => number;
 	private runSequence = 0;
@@ -461,6 +464,8 @@ export class PiEventMapper {
 		this.source = { ...options.source };
 		this.sessionId = options.sessionId;
 		this.conversationId = options.conversationId;
+		this.idNamespace = options.idNamespace ?? options.conversationId;
+		this.namespaceToolCallIds = options.idNamespace !== undefined;
 		this.wallNow = options.wallNow ?? Date.now;
 		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
 	}
@@ -478,7 +483,7 @@ export class PiEventMapper {
 			duplicateStart = this.currentRun !== null;
 			if (!this.currentRun) {
 				this.currentRun = {
-					id: `${this.conversationId}:run:${++this.runSequence}`,
+					id: `${this.idNamespace}:run:${++this.runSequence}`,
 					startedAt: monotonicTime,
 				};
 			}
@@ -488,9 +493,9 @@ export class PiEventMapper {
 				const sequence = ++this.turnSequence;
 				this.currentTurn = {
 					ids: {
-						turn_id: `${this.conversationId}:turn:${sequence}`,
-						step_id: `${this.conversationId}:step:${sequence}`,
-						request_id: `${this.conversationId}:request:${sequence}`,
+						turn_id: `${this.idNamespace}:turn:${sequence}`,
+						step_id: `${this.idNamespace}:step:${sequence}`,
+						request_id: `${this.idNamespace}:request:${sequence}`,
 					},
 					startedAt: monotonicTime,
 				};
@@ -737,7 +742,13 @@ export class PiEventMapper {
 			parent_id: input.parentId,
 			session_id: this.sessionId,
 			conversation_id: this.conversationId,
-			...(input.toolCallId ? { tool_call_id: input.toolCallId } : {}),
+			...(input.toolCallId
+				? {
+					tool_call_id: this.namespaceToolCallIds
+						? `${this.idNamespace}:tool:${input.toolCallId}`
+						: input.toolCallId,
+				}
+				: {}),
 		};
 		return {
 			kind: input.kind,

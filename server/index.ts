@@ -21,7 +21,7 @@ import { stat } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { createConnection } from "node:net";
 import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -42,6 +42,8 @@ import { listThemes, resolveThemeFile } from "./themes.js";
 import { PluginManager, resolvePluginClientFile } from "./plugins.js";
 import { McpBridge } from "./mcp-bridge.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
+import { TelemetrySocketClient } from "./telemetry/client.js";
+import type { PiTelemetrySource } from "./telemetry/types.js";
 
 const PORT = Number(process.env.PI_WEB_PORT ?? process.env.PORT ?? 8787);
 const CWD = resolve(process.env.PI_WEB_CWD ?? process.cwd());
@@ -398,10 +400,30 @@ const heartbeatTimer = setInterval(() => {
 	}
 }, 10_000);
 
-const service = new AgentService(
+const telemetrySocketPath = process.env.UA_TELEMETRY_SOCKET?.trim();
+export const telemetryClient = telemetrySocketPath
+	? new TelemetrySocketClient({ socketPath: telemetrySocketPath })
+	: undefined;
+const telemetrySource: PiTelemetrySource | undefined = telemetryClient
+	? {
+		host_id: hostname(),
+		component: "pi-web-ui",
+		robot_id: process.env.UA_ROBOT_ID?.trim() || hostname(),
+		instance_id: process.env.UA_AGENT_INSTANCE_ID?.trim() || randomUUID(),
+		version: VERSION,
+	}
+	: undefined;
+
+export const service = new AgentService(
 	CWD,
 	// Per-client persisted UI state: last-used workspace + recent projects.
 	join(DATA_DIR, "client-state.json"),
+	telemetryClient && telemetrySource
+		? {
+			source: telemetrySource,
+			emit: (record) => telemetryClient.emit(record),
+		}
+		: undefined,
 );
 
 // Optional UI plugins (<dataDir>/plugins/<id>/): scanned on every client
@@ -437,8 +459,7 @@ function scheduleQuit(): boolean {
 	if (isLaunchd || isSystemd || inDocker) {
 		setTimeout(() => {
 			console.log("pi-web-ui:quit — shutting down (supervisor will restart)…");
-			if (isSystemd) process.exit(3);
-			void shutdown();
+			void shutdown(isSystemd ? 3 : 0);
 		}, 300);
 		return true;
 	}
@@ -935,7 +956,7 @@ scheduleUploadCleanup();
 const stopControl = startControlServer({ service, dataDir: DATA_DIR, port: PORT });
 
 let shuttingDown = false;
-async function shutdown(): Promise<void> {
+export async function closeServer(): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	console.log("\nshutting down…");
@@ -944,9 +965,18 @@ async function shutdown(): Promise<void> {
 	pluginMgr.dispose();
 	mcpBridge.dispose();
 	await service.disposeAll();
+	try {
+		telemetryClient?.dispose();
+	} catch {
+		// Telemetry disposal cannot block server shutdown.
+	}
 	wss.close();
 	httpServer.close();
-	process.exit(0);
+}
+
+async function shutdown(exitCode = 0): Promise<void> {
+	await closeServer();
+	process.exit(exitCode);
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

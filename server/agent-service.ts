@@ -11,6 +11,7 @@
  * so reconnects just re-request a snapshot.
  */
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	readFileSync,
@@ -101,6 +102,16 @@ import {
 	SYSTEM_PROMPT,
 	transcribeImages,
 } from "./vision-bridge.js";
+import { PiEventMapper } from "./telemetry/pi-event-mapper.js";
+import type {
+	PiTelemetryRecord,
+	PiTelemetrySource,
+} from "./telemetry/types.js";
+
+export interface AgentServiceTelemetry {
+	source: PiTelemetrySource;
+	emit(record: PiTelemetryRecord): void;
+}
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
@@ -387,6 +398,10 @@ interface Conversation {
 	wizardRunning: boolean;
 	/** Session event subscription — events are routed to THIS conversation. */
 	unsubscribe?: () => void;
+	/** Stable telemetry identity across concrete Pi session replacements. */
+	telemetryConversationId: string;
+	/** Mapper owned by the currently bound concrete Pi session. */
+	telemetryMapper?: PiEventMapper;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -833,6 +848,7 @@ export class ClientSession {
 		cwd: string,
 		agentDir: string,
 		stateStore: ClientStateStore,
+		private readonly telemetry?: AgentServiceTelemetry,
 	) {
 		this.clientId = clientId;
 		this.cwd = cwd;
@@ -894,10 +910,11 @@ export class ClientSession {
 		clientId: string,
 		cwd: string,
 		stateStore: ClientStateStore,
+		telemetry?: AgentServiceTelemetry,
 	): Promise<ClientSession> {
 		const agentDir = process.env.PI_CODING_AGENT_DIR ?? getAgentDir();
 
-		const cs = new ClientSession(clientId, cwd, agentDir, stateStore);
+		const cs = new ClientSession(clientId, cwd, agentDir, stateStore, telemetry);
 		const conversationId = cs.nextConversationId();
 		const terminals = cs.makeTerminalManager(conversationId, cwd);
 		const runtime = await createAgentSessionRuntime(cs.makeRuntimeFactory(terminals), {
@@ -1069,6 +1086,7 @@ export class ClientSession {
 			goalGeneration: 0,
 			goalReviewGeneration: 0,
 			wizardRunning: false,
+			telemetryConversationId: randomUUID(),
 			deltaSeq: 0,
 			terminals,
 			msgIds: new Map(),
@@ -1156,21 +1174,69 @@ export class ClientSession {
 		for (const sink of [...this.sinks]) sink(msg);
 	}
 
-	/** (Re)attach event plumbing to the ACTIVE conversation's session. */
-	private async bindSession(): Promise<void> {
-		const conv = this.conv;
+	private disposeTelemetryMapper(conv: Conversation): void {
+		try {
+			conv.telemetryMapper?.dispose();
+		} catch {
+			// Telemetry cleanup cannot affect Pi runtime cleanup.
+		}
+		conv.telemetryMapper = undefined;
+	}
+
+	private emitTelemetry(conv: Conversation, event: AgentSessionEvent): void {
+		const mapper = conv.telemetryMapper;
+		if (!mapper || !this.telemetry) return;
+		try {
+			for (const record of mapper.map(event)) {
+				this.telemetry.emit({
+					...record,
+					attributes: {
+						...record.attributes,
+						project_cwd: conv.cwd,
+						project_name: basename(conv.cwd),
+						ui_conversation_id: conv.id,
+					},
+				});
+			}
+		} catch {
+			// Mapping and transport are observability only. UI projection must run.
+		}
+	}
+
+	/** (Re)attach event plumbing to one conversation's concrete session. */
+	private async bindSession(conv: Conversation = this.conv): Promise<void> {
 		conv.unsubscribe?.();
 		conv.session = conv.runtime.session;
-		await conv.session.bindExtensions({
-			mode: "rpc",
-			uiContext: this.webUi,
-			onError: (err) => {
-				this.emit({ type: "notice", level: "error", text: err.error });
-			},
+		try {
+			await conv.session.bindExtensions({
+				mode: "rpc",
+				uiContext: this.webUi,
+				onError: (err) => {
+					this.emit({ type: "notice", level: "error", text: err.error });
+				},
+			});
+		} catch (error) {
+			this.disposeTelemetryMapper(conv);
+			throw error;
+		}
+		this.disposeTelemetryMapper(conv);
+		if (this.telemetry) {
+			try {
+				const sessionId = conv.runtime.session.sessionId;
+				conv.telemetryMapper = new PiEventMapper({
+					source: this.telemetry.source,
+					sessionId,
+					conversationId: conv.telemetryConversationId,
+					idNamespace: `${conv.telemetryConversationId}:${sessionId}:${randomUUID()}`,
+				});
+			} catch {
+				conv.telemetryMapper = undefined;
+			}
+		}
+		conv.unsubscribe = conv.session.subscribe((event) => {
+			this.emitTelemetry(conv, event);
+			this.onEvent(conv, event);
 		});
-		conv.unsubscribe = conv.session.subscribe((event) =>
-			this.onEvent(conv, event),
-		);
 		this.scheduleSnapshot();
 		this.webUi.refresh();
 		this.startWidgetsTimer();
@@ -2363,6 +2429,7 @@ export class ClientSession {
 		try {
 			conv.unsubscribe?.();
 			conv.unsubscribe = undefined;
+			this.disposeTelemetryMapper(conv);
 			this.clearAllToolWatchdogs(conv);
 			conv.toolStartTimes.clear();
 			await conv.runtime.dispose();
@@ -2377,7 +2444,7 @@ export class ClientSession {
 			conv.runtime = runtime;
 			conv.session = runtime.session;
 			this.emit({ type: "notice", level: "warning", text: reason });
-			await this.bindSession();
+			await this.bindSession(conv);
 			this.emitConversations();
 			void this.pushSlashCommands();
 		} catch (err) {
@@ -2531,6 +2598,7 @@ export class ClientSession {
 		conv.terminals.killAll();
 		conv.unsubscribe?.();
 		conv.unsubscribe = undefined;
+		this.disposeTelemetryMapper(conv);
 		void conv.runtime.dispose().catch(() => {});
 	}
 
@@ -3373,6 +3441,7 @@ export class ClientSession {
 		for (const conv of this.convs.values()) {
 			this.clearAllToolWatchdogs(conv);
 			conv.unsubscribe?.();
+			this.disposeTelemetryMapper(conv);
 			try {
 				await conv.runtime.dispose();
 			} catch {
@@ -3414,6 +3483,7 @@ export class AgentService {
 	constructor(
 		private cwd: string,
 		stateFile: string,
+		private readonly telemetry?: AgentServiceTelemetry,
 	) {
 		this.stateStore = new ClientStateStore(stateFile);
 	}
@@ -3521,6 +3591,7 @@ export class AgentService {
 					clientId,
 					cwd,
 					this.stateStore,
+					this.telemetry,
 				).finally(() => {
 					this.pending.delete(clientId);
 				});

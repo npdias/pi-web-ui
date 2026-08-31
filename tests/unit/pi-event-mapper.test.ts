@@ -166,6 +166,45 @@ const lifecycleCases: Array<{
 ];
 
 describe("PiEventMapper", () => {
+	it("uses a concrete-session namespace without changing conversation metadata", () => {
+		const subject = new PiEventMapper({
+			source: { host_id: "robot-01", component: "pi" },
+			sessionId: "session-a",
+			conversationId: "conversation-stable",
+			idNamespace: "conversation-stable:session-a",
+		});
+
+		const [record] = subject.map({ type: "agent_start" });
+
+		expect(record.correlation).toMatchObject({
+			trace_id: "conversation-stable:session-a:run:1",
+			session_id: "session-a",
+			conversation_id: "conversation-stable",
+		});
+	});
+
+	it("namespaces tool correlation IDs when a concrete-session namespace is supplied", () => {
+		const subject = new PiEventMapper({
+			source: { host_id: "robot-01", component: "pi" },
+			sessionId: "session-b",
+			conversationId: "conversation-stable",
+			idNamespace: "conversation-stable:session-b",
+		});
+
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		const [record] = subject.map({
+			type: "tool_execution_start",
+			toolCallId: "reused-tool-id",
+			toolName: "fixture",
+			args: {},
+		});
+
+		expect(record.correlation?.tool_call_id).toBe(
+			"conversation-stable:session-b:tool:reused-tool-id",
+		);
+	});
+
 	it.each(lifecycleCases)("maps $name with stable parent ids", ({ prepare, event, want }) => {
 		const subject = mapper();
 		for (const prerequisite of prepare) subject.map(prerequisite);
