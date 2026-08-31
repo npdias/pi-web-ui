@@ -14,6 +14,11 @@ it("pins DSH trajectory donor commit and MIT license", async () => {
 	expect(notice).toContain("Copyright (c) 2026 DeepSeek");
 	expect(notice).toContain("MIT");
 	expect(notice).toContain("https://github.com/deepseek-ai/DeepSeek-Harness/blob/0a53fb55bea101816fa226bb964ae2bed71c343b/LICENSE");
+	expect(notice).toContain("src/client/layout.ts` -> `web/src/observe/trajectory/project.ts");
+	expect(notice).toContain("tests/layout.client.spec.tsx` -> `tests/unit/trajectory-project.test.ts");
+	expect(notice).toContain(
+		"tests/virtual-rows.client.spec.ts` -> `tests/unit/trajectory-virtual-rows.test.ts",
+	);
 });
 
 it("includes the third-party notice in the packed npm artifact", async () => {

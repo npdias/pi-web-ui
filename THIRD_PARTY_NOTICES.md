@@ -12,12 +12,21 @@ Observe Trajectory work derives from DeepSeek Harness trajectory UI code.
 - License source: https://github.com/deepseek-ai/DeepSeek-Harness/blob/0a53fb55bea101816fa226bb964ae2bed71c343b/LICENSE
 - Copyright: Copyright (c) 2026 DeepSeek
 
-Task 1 adds attribution before donor code lands. Planned adaptation boundary:
+Task 3 copied or substantially adapted these donor files:
 
 - `src/client/trajectory-record.ts` -> `web/src/observe/trajectory/record.ts`
-- `src/client/trajectory-event-projection.ts` plus `src/client/trajectory-snapshot-builder.ts` -> `web/src/observe/trajectory/project.ts`
+- `src/client/layout.ts` -> `web/src/observe/trajectory/project.ts` (Turn/Step grouping and exact tool lifecycle pairing only; telemetry projection is rewritten around normalized envelopes)
 - `src/client/trajectory-search-index.ts` -> `web/src/observe/trajectory/search-index.ts`
 - `src/client/trajectory-virtual-rows.ts` -> `web/src/observe/trajectory/virtual-rows.ts`
+
+Task 3 test adaptations:
+
+- `tests/layout.client.spec.tsx` -> `tests/unit/trajectory-project.test.ts`
+- `tests/virtual-rows.client.spec.ts` -> `tests/unit/trajectory-virtual-rows.test.ts`
+- Search coverage in `tests/unit/trajectory-search.test.ts` is target-native coverage of the adapted `src/client/trajectory-search-index.ts`; the donor has no standalone search-index test.
+
+Later planned adaptation boundary:
+
 - `src/client/timeline.ts` -> Pi-owned timeline projection code
 - `src/client/TrajectoryTimeline.tsx` plus `src/client/TrajectoryTimeline.module.css` -> `web/src/observe/trajectory/TrajectoryTimeline.tsx` plus `web/src/observe/trajectory/TrajectoryTimeline.css`
 - `src/client/TrajectoryCell.tsx`, `src/client/TrajectoryTurn.tsx`, `src/client/TrajectoryTurnHeader.tsx`, selected `src/client/TrajectoryTable.tsx` structure, toolbar structure, CSS tokens -> Pi-owned ledger, inspector, toolbar, responsive styles
