@@ -25,12 +25,20 @@ const FIXTURE_NAMES = [
 ];
 const FORBIDDEN_FIXTURE_KEYS = new Set([
 	"args",
+	"apiKey",
+	"authorization",
 	"content",
+	"cookie",
+	"credential",
 	"headers",
 	"messages",
+	"payload",
 	"prompt",
+	"raw",
 	"result",
+	"secret",
 	"systemPrompt",
+	"token",
 	"toolResults",
 ]);
 const EXPECTATION_KEYS = new Set([
@@ -46,6 +54,29 @@ const EXPECTATION_KEYS = new Set([
 	"turn_id",
 	"step_id",
 	"request_id",
+]);
+const EXPECTATION_KINDS = new Set([
+	"agent.run",
+	"agent.stall",
+	"agent.turn",
+	"tool.execution",
+]);
+const EXPECTATION_PHASES = new Set(["start", "end", "observation"]);
+const EXPECTATION_SEVERITIES = new Set(["debug", "info", "warning", "error", "critical"]);
+const EXPECTATION_STATES = new Set([
+	"running",
+	"completed",
+	"error",
+	"cancelled",
+	"possibly_stalled",
+]);
+const EXPECTATION_ATTRIBUTES = new Set([
+	"is_error",
+	"matched_start",
+	"silence_ms",
+	"threshold_ms",
+	"tool_name",
+	"will_retry",
 ]);
 const EVENT_TYPES = new Set([
 	"agent_start",
@@ -140,6 +171,22 @@ function validateExpectation(expectation, location) {
 		assert.equal(typeof expectation[key], "string", `${location}.${key} is required`);
 		assert.ok(expectation[key].length > 0, `${location}.${key} is empty`);
 	}
+	assert.ok(EXPECTATION_KINDS.has(expectation.kind), `${location}.kind is invalid`);
+	assert.ok(EXPECTATION_PHASES.has(expectation.phase), `${location}.phase is invalid`);
+	assert.ok(EXPECTATION_SEVERITIES.has(expectation.severity), `${location}.severity is invalid`);
+	assert.ok(EXPECTATION_STATES.has(expectation.state), `${location}.state is invalid`);
+	for (const key of [
+		"parent_id",
+		"tool_call_id",
+		"trace_id",
+		"turn_id",
+		"step_id",
+		"request_id",
+	]) {
+		if (!Object.hasOwn(expectation, key)) continue;
+		assert.equal(typeof expectation[key], "string", `${location}.${key} is invalid`);
+		assert.ok(expectation[key].length > 0, `${location}.${key} is empty`);
+	}
 	if (Object.hasOwn(expectation, "duration_ms")) {
 		assert.equal(typeof expectation.duration_ms, "number", `${location}.duration_ms is invalid`);
 		assert.ok(Number.isFinite(expectation.duration_ms), `${location}.duration_ms is invalid`);
@@ -147,6 +194,17 @@ function validateExpectation(expectation, location) {
 	}
 	if (Object.hasOwn(expectation, "attributes")) {
 		assert.ok(isRecord(expectation.attributes), `${location}.attributes must be an object`);
+		for (const [key, value] of Object.entries(expectation.attributes)) {
+			assert.ok(EXPECTATION_ATTRIBUTES.has(key), `${location} contains unknown attribute ${key}`);
+			if (key === "tool_name") {
+				assert.equal(typeof value, "string", `${location}.attributes.${key} is invalid`);
+			} else if (key.endsWith("_ms")) {
+				assert.equal(typeof value, "number", `${location}.attributes.${key} is invalid`);
+				assert.ok(Number.isFinite(value) && value >= 0, `${location}.attributes.${key} is invalid`);
+			} else {
+				assert.equal(typeof value, "boolean", `${location}.attributes.${key} is invalid`);
+			}
+		}
 	}
 }
 
@@ -234,6 +292,53 @@ function proveLoaderRejectsMalformedFixtures() {
 			() => loadFixtures(malformedExpectation, ["broken"]),
 			/\.state is required/,
 			"loader accepted malformed expectations",
+		);
+
+		const invalidExpectationEnum = join(root, "invalid-expectation-enum");
+		mkdirSync(invalidExpectationEnum);
+		writeFileSync(
+			join(invalidExpectationEnum, "broken.jsonl"),
+			`${JSON.stringify({
+				fixture: "broken",
+				at_ms: 0,
+				event: { type: "agent_start" },
+				expect: [{
+					kind: "made.up",
+					phase: "start",
+					severity: "info",
+					state: "running",
+					parent_id: "session-1",
+				}],
+			})}\n`,
+		);
+		assert.throws(
+			() => loadFixtures(invalidExpectationEnum, ["broken"]),
+			/\.kind is invalid/,
+			"loader accepted invalid expectation enums",
+		);
+
+		const unsafeExpectationAttribute = join(root, "unsafe-expectation-attribute");
+		mkdirSync(unsafeExpectationAttribute);
+		writeFileSync(
+			join(unsafeExpectationAttribute, "broken.jsonl"),
+			`${JSON.stringify({
+				fixture: "broken",
+				at_ms: 0,
+				event: { type: "agent_start" },
+				expect: [{
+					kind: "agent.run",
+					phase: "start",
+					severity: "info",
+					state: "running",
+					parent_id: "session-1",
+					attributes: { authorization: "private" },
+				}],
+			})}\n`,
+		);
+		assert.throws(
+			() => loadFixtures(unsafeExpectationAttribute, ["broken"]),
+			/forbidden authorization|unknown attribute authorization/,
+			"loader accepted unsafe expectation attributes",
 		);
 
 		const mismatchedName = join(root, "mismatched-name");
@@ -529,7 +634,9 @@ try {
 		gaps: 0,
 	});
 	console.log(`PASS integrated queue boundary: ${emittedCount}/${emittedCount} accepted`);
-	console.log("PASS fixture loader rejects malformed JSONL, expectations, and name drift");
+	console.log(
+		"PASS fixture loader rejects malformed JSONL, expectations, unsafe attributes, and name drift",
+	);
 } catch (error) {
 	exitCode = 1;
 	console.error(`FAIL ${error.stack ?? error}`);
