@@ -250,6 +250,32 @@ function isAssistantMessageEvent(value: unknown): boolean {
 	}
 }
 
+function hasThinkingBlockAt(message: unknown, contentIndex: number): boolean {
+	return (
+		isRecord(message) &&
+		Array.isArray(message.content) &&
+		contentIndex < message.content.length &&
+		Object.hasOwn(message.content, contentIndex) &&
+		isThinkingBlock(message.content[contentIndex])
+	);
+}
+
+function hasAlignedThinkingContent(message: unknown, update: unknown): boolean {
+	if (!isRecord(update)) return false;
+	if (
+		update.type !== "thinking_start" &&
+		update.type !== "thinking_delta" &&
+		update.type !== "thinking_end"
+	) {
+		return true;
+	}
+	if (!isContentIndex(update.contentIndex)) return false;
+	return (
+		hasThinkingBlockAt(message, update.contentIndex) &&
+		hasThinkingBlockAt(update.partial, update.contentIndex)
+	);
+}
+
 function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 	if (!isRecord(value) || typeof value.type !== "string") return false;
 	switch (value.type) {
@@ -282,7 +308,11 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 				typeof value.isError === "boolean"
 			);
 		case "message_update":
-			return isAssistantMessage(value.message) && isAssistantMessageEvent(value.assistantMessageEvent);
+			return (
+				isAssistantMessage(value.message) &&
+				isAssistantMessageEvent(value.assistantMessageEvent) &&
+				hasAlignedThinkingContent(value.message, value.assistantMessageEvent)
+			);
 		case "auto_retry_end":
 			return (
 				typeof value.success === "boolean" &&
@@ -296,7 +326,7 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 	}
 }
 
-function isTelemetryContext(value: unknown): value is PiTelemetryContext {
+function isTelemetryContextShape(value: unknown): value is PiTelemetryContext {
 	if (
 		!isRecord(value) ||
 		typeof value.systemPrompt !== "string" ||
@@ -317,6 +347,41 @@ function isTelemetryContext(value: unknown): value is PiTelemetryContext {
 		}
 	}
 	return true;
+}
+
+function isJsonGraph(value: unknown, ancestors = new Set<object>()): boolean {
+	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+	if (typeof value === "number") return Number.isFinite(value);
+	if (typeof value !== "object") return false;
+	if (ancestors.has(value)) return false;
+	ancestors.add(value);
+	try {
+		if (Array.isArray(value)) {
+			for (let index = 0; index < value.length; index++) {
+				if (!Object.hasOwn(value, index) || !isJsonGraph(value[index], ancestors)) return false;
+			}
+			return true;
+		}
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return false;
+		for (const key of Object.keys(value)) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !("value" in descriptor) || !isJsonGraph(descriptor.value, ancestors)) {
+				return false;
+			}
+		}
+		return true;
+	} finally {
+		ancestors.delete(value);
+	}
+}
+
+function hasJsonToolSchemas(context: PiTelemetryContext): boolean {
+	try {
+		return context.toolSchemas.every((tool) => isJsonGraph(tool.schema));
+	} catch {
+		return false;
+	}
 }
 
 function stableValue(value: unknown, seen = new Set<object>()): JsonValue {
@@ -403,6 +468,8 @@ export class PiEventMapper {
 	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[] {
 		if (this.disposed) return [];
 		if (!isSupportedEvent(event)) return [];
+		const validatedContext = isTelemetryContextShape(context) ? context : undefined;
+		if (validatedContext && !hasJsonToolSchemas(validatedContext)) return [];
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
 		const records: PiTelemetryRecord[] = [];
@@ -429,8 +496,8 @@ export class PiEventMapper {
 				};
 			}
 		}
-		const contextRecord = isTelemetryContext(context)
-			? this.mapContext(context, wallTime)
+		const contextRecord = validatedContext
+			? this.mapContext(validatedContext, wallTime)
 			: undefined;
 		if (contextRecord) records.push(contextRecord);
 

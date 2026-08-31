@@ -463,6 +463,77 @@ describe("PiEventMapper", () => {
 	});
 
 	it.each([
+		[
+			"text-only thinking end",
+			{
+				type: "message_update",
+				message: assistant("pending", [{ type: "text", text: "answer" }]),
+				assistantMessageEvent: {
+					type: "thinking_end",
+					contentIndex: 0,
+					content: "spoofed thinking",
+					partial: assistant("pending", [{ type: "text", text: "answer" }]),
+				},
+			},
+		],
+		[
+			"out-of-range thinking start",
+			{
+				type: "message_update",
+				message: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				assistantMessageEvent: {
+					type: "thinking_start",
+					contentIndex: 1,
+					partial: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				},
+			},
+		],
+		[
+			"out-of-range thinking delta",
+			{
+				type: "message_update",
+				message: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				assistantMessageEvent: {
+					type: "thinking_delta",
+					contentIndex: 1,
+					delta: "more",
+					partial: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				},
+			},
+		],
+		[
+			"out-of-range thinking end",
+			{
+				type: "message_update",
+				message: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				assistantMessageEvent: {
+					type: "thinking_end",
+					contentIndex: 1,
+					content: "summary",
+					partial: assistant("pending", [{ type: "thinking", thinking: "summary" }]),
+				},
+			},
+		],
+	] as const)("ignores %s without changing context or turn state", (_name, malformed) => {
+		const subject = mapper();
+		const initial: PiTelemetryContext = { systemPrompt: "prompt-1", toolSchemas: [] };
+		const changed: PiTelemetryContext = { systemPrompt: "prompt-2", toolSchemas: [] };
+		subject.map({ type: "agent_start" }, initial);
+		const [, firstTurn] = subject.map({ type: "turn_start" }, changed);
+
+		expect(subject.map(malformed as unknown as AgentSessionEvent, initial)).toEqual([]);
+
+		const nextRecords = subject.map({ type: "turn_start" }, initial);
+		expect(nextRecords.map((record) => record.kind)).toEqual(["context.changed", "agent.turn"]);
+		expect(nextRecords[1].attributes).toMatchObject({ duplicate_start: true });
+		expect(nextRecords[1].correlation).toMatchObject({
+			turn_id: firstTurn.correlation?.turn_id,
+			step_id: firstTurn.correlation?.step_id,
+			request_id: firstTurn.correlation?.request_id,
+		});
+	});
+
+	it.each([
 		["agent_end messages", { type: "agent_end", messages: null, willRetry: false }],
 		["agent_end message entry", { type: "agent_end", messages: [null], willRetry: false }],
 		["agent_end message object", { type: "agent_end", messages: [{}], willRetry: false }],
@@ -593,6 +664,65 @@ describe("PiEventMapper", () => {
 			});
 		},
 	);
+
+	it.each([
+		[
+			"self-referential array",
+			() => {
+				const schema: unknown[] = [];
+				schema.push(schema);
+				return schema;
+			},
+		],
+		[
+			"object-array mixed cycle",
+			() => {
+				const schema: { items?: unknown[] } = {};
+				const items: unknown[] = [schema];
+				schema.items = items;
+				return schema;
+			},
+		],
+		["boxed BigInt", () => Object(1n)],
+		["Map", () => new Map([["type", "object"]])],
+		["Date", () => new Date("2026-08-31T00:00:00Z")],
+		["RegExp", () => /object/],
+	] as const)("rejects %s before clocks, state, or context emission", (_name, makeSchema) => {
+		let wallCalls = 0;
+		let monotonicCalls = 0;
+		const subject = new PiEventMapper({
+			source: { host_id: "robot-01", component: "pi" },
+			sessionId: "session-1",
+			conversationId: "conversation-1",
+			wallNow: () => {
+				wallCalls++;
+				return 1_700_000_000_000;
+			},
+			monotonicNow: () => {
+				monotonicCalls++;
+				return 100;
+			},
+		});
+		const invalidContext: PiTelemetryContext = {
+			systemPrompt: "prompt",
+			toolSchemas: [{ name: "cyclic", schema: makeSchema() }],
+		};
+		let records: ReturnType<PiEventMapper["map"]> = [];
+
+		expect(() => {
+			records = subject.map({ type: "agent_start" }, invalidContext);
+		}).not.toThrow();
+		expect(records).toEqual([]);
+		expect({ wallCalls, monotonicCalls }).toEqual({ wallCalls: 0, monotonicCalls: 0 });
+
+		const validRecords = subject.map(
+			{ type: "agent_start" },
+			{ systemPrompt: "prompt", toolSchemas: [{ name: "read", schema: { type: "object" } }] },
+		);
+		expect(validRecords.map((record) => record.kind)).toEqual(["context.changed", "agent.run"]);
+		expect(validRecords[0].correlation).toMatchObject({ trace_id: "conversation-1:run:1" });
+		expect(validRecords[1].attributes).not.toHaveProperty("duplicate_start");
+	});
 
 	it("does not consume a matched tool start when malformed tool end arrives", () => {
 		const clock = { wall: 1_700_000_000_000, mono: 100 };
