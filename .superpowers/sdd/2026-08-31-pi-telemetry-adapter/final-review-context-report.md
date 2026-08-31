@@ -56,7 +56,24 @@ Observed exit 0 with these added cases:
 | `npx tsc -p tsconfig.server.json --noEmit` | Exit 0 |
 | `git diff --check -- server/agent-service.ts tests/pi-telemetry-test.mjs` | Exit 0 |
 
-Whole-repo unit, typecheck, protocol, build, and smoke gates remain pending until concurrent Observe Task 2 changes reach a clean commit. The initial full typecheck attempt failed only in that unrelated dirty scope; this report does not claim those gates passed.
+Implementation commit: `e3bd10c` (`fix: emit Pi context hash changes`).
+
+## Clean combined-branch gates
+
+After concurrent Observe Task 2 committed and the worktree became clean, final checks ran against combined HEAD `f701720`:
+
+| Command | Result |
+| --- | --- |
+| `npx vitest run tests/unit/pi-event-mapper.test.ts tests/unit/telemetry-client.test.ts` | Exit 0; 96/96 |
+| `node tests/pi-telemetry-test.mjs` | Exit 0 |
+| `node tests/pi-telemetry-scenarios-test.mjs` | Exit 0; 21/21 accepted |
+| `npm run typecheck` | Exit 0 |
+| `npm run check:protocol` | Exit 0; protocol v10 |
+| `npm test -- --run` | Exit 0; 31 files, 340/340 |
+| `npm run build` | Exit 0 |
+| `npm run test:smoke` | Exit 1; 32/33. Only known `settings-test` assertion `skill re-enabled` failed. |
+
+The earlier full typecheck attempt failed only while Observe Task 2 held uncommitted RED tests. No Pi context file caused those errors.
 
 ## Limits
 
