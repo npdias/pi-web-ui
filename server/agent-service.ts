@@ -420,6 +420,8 @@ interface Conversation {
 	bindGeneration: number;
 	/** Invalidates edit/reset work when another operation wins this conversation. */
 	operationGeneration: number;
+	/** Serializes edit/fork operations that target this conversation. */
+	editTail: Promise<void>;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -847,6 +849,8 @@ export class ClientSession {
 	private disposed = false;
 	private lifecycleGeneration = 0;
 	private navigationGeneration = 0;
+	private navigationRequestGeneration = 0;
+	private latestActionableNavigationRequest = 0;
 	/** pi-config readiness check, cached briefly so 60ms snapshots don't hit disk. */
 	private piCheckCache: { at: number; configured: boolean } | null = null;
 
@@ -1137,6 +1141,7 @@ export class ClientSession {
 			telemetryMapper: undefined,
 			bindGeneration: 0,
 			operationGeneration: 0,
+			editTail: Promise.resolve(),
 			deltaSeq: 0,
 			terminals,
 			msgIds: new Map(),
@@ -1211,6 +1216,12 @@ export class ClientSession {
 		);
 	}
 
+	private beginNavigation(requestGeneration: number): number | null {
+		if (requestGeneration < this.latestActionableNavigationRequest) return null;
+		this.latestActionableNavigationRequest = requestGeneration;
+		return ++this.navigationGeneration;
+	}
+
 	private ownsConversationOperation(
 		conv: Conversation,
 		runtime: AgentSessionRuntime,
@@ -1232,7 +1243,9 @@ export class ClientSession {
 		runtime: AgentSessionRuntime,
 	): void {
 		runtime.setRebindSession(async (nextSession) => {
-			await this.bindSession(conv, runtime, nextSession);
+			await this.bindSession(conv, runtime, nextSession, {
+				preserveCoreOnExtensionFailure: true,
+			});
 		});
 	}
 
@@ -1251,10 +1264,15 @@ export class ClientSession {
 	): Promise<void> {
 		if (
 			this.convs.get(conv.id) === conv &&
-			conv.runtime === runtime &&
-			this.activeId !== conv.id
+			conv.runtime === runtime
 		) {
-			this.removeConversation(conv.id);
+			if (this.activeId !== conv.id) {
+				this.removeConversation(conv.id);
+				return;
+			}
+			await this.bindSession(conv, runtime, runtime.session, {
+				preserveCoreOnExtensionFailure: true,
+			});
 			return;
 		}
 		await this.disposeUninstalledRuntime(runtime);
@@ -1369,6 +1387,7 @@ export class ClientSession {
 			conv.session === session &&
 			conv.unsubscribe
 		) {
+			this.installRuntimeRebind(conv, runtime);
 			return true;
 		}
 		const bindGeneration = ++conv.bindGeneration;
@@ -2720,8 +2739,8 @@ export class ClientSession {
 
 	async newChat(): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const navigationRequestGeneration = ++this.navigationRequestGeneration;
 		const lifecycleGeneration = this.lifecycleGeneration;
-		const navigationGeneration = ++this.navigationGeneration;
 		// Reuse an already-open blank conversation instead of piling up new ones
 		// on every click: if the active chat has no messages it IS the new chat
 		// (focus already on it); otherwise switch to the first blank one (under
@@ -2762,6 +2781,8 @@ export class ClientSession {
 			});
 			return;
 		}
+		const navigationGeneration = this.beginNavigation(navigationRequestGeneration);
+		if (navigationGeneration === null) return;
 		// Carry the model chosen in the active chat over to the new chat so it
 		// doesn't silently revert to the ModelRuntime default model.
 		const prevModel = this.conv.session.agent.state.model ?? null;
@@ -2885,7 +2906,7 @@ export class ClientSession {
 	/** Switch the ACTIVE conversation without interrupting any other chat. */
 	async switchConversation(id: string): Promise<void> {
 		if (!this.convs.has(id)) return;
-		this.navigationGeneration++;
+		const navigationRequestGeneration = ++this.navigationRequestGeneration;
 		if (id === this.activeId) {
 			const conv = this.conv;
 			if (this.cwd !== conv.cwd) {
@@ -2911,6 +2932,7 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
+		if (this.beginNavigation(navigationRequestGeneration) === null) return;
 		const displaced = this.displaceActive();
 		this.activeId = id;
 		const newCwd = this.conv.cwd;
@@ -3157,8 +3179,8 @@ export class ClientSession {
 	 */
 	async switchSession(path: string): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const navigationRequestGeneration = ++this.navigationRequestGeneration;
 		const lifecycleGeneration = this.lifecycleGeneration;
-		const navigationGeneration = ++this.navigationGeneration;
 		let openedRuntime: AgentSessionRuntime | null = null;
 		let openedTerminals: TerminalManager | null = null;
 		try {
@@ -3177,6 +3199,8 @@ export class ClientSession {
 
 			const sessionManager = SessionManager.open(targetPath);
 			const targetCwd = sessionManager.getCwd();
+			const navigationGeneration = this.beginNavigation(navigationRequestGeneration);
+			if (navigationGeneration === null) return;
 			const conversationId = this.nextConversationId();
 			openedTerminals = this.makeTerminalManager(conversationId, targetCwd);
 			openedRuntime = await createAgentSessionRuntime(
@@ -3266,7 +3290,10 @@ export class ClientSession {
 	 * serialize.ts) back to its append-only session entry id. The seq handles
 	 * two user messages sharing the same millisecond timestamp.
 	 */
-	private resolveUserMessageEntryId(messageId: string): string | null {
+	private resolveUserMessageEntryId(
+		messageId: string,
+		session: AgentSession = this.session,
+	): string | null {
 		const m = /^u-(\d+)(?:-(\d+))?$/.exec(messageId);
 		if (!m) return null;
 		const ts = Number(m[1]);
@@ -3275,7 +3302,7 @@ export class ClientSession {
 		// Resolve against the compaction-aware current leaf path — the same list
 		// the UI renders (state.messages). Scanning the whole file (getEntries)
 		// could match a summarized entry or one on a different branch.
-		for (const entry of this.session.sessionManager.buildContextEntries()) {
+		for (const entry of session.sessionManager.buildContextEntries()) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as unknown as { message?: AgentMessage }).message;
 			if (!msg || msg.role !== "user" || msg.timestamp !== ts) continue;
@@ -3303,7 +3330,29 @@ export class ClientSession {
 		attachments?: Parameters<ClientSession["prompt"]>[1],
 	): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const conv = this.conv;
+		const previousEdit = conv.editTail;
+		let releaseEdit!: () => void;
+		conv.editTail = new Promise<void>((resolveEdit) => {
+			releaseEdit = resolveEdit;
+		});
+		await previousEdit.catch(() => {});
+		try {
+			if (this.quiesceBlocked()) return;
+			await this.editMessageInConversation(conv, messageId, text, attachments);
+		} finally {
+			releaseEdit();
+		}
+	}
+
+	private async editMessageInConversation(
+		conv: Conversation,
+		messageId: string,
+		text: string,
+		attachments?: Parameters<ClientSession["prompt"]>[1],
+	): Promise<void> {
 		const lifecycleGeneration = this.lifecycleGeneration;
+		if (this.convs.get(conv.id) !== conv || this.activeId !== conv.id) return;
 		const trimmed = text.trim();
 		if (!trimmed) {
 			this.emit({
@@ -3314,7 +3363,7 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		const entryId = this.resolveUserMessageEntryId(messageId);
+		const entryId = this.resolveUserMessageEntryId(messageId, conv.session);
 		if (!entryId) {
 			this.emit({
 				type: "notice",
@@ -3324,7 +3373,6 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
-		const conv = this.conv;
 		const runtime = conv.runtime;
 		const navigationGeneration = this.navigationGeneration;
 		const operationGeneration = ++conv.operationGeneration;
@@ -3354,7 +3402,9 @@ export class ClientSession {
 				this.flushSnapshot();
 				return;
 			}
-			await this.bindSession(conv, runtime, runtime.session);
+			await this.bindSession(conv, runtime, runtime.session, {
+				preserveCoreOnExtensionFailure: true,
+			});
 			if (!this.ownsConversationOperation(
 				conv,
 				runtime,
@@ -3526,15 +3576,15 @@ export class ClientSession {
 	}
 
 	async setCwd(newCwd: string): Promise<void> {
+		const navigationRequestGeneration = ++this.navigationRequestGeneration;
 		const lifecycleGeneration = this.lifecycleGeneration;
-		const navigationGeneration = ++this.navigationGeneration;
 		try {
 			const { resolve } = await import("node:path");
 			this.files.unwatchGit(); // stale repo's watcher must not fire across projects
 			const fs = await import("node:fs/promises");
 			const abs = resolve(newCwd);
 			const st = await fs.stat(abs);
-			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
+			if (!this.isLifecycleCurrent(lifecycleGeneration)) return;
 			if (!st.isDirectory()) {
 				throw new Error("路径不是目录");
 			}
@@ -3551,6 +3601,8 @@ export class ClientSession {
 				this.flushSnapshot();
 				return;
 			}
+			const navigationGeneration = this.beginNavigation(navigationRequestGeneration);
+			if (navigationGeneration === null) return;
 
 			// Prefer the target project's own most recently active conversation;
 			// only create a fresh one (resuming its most recent session) when the
