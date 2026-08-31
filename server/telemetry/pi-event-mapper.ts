@@ -61,9 +61,140 @@ function isContentIndex(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function isDenseArrayOf(value: unknown, predicate: (item: unknown) => boolean): value is unknown[] {
+	if (!Array.isArray(value)) return false;
+	for (let index = 0; index < value.length; index++) {
+		if (!Object.hasOwn(value, index) || !predicate(value[index])) return false;
+	}
+	return true;
+}
+
+function isContentBlock(value: unknown): boolean {
+	if (!isRecord(value)) return false;
+	switch (value.type) {
+		case "text":
+			return typeof value.text === "string";
+		case "thinking":
+			return typeof value.thinking === "string";
+		case "image":
+			return typeof value.data === "string" && typeof value.mimeType === "string";
+		case "toolCall":
+			return (
+				typeof value.id === "string" &&
+				typeof value.name === "string" &&
+				isRecord(value.arguments)
+			);
+		default:
+			return false;
+	}
+}
+
+function isUsage(value: unknown): boolean {
+	if (!isRecord(value) || !isRecord(value.cost)) return false;
+	return (
+		isFiniteNumber(value.input) &&
+		isFiniteNumber(value.output) &&
+		isFiniteNumber(value.cacheRead) &&
+		isFiniteNumber(value.cacheWrite) &&
+		isFiniteNumber(value.totalTokens) &&
+		isFiniteNumber(value.cost.input) &&
+		isFiniteNumber(value.cost.output) &&
+		isFiniteNumber(value.cost.cacheRead) &&
+		isFiniteNumber(value.cost.cacheWrite) &&
+		isFiniteNumber(value.cost.total)
+	);
+}
+
+function isStopReason(value: unknown): boolean {
+	return (
+		value === "pending" ||
+		value === "stop" ||
+		value === "length" ||
+		value === "toolUse" ||
+		value === "error" ||
+		value === "aborted" ||
+		value === "deferred"
+	);
+}
+
+function isAssistantMessage(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		value.role === "assistant" &&
+		isDenseArrayOf(value.content, isContentBlock) &&
+		typeof value.api === "string" &&
+		typeof value.provider === "string" &&
+		typeof value.model === "string" &&
+		isUsage(value.usage) &&
+		isStopReason(value.stopReason) &&
+		isFiniteNumber(value.timestamp)
+	);
+}
+
+function isToolResultMessage(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		value.role === "toolResult" &&
+		typeof value.toolCallId === "string" &&
+		typeof value.toolName === "string" &&
+		isDenseArrayOf(value.content, isContentBlock) &&
+		typeof value.isError === "boolean" &&
+		isFiniteNumber(value.timestamp)
+	);
+}
+
+function isAgentMessage(value: unknown): boolean {
+	if (!isRecord(value) || typeof value.role !== "string") return false;
+	switch (value.role) {
+		case "assistant":
+			return isAssistantMessage(value);
+		case "user":
+			return (
+				(typeof value.content === "string" || isDenseArrayOf(value.content, isContentBlock)) &&
+				isFiniteNumber(value.timestamp)
+			);
+		case "toolResult":
+			return isToolResultMessage(value);
+		case "bashExecution":
+			return (
+				typeof value.command === "string" &&
+				typeof value.output === "string" &&
+				(value.exitCode === undefined || isFiniteNumber(value.exitCode)) &&
+				typeof value.cancelled === "boolean" &&
+				typeof value.truncated === "boolean" &&
+				isFiniteNumber(value.timestamp)
+			);
+		case "custom":
+			return (
+				typeof value.customType === "string" &&
+				(typeof value.content === "string" || isDenseArrayOf(value.content, isContentBlock)) &&
+				typeof value.display === "boolean" &&
+				isFiniteNumber(value.timestamp)
+			);
+		case "branchSummary":
+			return (
+				typeof value.summary === "string" &&
+				typeof value.fromId === "string" &&
+				isFiniteNumber(value.timestamp)
+			);
+		case "compactionSummary":
+			return (
+				typeof value.summary === "string" &&
+				isFiniteNumber(value.tokensBefore) &&
+				isFiniteNumber(value.timestamp)
+			);
+		default:
+			return false;
+	}
+}
+
 function isAssistantMessageEvent(value: unknown): boolean {
 	if (!isRecord(value) || typeof value.type !== "string") return false;
-	const hasPartial = isRecord(value.partial);
+	const hasPartial = isAssistantMessage(value.partial);
 	switch (value.type) {
 		case "start":
 			return hasPartial;
@@ -79,17 +210,26 @@ function isAssistantMessageEvent(value: unknown): boolean {
 		case "thinking_end":
 			return isContentIndex(value.contentIndex) && typeof value.content === "string" && hasPartial;
 		case "toolcall_end":
-			return isContentIndex(value.contentIndex) && isRecord(value.toolCall) && hasPartial;
+			return (
+				isContentIndex(value.contentIndex) &&
+				isRecord(value.toolCall) &&
+				value.toolCall.type === "toolCall" &&
+				isContentBlock(value.toolCall) &&
+				hasPartial
+			);
 		case "done":
 			return (
 				(value.reason === "stop" ||
 					value.reason === "length" ||
 					value.reason === "toolUse" ||
 					value.reason === "deferred") &&
-				isRecord(value.message)
+				isAssistantMessage(value.message)
 			);
 		case "error":
-			return (value.reason === "aborted" || value.reason === "error") && isRecord(value.error);
+			return (
+				(value.reason === "aborted" || value.reason === "error") &&
+				isAssistantMessage(value.error)
+			);
 		default:
 			return false;
 	}
@@ -104,12 +244,11 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 			return true;
 		case "agent_end":
 			return (
-				Array.isArray(value.messages) &&
-				value.messages.every(isRecord) &&
+				isDenseArrayOf(value.messages, isAgentMessage) &&
 				typeof value.willRetry === "boolean"
 			);
 		case "turn_end":
-			return isRecord(value.message) && Array.isArray(value.toolResults);
+			return isAgentMessage(value.message) && isDenseArrayOf(value.toolResults, isToolResultMessage);
 		case "tool_execution_start":
 			return (
 				typeof value.toolCallId === "string" &&
@@ -128,7 +267,7 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 				typeof value.isError === "boolean"
 			);
 		case "message_update":
-			return isRecord(value.message) && isAssistantMessageEvent(value.assistantMessageEvent);
+			return isAssistantMessage(value.message) && isAssistantMessageEvent(value.assistantMessageEvent);
 		case "auto_retry_end":
 			return (
 				typeof value.success === "boolean" &&
@@ -143,18 +282,26 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 }
 
 function isTelemetryContext(value: unknown): value is PiTelemetryContext {
-	return (
-		isRecord(value) &&
-		typeof value.systemPrompt === "string" &&
-		Array.isArray(value.toolSchemas) &&
-		value.toolSchemas.every(
-			(tool) =>
-				isRecord(tool) &&
-				typeof tool.name === "string" &&
-				tool.name.length > 0 &&
-				Object.hasOwn(tool, "schema"),
-		)
-	);
+	if (
+		!isRecord(value) ||
+		typeof value.systemPrompt !== "string" ||
+		!Array.isArray(value.toolSchemas)
+	) {
+		return false;
+	}
+	for (let index = 0; index < value.toolSchemas.length; index++) {
+		if (!Object.hasOwn(value.toolSchemas, index)) return false;
+		const tool = value.toolSchemas[index];
+		if (
+			!isRecord(tool) ||
+			typeof tool.name !== "string" ||
+			tool.name.length === 0 ||
+			!Object.hasOwn(tool, "schema")
+		) {
+			return false;
+		}
+	}
+	return true;
 }
 
 function stableValue(value: unknown, seen = new Set<object>()): JsonValue {

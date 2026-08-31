@@ -465,10 +465,42 @@ describe("PiEventMapper", () => {
 	it.each([
 		["agent_end messages", { type: "agent_end", messages: null, willRetry: false }],
 		["agent_end message entry", { type: "agent_end", messages: [null], willRetry: false }],
+		["agent_end message object", { type: "agent_end", messages: [{}], willRetry: false }],
 		["turn_end message", { type: "turn_end", message: null, toolResults: [] }],
+		["turn_end message object", { type: "turn_end", message: {}, toolResults: [] }],
+		[
+			"turn_end tool result",
+			{ type: "turn_end", message: assistant("stop"), toolResults: [null] },
+		],
 		["tool start identity", { type: "tool_execution_start", toolCallId: 7, toolName: "bash", args: {} }],
 		["tool end error flag", { type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: {}, isError: "false" }],
 		["message update payload", { type: "message_update", message: assistant("pending"), assistantMessageEvent: null }],
+		[
+			"message update message",
+			{
+				type: "message_update",
+				message: {},
+				assistantMessageEvent: {
+					type: "thinking_end",
+					contentIndex: 0,
+					content: "provider summary",
+					partial: assistant("pending"),
+				},
+			},
+		],
+		[
+			"message update partial",
+			{
+				type: "message_update",
+				message: assistant("pending"),
+				assistantMessageEvent: {
+					type: "thinking_end",
+					contentIndex: 0,
+					content: "provider summary",
+					partial: {},
+				},
+			},
+		],
 		["retry end result", { type: "auto_retry_end", success: "false", attempt: 1 }],
 	] as const)(
 		"ignores malformed %s without emitting context or changing turn correlation",
@@ -549,6 +581,7 @@ describe("PiEventMapper", () => {
 		["system prompt", { systemPrompt: 7, toolSchemas: [] }],
 		["tool schema list", { systemPrompt: "prompt", toolSchemas: null }],
 		["tool schema name", { systemPrompt: "prompt", toolSchemas: [{ name: 7, schema: {} }] }],
+		["sparse tool schema list", { systemPrompt: "prompt", toolSchemas: Array(1) }],
 	] as const)(
 		"ignores malformed context %s while preserving valid lifecycle mapping",
 		(_name, malformedContext) => {
