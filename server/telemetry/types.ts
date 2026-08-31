@@ -60,6 +60,7 @@ export type TelemetrySocketState =
 export interface TelemetrySocketHealth {
 	state: TelemetrySocketState;
 	queued: number;
+	queuedBytes: number;
 	accepted: number;
 	rejected: number;
 	errors: number;

@@ -20,6 +20,28 @@ const records: PiTelemetryRecord[] = [
 	},
 ];
 
+const MIB = 1024 * 1024;
+const QUEUE_BYTE_CAP = 16 * MIB;
+
+function recordWithLineBytes(targetBytes: number, fill = "x"): PiTelemetryRecord {
+	const empty: PiTelemetryRecord = {
+		kind: "agent.turn",
+		phase: "observation",
+		source: { host_id: "robot-01", component: "pi" },
+		attributes: { payload: "" },
+	};
+	const emptyLineBytes = Buffer.byteLength(`${JSON.stringify(empty)}\n`, "utf8");
+	const fillBytes = Buffer.byteLength(fill, "utf8");
+	const payloadBytes = targetBytes - emptyLineBytes;
+	if (payloadBytes < 0 || payloadBytes % fillBytes !== 0) {
+		throw new Error("target line size cannot be represented by requested fill");
+	}
+	return {
+		...empty,
+		attributes: { payload: fill.repeat(payloadBytes / fillBytes) },
+	};
+}
+
 const clients: TelemetrySocketClient[] = [];
 const servers: Server[] = [];
 const tempDirs: string[] = [];
@@ -236,6 +258,95 @@ describe("TelemetrySocketClient", () => {
 		expect(client.health()).toMatchObject({ queued: 1_000, gaps: 1 });
 	});
 
+	it("caps serialized queued and sent data at exactly 16 MiB", () => {
+		vi.useFakeTimers();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => {
+				throw new Error("offline");
+			},
+		});
+		clients.push(client);
+		const oneMiBLine = recordWithLineBytes(MIB);
+
+		for (let index = 0; index < 1_000; index++) client.emit(oneMiBLine);
+
+		expect(client.health()).toMatchObject({
+			queued: 16,
+			queuedBytes: QUEUE_BYTE_CAP,
+			gaps: 984,
+		});
+	});
+
+	it("tracks UTF-8 queue bytes and releases them only after valid acknowledgement", () => {
+		vi.useFakeTimers();
+		const sockets: FakeSocket[] = [];
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket as unknown as Socket;
+			},
+		});
+		clients.push(client);
+		const multibyte: PiTelemetryRecord = {
+			...records[0],
+			attributes: { payload: "é🙂" },
+		};
+		const expectedBytes = Buffer.byteLength(`${JSON.stringify(multibyte)}\n`, "utf8");
+
+		client.emit(multibyte);
+		sockets[0].emit("connect");
+		expect(client.health().queuedBytes).toBe(expectedBytes);
+
+		sockets[0].emit("data", '{"accepted":true}\n');
+		expect(client.health()).toMatchObject({ queued: 1, queuedBytes: expectedBytes });
+
+		vi.advanceTimersByTime(250);
+		sockets[1].emit("connect");
+		sockets[1].emit(
+			"data",
+			'{"accepted":false,"event_id":null,"sequence":null,"error":"dropped"}\n',
+		);
+		expect(client.health()).toMatchObject({ queued: 0, queuedBytes: 0, rejected: 1 });
+	});
+
+	it("keeps one byte accounting total across disconnect and FIFO requeue", () => {
+		vi.useFakeTimers();
+		const sockets: FakeSocket[] = [];
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => {
+				const socket = new FakeSocket();
+				sockets.push(socket);
+				return socket as unknown as Socket;
+			},
+		});
+		clients.push(client);
+		const expectedBytes = records.reduce(
+			(total, record) => total + Buffer.byteLength(`${JSON.stringify(record)}\n`, "utf8"),
+			0,
+		);
+
+		for (const record of records) client.emit(record);
+		sockets[0].emit("connect");
+		expect(client.health().queuedBytes).toBe(expectedBytes);
+		sockets[0].emit("close");
+		expect(client.health().queuedBytes).toBe(expectedBytes);
+		vi.advanceTimersByTime(250);
+		sockets[1].emit("connect");
+		expect(client.health().queuedBytes).toBe(expectedBytes);
+
+		sockets[1].emit(
+			"data",
+			'{"accepted":true,"event_id":"tel_1","sequence":1,"error":null}\n',
+		);
+		expect(client.health().queuedBytes).toBe(
+			Buffer.byteLength(`${JSON.stringify(records[1])}\n`, "utf8"),
+		);
+	});
+
 	it("accounts for adapter failures and their explicit lost-record count", () => {
 		const client = new TelemetrySocketClient({ socketPath: socketPath() });
 		clients.push(client);
@@ -358,6 +469,133 @@ describe("TelemetrySocketClient", () => {
 		expect(sockets).toHaveLength(3);
 		vi.advanceTimersByTime(1);
 		expect(sockets).toHaveLength(4);
+	});
+
+	it("disconnects and requeues when oldest sent record misses one-second ACK deadline", () => {
+		vi.useFakeTimers();
+		const socket = new FakeSocket();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => socket as unknown as Socket,
+		});
+		clients.push(client);
+
+		client.emit(records[0]);
+		socket.emit("connect");
+		vi.advanceTimersByTime(999);
+		expect(client.health()).toMatchObject({ state: "connected", errors: 0, queued: 1 });
+		vi.advanceTimersByTime(1);
+
+		expect(socket.destroyedByClient).toBe(true);
+		expect(client.health()).toMatchObject({ state: "backoff", errors: 1, queued: 1 });
+		expect(vi.getTimerCount()).toBe(1);
+	});
+
+	it("does not extend ACK deadline when peer trickles data without LF", () => {
+		vi.useFakeTimers();
+		const socket = new FakeSocket();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => socket as unknown as Socket,
+		});
+		clients.push(client);
+		client.emit(records[0]);
+		socket.emit("connect");
+
+		vi.advanceTimersByTime(500);
+		socket.emit("data", '{"accepted":true,"event_id":"tel_1"');
+		vi.advanceTimersByTime(499);
+		expect(client.health().state).toBe("connected");
+		vi.advanceTimersByTime(1);
+
+		expect(client.health()).toMatchObject({ state: "backoff", errors: 1, queued: 1 });
+	});
+
+	it("rearms to next already-sent record's original absolute ACK deadline", () => {
+		vi.useFakeTimers();
+		const socket = new FakeSocket();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => socket as unknown as Socket,
+		});
+		clients.push(client);
+		client.emit(records[0]);
+		client.emit(records[1]);
+		socket.emit("connect");
+
+		vi.advanceTimersByTime(900);
+		socket.emit(
+			"data",
+			'{"accepted":true,"event_id":"tel_1","sequence":1,"error":null}\n',
+		);
+		expect(client.health()).toMatchObject({ state: "connected", accepted: 1, queued: 1 });
+		vi.advanceTimersByTime(99);
+		expect(client.health().state).toBe("connected");
+		vi.advanceTimersByTime(1);
+
+		expect(client.health()).toMatchObject({ state: "backoff", errors: 1, queued: 1 });
+	});
+
+	it.each([
+		["forward", 86_400_000],
+		["backward", -86_400_000],
+	] as const)("keeps absolute ACK deadline on monotonic time when wall clock jumps %s", (
+		_direction,
+		wallJumpMs,
+	) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(1_700_000_000_000);
+		let monotonicNow = 0;
+		const socket = new FakeSocket();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => socket as unknown as Socket,
+			monotonicNow: () => monotonicNow,
+		});
+		clients.push(client);
+		client.emit(records[0]);
+		client.emit(records[1]);
+		socket.emit("connect");
+
+		vi.advanceTimersByTime(900);
+		monotonicNow = 900;
+		vi.setSystemTime(1_700_000_000_000 + wallJumpMs);
+		socket.emit(
+			"data",
+			'{"accepted":true,"event_id":"tel_1","sequence":1,"error":null}\n',
+		);
+		expect(client.health()).toMatchObject({ state: "connected", accepted: 1, queued: 1 });
+
+		monotonicNow = 999;
+		vi.advanceTimersByTime(99);
+		expect(client.health().state).toBe("connected");
+		monotonicNow = 1_000;
+		vi.advanceTimersByTime(1);
+		expect(client.health()).toMatchObject({ state: "backoff", errors: 1, queued: 1 });
+	});
+
+	it("clears ACK deadline after final valid acknowledgement and on dispose", () => {
+		vi.useFakeTimers();
+		const socket = new FakeSocket();
+		const client = new TelemetrySocketClient({
+			socketPath: "/tmp/telemetry.sock",
+			connect: () => socket as unknown as Socket,
+		});
+		clients.push(client);
+		client.emit(records[0]);
+		socket.emit("connect");
+		expect(vi.getTimerCount()).toBe(1);
+
+		socket.emit(
+			"data",
+			'{"accepted":true,"event_id":"tel_1","sequence":1,"error":null}\n',
+		);
+		expect(vi.getTimerCount()).toBe(0);
+
+		client.emit(records[1]);
+		expect(vi.getTimerCount()).toBe(1);
+		client.dispose();
+		expect(vi.getTimerCount()).toBe(0);
 	});
 
 	it("dispose closes socket and timer, clears queue, and prevents reconnect", () => {

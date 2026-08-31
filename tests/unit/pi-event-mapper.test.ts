@@ -831,6 +831,65 @@ describe("PiEventMapper", () => {
 		},
 	);
 
+	it("terminates every open span in tool-turn-run order for a forced reset", () => {
+		const clock = { wall: 1_700_000_000_000, mono: 100 };
+		const subject = mapper(clock);
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		subject.map({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "read",
+			args: {},
+		});
+		subject.map({
+			type: "tool_execution_start",
+			toolCallId: "call-2",
+			toolName: "bash",
+			args: {},
+		});
+		clock.wall = 1_700_000_000_250;
+		clock.mono = 350;
+
+		const records = subject.forceReset();
+
+		expect(records.map((record) => `${record.kind}:${record.phase}:${record.state}`)).toEqual([
+			"tool.execution:end:cancelled",
+			"tool.execution:end:cancelled",
+			"agent.turn:end:cancelled",
+			"agent.run:end:aborted",
+		]);
+		expect(records.map((record) => record.correlation?.tool_call_id).filter(Boolean)).toEqual([
+			"call-1",
+			"call-2",
+		]);
+		for (const record of records) {
+			expect(record.duration_ms).toBe(250);
+			expect(record.attributes).toMatchObject({
+				cause_class: "forced_reset",
+				matched_start: true,
+			});
+			expect(JSON.stringify(record)).not.toContain("operator reset reason");
+		}
+		const unmatchedEnd = subject.map(toolEnd());
+		expect(unmatchedEnd[0].duration_ms).toBeUndefined();
+		expect(unmatchedEnd[0].correlation).not.toHaveProperty("turn_id");
+	});
+
+	it("emits an explicit forced-reset observation when no span is open", () => {
+		const subject = mapper();
+
+		expect(subject.forceReset()).toEqual([
+			expect.objectContaining({
+				kind: "agent.reset",
+				phase: "observation",
+				state: "forced_reset",
+				severity: "warning",
+				attributes: expect.objectContaining({ cause_class: "forced_reset" }),
+			}),
+		]);
+	});
+
 	it("reset clears open spans and context while dispose rejects later mapping", () => {
 		const clock = { wall: 1_700_000_000_000, mono: 100 };
 		const subject = mapper(clock);

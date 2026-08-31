@@ -146,6 +146,13 @@ function recordHasTool(record, sourceToolCallId) {
 	return id === sourceToolCallId || id?.endsWith(`:tool:${sourceToolCallId}`);
 }
 
+function lifecycleSpanKey(record) {
+	if (record.kind === "tool.execution") return `tool:${record.correlation?.tool_call_id}`;
+	if (record.kind === "agent.turn") return `turn:${record.correlation?.turn_id}`;
+	if (record.kind === "agent.run") return `run:${record.correlation?.trace_id}`;
+	return null;
+}
+
 class WireClient {
 	constructor(ws) {
 		this.ws = ws;
@@ -781,10 +788,57 @@ try {
 		throw new Error("conversation metadata crossed during project switch");
 	}
 	const activeBeforeReset = client.activeId;
+	const forcedResetReason = "PRIVATE_FORCED_RESET_REASON";
 	const resetOffset = records.length;
-	await client.forceResetConversation(firstConversation, "fixture reset");
+	firstConversation.session._emit({ type: "agent_start" });
+	firstConversation.session._emit({ type: "turn_start" });
+	for (const [toolCallId, toolName] of [["reset-tool-1", "read"], ["reset-tool-2", "bash"]]) {
+		firstConversation.session._emit({
+			type: "tool_execution_start",
+			toolCallId,
+			toolName,
+			args: { private: forcedResetReason },
+		});
+	}
+	await waitFor(
+		() => records.slice(resetOffset).filter((record) => record.phase === "start").length === 4,
+		"open force-reset telemetry spans",
+	);
+	await client.forceResetConversation(firstConversation, forcedResetReason);
+	await waitFor(
+		() => records.slice(resetOffset).some((record) =>
+			record.kind === "agent.run" &&
+			record.phase === "end" &&
+			record.attributes?.cause_class === "forced_reset"),
+		"forced-reset terminal telemetry",
+	);
 	if (client.activeId !== activeBeforeReset || firstConversation.session !== firstConversation.runtime.session) {
 		throw new Error("background force reset changed active conversation or target session");
+	}
+	const forcedResetRecords = records.slice(resetOffset);
+	const forcedResetTerminals = forcedResetRecords.filter((record) =>
+		record.phase === "end" && record.attributes?.cause_class === "forced_reset");
+	if (
+		JSON.stringify(forcedResetTerminals.map((record) => `${record.kind}:${record.state}`)) !==
+			JSON.stringify([
+				"tool.execution:cancelled",
+				"tool.execution:cancelled",
+				"agent.turn:cancelled",
+				"agent.run:aborted",
+			]) ||
+		JSON.stringify(forcedResetRecords).includes(forcedResetReason)
+	) {
+		throw new Error("forced reset did not emit ordered content-free terminals");
+	}
+	const openSpans = new Set();
+	for (const record of forcedResetRecords) {
+		const key = lifecycleSpanKey(record);
+		if (!key) continue;
+		if (record.phase === "start") openSpans.add(key);
+		else if (record.phase === "end") openSpans.delete(key);
+	}
+	if (openSpans.size !== 0) {
+		throw new Error(`forced reset left normalized spans open: ${JSON.stringify([...openSpans])}`);
 	}
 	emitFixture(firstConversation.session, "background-reset-tool");
 	await waitFor(
@@ -795,7 +849,7 @@ try {
 			record.correlation?.conversation_id === firstConversationId),
 		"background force-reset telemetry",
 	);
-	console.log("PASS background conversation and force reset retain target mapper metadata");
+	console.log("PASS force reset closes open spans before background runtime replacement");
 
 	const editConversation = secondConversation;
 	const editTimestamp = 4_000;

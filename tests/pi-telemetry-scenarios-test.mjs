@@ -628,6 +628,7 @@ try {
 	assert.deepEqual(queue.client.health(), {
 		state: "connected",
 		queued: 0,
+		queuedBytes: 0,
 		accepted: emittedCount,
 		rejected: 0,
 		errors: 0,

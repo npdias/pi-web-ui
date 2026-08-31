@@ -7,12 +7,16 @@ import type {
 } from "./types.js";
 
 const MAX_QUEUE_SIZE = 1_000;
+const MAX_QUEUE_BYTES = 16 * 1024 * 1024;
 const MAX_FRAME_BYTES = 1024 * 1024;
+const ACKNOWLEDGEMENT_TIMEOUT_MS = 1_000;
 const RECONNECT_DELAYS_MS = [250, 1_000, 5_000, 30_000] as const;
 
 interface QueuedRecord {
 	line: string;
+	bytes: number;
 	sent: boolean;
+	sentAt: number | null;
 }
 
 function parseAcknowledgement(line: string): TelemetryAcknowledgement | null {
@@ -54,14 +58,18 @@ function parseAcknowledgement(line: string): TelemetryAcknowledgement | null {
 export interface TelemetrySocketClientOptions {
 	socketPath: string;
 	connect?: (socketPath: string) => Socket;
+	monotonicNow?: () => number;
 }
 
 export class TelemetrySocketClient {
 	private readonly socketPath: string;
 	private readonly connectSocket: (socketPath: string) => Socket;
+	private readonly monotonicNow: () => number;
 	private readonly queue: QueuedRecord[] = [];
+	private queuedBytes = 0;
 	private socket: Socket | null = null;
 	private reconnectTimer: NodeJS.Timeout | null = null;
+	private acknowledgementTimer: NodeJS.Timeout | null = null;
 	private reconnectAttempt = 0;
 	private readonly acknowledgementChunks: Buffer[] = [];
 	private acknowledgementBytes = 0;
@@ -75,6 +83,7 @@ export class TelemetrySocketClient {
 	constructor(options: TelemetrySocketClientOptions) {
 		this.socketPath = options.socketPath;
 		this.connectSocket = options.connect ?? createConnection;
+		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
 	}
 
 	emit(record: PiTelemetryRecord): void {
@@ -93,11 +102,16 @@ export class TelemetrySocketClient {
 			this.rejected++;
 			return;
 		}
-		if (this.queue.length >= MAX_QUEUE_SIZE) {
+		const bytes = Buffer.byteLength(line, "utf8");
+		if (
+			this.queue.length >= MAX_QUEUE_SIZE ||
+			this.queuedBytes + bytes > MAX_QUEUE_BYTES
+		) {
 			this.gaps++;
 			return;
 		}
-		this.queue.push({ line, sent: false });
+		this.queue.push({ line, bytes, sent: false, sentAt: null });
+		this.queuedBytes += bytes;
 		if (this.state === "connected") this.flush();
 		else if (this.state === "disconnected") this.connect();
 	}
@@ -106,6 +120,7 @@ export class TelemetrySocketClient {
 		return {
 			state: this.state,
 			queued: this.queue.length,
+			queuedBytes: this.queuedBytes,
 			accepted: this.accepted,
 			rejected: this.rejected,
 			errors: this.errors,
@@ -126,6 +141,7 @@ export class TelemetrySocketClient {
 		this.state = "disposed";
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = null;
+		this.clearAcknowledgementTimer();
 		const socket = this.socket;
 		this.socket = null;
 		if (socket) {
@@ -133,6 +149,7 @@ export class TelemetrySocketClient {
 			socket.destroy();
 		}
 		this.queue.length = 0;
+		this.queuedBytes = 0;
 		this.clearAcknowledgementBuffer();
 		this.writeBlocked = false;
 	}
@@ -180,13 +197,17 @@ export class TelemetrySocketClient {
 		for (const queued of this.queue) {
 			if (queued.sent) continue;
 			queued.sent = true;
+			queued.sentAt = this.monotonicNow();
 			try {
-				if (!socket.write(queued.line)) {
+				const writable = socket.write(queued.line);
+				this.armAcknowledgementTimer();
+				if (!writable) {
 					this.writeBlocked = true;
 					return;
 				}
 			} catch {
 				queued.sent = false;
+				queued.sentAt = null;
 				this.errors++;
 				this.disconnect(socket);
 				return;
@@ -224,9 +245,12 @@ export class TelemetrySocketClient {
 				return;
 			}
 			this.reconnectAttempt = 0;
-			this.queue.shift();
+			const acknowledged = this.queue.shift();
+			if (acknowledged) this.queuedBytes -= acknowledged.bytes;
+			this.clearAcknowledgementTimer();
 			if (acknowledgement.accepted) this.accepted++;
 			else this.rejected++;
+			this.armAcknowledgementTimer();
 			remaining = remaining.subarray(newline + 1);
 		}
 		this.flush();
@@ -235,6 +259,36 @@ export class TelemetrySocketClient {
 	private clearAcknowledgementBuffer(): void {
 		this.acknowledgementChunks.length = 0;
 		this.acknowledgementBytes = 0;
+	}
+
+	private armAcknowledgementTimer(): void {
+		if (this.acknowledgementTimer || this.state !== "connected") return;
+		const socket = this.socket;
+		const oldest = this.queue[0];
+		if (!socket || !oldest?.sent || oldest.sentAt === null) return;
+		const delay = Math.max(
+			0,
+			oldest.sentAt + ACKNOWLEDGEMENT_TIMEOUT_MS - this.monotonicNow(),
+		);
+		this.acknowledgementTimer = setTimeout(() => {
+			this.acknowledgementTimer = null;
+			if (
+				this.state !== "connected" ||
+				this.socket !== socket ||
+				this.queue[0] !== oldest ||
+				!oldest.sent
+			) {
+				return;
+			}
+			this.errors++;
+			this.disconnect(socket);
+		}, delay);
+		this.acknowledgementTimer.unref?.();
+	}
+
+	private clearAcknowledgementTimer(): void {
+		if (this.acknowledgementTimer) clearTimeout(this.acknowledgementTimer);
+		this.acknowledgementTimer = null;
 	}
 
 	private protocolFailure(): void {
@@ -246,9 +300,13 @@ export class TelemetrySocketClient {
 	private disconnect(socket: Socket): void {
 		if (this.socket !== socket || this.state === "disposed") return;
 		this.socket = null;
+		this.clearAcknowledgementTimer();
 		this.clearAcknowledgementBuffer();
 		this.writeBlocked = false;
-		for (const queued of this.queue) queued.sent = false;
+		for (const queued of this.queue) {
+			queued.sent = false;
+			queued.sentAt = null;
+		}
 		socket.destroy();
 		if (this.queue.length > 0) this.scheduleReconnect();
 		else this.state = "disconnected";

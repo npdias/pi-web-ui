@@ -121,6 +121,7 @@ interface ConversationTelemetryMapper {
 	noteActivity?(nowMs?: number): void;
 	map(event: AgentSessionEvent): PiTelemetryRecord[];
 	observeStall?(nowMs: number): PiTelemetryRecord[];
+	forceReset(): PiTelemetryRecord[];
 	dispose(): void;
 }
 
@@ -1230,6 +1231,19 @@ export class ClientSession {
 		let records: PiTelemetryRecord[];
 		try {
 			records = mapper.observeStall(nowMs);
+		} catch {
+			this.noteTelemetryFailure("mapping", 1);
+			return;
+		}
+		this.emitTelemetryRecords(conv, records);
+	}
+
+	private emitForcedResetTelemetry(conv: Conversation): void {
+		const mapper = conv.telemetryMapper;
+		if (!mapper || !this.telemetry) return;
+		let records: PiTelemetryRecord[];
+		try {
+			records = mapper.forceReset();
 		} catch {
 			this.noteTelemetryFailure("mapping", 1);
 			return;
@@ -2485,6 +2499,7 @@ export class ClientSession {
 		try {
 			conv.unsubscribe?.();
 			conv.unsubscribe = undefined;
+			this.emitForcedResetTelemetry(conv);
 			this.disposeTelemetryMapper(conv);
 			this.clearAllToolWatchdogs(conv);
 			conv.toolStartTimes.clear();

@@ -48,6 +48,7 @@ interface TurnSpan {
 interface ToolSpan {
 	correlation: SpanCorrelation;
 	startedAt: number;
+	toolName: string;
 }
 
 interface FinalState {
@@ -593,6 +594,7 @@ export class PiEventMapper {
 				const span: ToolSpan = existing ?? {
 					correlation: this.currentSpan(),
 					startedAt: monotonicTime,
+					toolName: event.toolName,
 				};
 				if (!existing) this.toolStarts.set(event.toolCallId, span);
 				records.push(
@@ -708,6 +710,89 @@ export class PiEventMapper {
 				},
 			}),
 		];
+	}
+
+	forceReset(): PiTelemetryRecord[] {
+		if (this.disposed) return [];
+		const wallTime = this.wallNow();
+		const monotonicTime = this.monotonicNow();
+		const records: PiTelemetryRecord[] = [];
+		for (const [toolCallId, tool] of this.toolStarts) {
+			records.push(
+				this.record({
+					kind: "tool.execution",
+					phase: "end",
+					state: "cancelled",
+					severity: "warning",
+					wallTime,
+					parentId:
+						tool.correlation.request_id ??
+						tool.correlation.trace_id ??
+						this.sessionId,
+					span: tool.correlation,
+					toolCallId,
+					durationMs: Math.max(0, monotonicTime - tool.startedAt),
+					attributes: {
+						cause_class: "forced_reset",
+						matched_start: true,
+						tool_name: tool.toolName,
+					},
+				}),
+			);
+		}
+		if (this.currentTurn) {
+			const span = this.currentSpan();
+			records.push(
+				this.record({
+					kind: "agent.turn",
+					phase: "end",
+					state: "cancelled",
+					severity: "warning",
+					wallTime,
+					parentId: this.currentRun?.id ?? this.sessionId,
+					span,
+					durationMs: Math.max(0, monotonicTime - this.currentTurn.startedAt),
+					attributes: {
+						cause_class: "forced_reset",
+						matched_start: true,
+					},
+				}),
+			);
+		}
+		if (this.currentRun) {
+			records.push(
+				this.record({
+					kind: "agent.run",
+					phase: "end",
+					state: "aborted",
+					severity: "warning",
+					wallTime,
+					parentId: this.sessionId,
+					span: { trace_id: this.currentRun.id },
+					durationMs: Math.max(0, monotonicTime - this.currentRun.startedAt),
+					attributes: {
+						cause_class: "forced_reset",
+						matched_start: true,
+					},
+				}),
+			);
+		}
+		if (records.length === 0) {
+			records.push(
+				this.record({
+					kind: "agent.reset",
+					phase: "observation",
+					state: "forced_reset",
+					severity: "warning",
+					wallTime,
+					parentId: this.sessionId,
+					attributes: { cause_class: "forced_reset" },
+				}),
+			);
+		}
+		this.clearOpenSpans();
+		this.contextHashes = null;
+		return records;
 	}
 
 	reset(): void {
