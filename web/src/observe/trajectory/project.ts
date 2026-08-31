@@ -74,6 +74,7 @@ interface AttemptTracker {
 	hasSettledAttempt: boolean;
 	open?: OpenAttempt;
 	uncertainRecordIndex?: number;
+	pendingTerminalRecordIndex?: number;
 }
 
 function unwrap(input: TrajectoryProjectionInput): OrderedInput {
@@ -137,14 +138,21 @@ function eventRecordId(event: TelemetryEvent): string {
 		: `sequence:${event.sequence}`;
 }
 
-function attemptRecordId(key: string, anchor: TelemetryEvent): string {
+function attemptRecordId(
+	key: string,
+	anchor: TelemetryEvent,
+	disambiguate = false,
+): string {
+	const suffix = disambiguate
+		? `|reuse:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}`
+		: "";
 	if (
 		anchor.kind === "tool.execution" &&
 		stringAttribute(anchor.attributes, "lifecycle_attempt_id") !== undefined
 	) {
-		return `attempt:${key}`;
+		return `attempt:${key}${suffix}`;
 	}
-	return `attempt:${key}|anchor:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}`;
+	return `attempt:${key}|anchor:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}${suffix}`;
 }
 
 function identityPart(value: string): string {
@@ -186,6 +194,11 @@ function lifecycleSemanticId(event: TelemetryEvent): string | undefined {
 		default:
 			return undefined;
 	}
+}
+
+function reusesSourceAttemptIdentity(event: TelemetryEvent): boolean {
+	return event.kind === "tool.execution" &&
+		stringAttribute(event.attributes, "lifecycle_attempt_id") !== undefined;
 }
 
 function lifecycleKey(event: TelemetryEvent): string | undefined {
@@ -436,9 +449,10 @@ function openAttemptRecord(
 	event: TelemetryEvent,
 	key: string,
 	ordinal: number,
+	identityReuse = false,
 ): TelemetryTrajectoryRecord {
 	return {
-		id: attemptRecordId(key, event),
+		id: attemptRecordId(key, event, identityReuse),
 		index: 0,
 		kind: recordKind(event),
 		sequence: event.sequence,
@@ -455,9 +469,10 @@ function openAttemptRecord(
 		closureUnknown: false,
 		gapTainted: false,
 		gapEvidence: [],
-		terminalConflict: false,
+		identityReuse,
+		terminalConflict: identityReuse,
 		unmatchedTerminal: false,
-		diagnostic: diagnosticEvidence([event]),
+		diagnostic: diagnosticEvidence([event], identityReuse),
 		...attemptEvidenceFields([event]),
 		...(event.phase === undefined ? {} : { phase: event.phase }),
 		...(event.state === undefined ? {} : { state: event.state }),
@@ -502,9 +517,9 @@ function settleAttempt(
 		closureUnknown: false,
 		gapTainted: false,
 		gapEvidence: [],
-		terminalConflict: false,
+		terminalConflict: record.identityReuse,
 		unmatchedTerminal: false,
-		diagnostic: diagnosticEvidence(evidence),
+		diagnostic: diagnosticEvidence(evidence, record.identityReuse),
 		...attemptEvidenceFields(evidence),
 		phase: "end",
 		...(event.state === undefined ? {} : { state: event.state }),
@@ -527,15 +542,56 @@ function settleGapTaintedAttempt(
 	};
 }
 
+function reconcileTerminalBeforeStart(
+	record: TelemetryTrajectoryRecord,
+	start: TelemetryEvent,
+): TelemetryTrajectoryRecord {
+	const terminal = record.sourceEnvelopes.find((event) => event.phase === "end");
+	if (terminal === undefined) return record;
+	const evidence = [...record.sourceEnvelopes, start].sort((left, right) =>
+		left.sequence === right.sequence
+			? compareText(left.event_id, right.event_id)
+			: left.sequence - right.sequence,
+	);
+	const attributes = mergedAttributes(evidence);
+	const normalizedTerminal = { ...terminal, attributes };
+	const toolName = stringAttribute(attributes, "tool_name");
+	return {
+		...record,
+		kind: recordKind(normalizedTerminal),
+		...eventSummary(normalizedTerminal),
+		sequence: Math.min(...evidence.map((event) => event.sequence)),
+		durationMs: recordedDuration(terminal),
+		isOpen: false,
+		isError: eventIsError(normalizedTerminal),
+		severity: terminal.severity,
+		attributes,
+		closureUnknown: false,
+		gapTainted: false,
+		gapEvidence: [],
+		identityReuse: false,
+		terminalConflict: false,
+		unmatchedTerminal: false,
+		diagnostic: true,
+		...attemptEvidenceFields(evidence),
+		phase: "end",
+		...(terminal.state === undefined ? {} : { state: terminal.state }),
+		startedAt: start.observed_at,
+		endedAt: terminal.observed_at,
+		...(toolName === undefined ? {} : { toolName }),
+	};
+}
+
 function terminalOnlyAttempt(
 	event: TelemetryEvent,
 	key: string,
 	ordinal: number,
 	tracker: AttemptTracker,
 	gapEvidence: readonly TelemetryReplayGap[],
+	identityReuse = false,
 ): TelemetryTrajectoryRecord {
 	const closureUnknown = gapEvidence.length > 0;
-	const terminalConflict = !closureUnknown && tracker.hasSettledAttempt;
+	const terminalConflict = !closureUnknown && (tracker.hasSettledAttempt || identityReuse);
 	const state = closureUnknown
 		? "closure_unknown"
 		: terminalConflict
@@ -543,7 +599,7 @@ function terminalOnlyAttempt(
 			: "unmatched_terminal";
 	const toolName = stringAttribute(event.attributes, "tool_name");
 	return {
-		id: attemptRecordId(key, event),
+		id: attemptRecordId(key, event, identityReuse),
 		index: 0,
 		kind: recordKind(event),
 		sequence: event.sequence,
@@ -566,6 +622,7 @@ function terminalOnlyAttempt(
 		closureUnknown,
 		gapTainted: closureUnknown,
 		gapEvidence,
+		identityReuse,
 		terminalConflict,
 		unmatchedTerminal: true,
 		diagnostic: true,
@@ -596,6 +653,7 @@ function standaloneEventRecord(event: TelemetryEvent): TelemetryTrajectoryRecord
 		closureUnknown: false,
 		gapTainted: false,
 		gapEvidence: [],
+		identityReuse: false,
 		terminalConflict: false,
 		unmatchedTerminal: false,
 		diagnostic: diagnosticEvidence([event]),
@@ -672,6 +730,7 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 	const ordinalCounters = new Map<string, number>();
 	const openTrackers = new Set<AttemptTracker>();
 	const uncertainTrackers = new Set<AttemptTracker>();
+	const pendingTerminalTrackers = new Set<AttemptTracker>();
 	const gaps: TelemetryReplayGap[] = [];
 
 	for (const input of inputs) {
@@ -700,6 +759,10 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 				uncertainTrackers.add(tracker);
 			}
 			openTrackers.clear();
+			for (const tracker of pendingTerminalTrackers) {
+				tracker.pendingTerminalRecordIndex = undefined;
+			}
+			pendingTerminalTrackers.clear();
 			continue;
 		}
 
@@ -740,11 +803,21 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			const record = output[recordIndex];
 			if (record !== undefined && record.kind !== "GAP") {
 				if (event.phase === "start") {
-					output[recordIndex] = {
-						...mergeOpenAttemptEvidence(
+					const reopened = mergeOpenAttemptEvidence(
 							record,
 							[...record.sourceEnvelopes, event],
-						),
+						);
+					output[recordIndex] = {
+						...reopened,
+						kind: recordKind(event),
+						...eventSummary(event),
+						isOpen: true,
+						closureUnknown: false,
+						gapTainted: true,
+						gapEvidence: record.gapEvidence,
+						phase: "start",
+						state: event.state ?? "running",
+						startedAt: event.observed_at,
 						diagnostic: true,
 					};
 					tracker.lastGapIndexSeen = gaps.length;
@@ -764,6 +837,18 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 		}
 
 		if (event.phase === "start") {
+			if (tracker.pendingTerminalRecordIndex !== undefined) {
+				const recordIndex = tracker.pendingTerminalRecordIndex;
+				const record = output[recordIndex];
+				if (record !== undefined && record.kind !== "GAP") {
+					output[recordIndex] = reconcileTerminalBeforeStart(record, event);
+				}
+				tracker.pendingTerminalRecordIndex = undefined;
+				pendingTerminalTrackers.delete(tracker);
+				tracker.hasSettledAttempt = true;
+				tracker.lastGapIndexSeen = gaps.length;
+				continue;
+			}
 			if (tracker.open !== undefined) {
 				tracker.open.events.push(event);
 				continue;
@@ -771,8 +856,9 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			const ordinalKey = ordinalLifecycleKey(event) ?? key;
 			const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
 			ordinalCounters.set(ordinalKey, ordinal);
+			const identityReuse = tracker.hasSettledAttempt && reusesSourceAttemptIdentity(event);
 			const recordIndex = output.push(
-				openAttemptRecord(event, key, ordinal),
+				openAttemptRecord(event, key, ordinal, identityReuse),
 			) - 1;
 			tracker.open = { recordIndex, events: [event] };
 			tracker.lastGapIndexSeen = gaps.length;
@@ -795,17 +881,28 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			continue;
 		}
 
+		if (tracker.pendingTerminalRecordIndex !== undefined) {
+			tracker.pendingTerminalRecordIndex = undefined;
+			pendingTerminalTrackers.delete(tracker);
+		}
+
 		const ordinalKey = ordinalLifecycleKey(event) ?? key;
 		const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
 		ordinalCounters.set(ordinalKey, ordinal);
 		const relevantGaps = gaps.slice(tracker.lastGapIndexSeen);
-		output.push(terminalOnlyAttempt(
+		const identityReuse = tracker.hasSettledAttempt && reusesSourceAttemptIdentity(event);
+		const recordIndex = output.push(terminalOnlyAttempt(
 			event,
 			key,
 			ordinal,
 			tracker,
 			relevantGaps,
-		));
+			identityReuse,
+		)) - 1;
+		if (!identityReuse && relevantGaps.length === 0) {
+			tracker.pendingTerminalRecordIndex = recordIndex;
+			pendingTerminalTrackers.add(tracker);
+		}
 		tracker.hasSettledAttempt = true;
 		tracker.lastGapIndexSeen = gaps.length;
 	}

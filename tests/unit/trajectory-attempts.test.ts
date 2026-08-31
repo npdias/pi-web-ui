@@ -221,6 +221,191 @@ describe("trajectory lifecycle attempts", () => {
 		});
 	});
 
+	it("reopens exact post-gap duplicate start while retaining gap evidence", () => {
+		const correlation = {
+			trace_id: "duplicate-gap-source-run",
+			turn_id: "duplicate-gap-source-turn",
+			step_id: "duplicate-gap-source-step",
+			request_id: "duplicate-gap-source-request",
+			tool_call_id: "duplicate-gap-source-call",
+		};
+		const gap: TelemetryReplayGap = {
+			requested: 1,
+			earliest_available: 3,
+			resume_after: 2,
+		};
+		const attributes = {
+			tool_name: "read",
+			lifecycle_attempt_id: "duplicate-gap-source-attempt",
+		};
+		const start = event(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes,
+		});
+		const duplicate = event(3, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { ...attributes, duplicate_start: true },
+		});
+		const terminal = event(4, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: { ...attributes, matched_start: true },
+		});
+		const reopened = telemetryRecords([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: duplicate },
+		]);
+		const settled = telemetryRecords([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: duplicate },
+			{ type: "event", event: terminal },
+		]);
+
+		expect(reopened).toHaveLength(1);
+		expect(reopened[0]).toMatchObject({
+			state: "running",
+			isOpen: true,
+			closureUnknown: false,
+			gapTainted: true,
+			gapEvidence: [gap],
+			attributes: { duplicate_start: true },
+			sourceEventIds: [start.event_id, duplicate.event_id],
+		});
+		expect(settled).toHaveLength(1);
+		expect(settled[0]).toMatchObject({
+			state: "completed",
+			isOpen: false,
+			closureUnknown: false,
+			gapTainted: true,
+			gapEvidence: [gap],
+			sourceEventIds: [start.event_id, duplicate.event_id, terminal.event_id],
+		});
+	});
+
+	it("reconciles terminal-before-start exact source ID into one lossless row", () => {
+		const correlation = {
+			trace_id: "reverse-run",
+			turn_id: "reverse-turn",
+			step_id: "reverse-step",
+			request_id: "reverse-request",
+			tool_call_id: "reverse-call",
+		};
+		const attemptAttributes = {
+			tool_name: "read",
+			lifecycle_attempt_id: "reverse-attempt",
+		};
+		const terminal = event(1, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 7,
+			attributes: { ...attemptAttributes, matched_start: true },
+		});
+		const start = event(2, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: attemptAttributes,
+		});
+		const records = telemetryRecords([terminal, start]);
+
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			state: "completed",
+			durationMs: 7,
+			isOpen: false,
+			identityReuse: false,
+			sourceEventIds: [terminal.event_id, start.event_id],
+		});
+	});
+
+	it("disambiguates terminal-start-terminal source ID reuse without cumulative evidence", () => {
+		const correlation = {
+			trace_id: "reverse-reuse-run",
+			turn_id: "reverse-reuse-turn",
+			step_id: "reverse-reuse-step",
+			request_id: "reverse-reuse-request",
+			tool_call_id: "reverse-reuse-call",
+		};
+		const attemptAttributes = {
+			tool_name: "read",
+			lifecycle_attempt_id: "reverse-reuse-attempt",
+		};
+		const firstTerminal = event(1, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: { ...attemptAttributes, matched_start: true },
+		});
+		const start = event(2, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: attemptAttributes,
+		});
+		const secondTerminal = event(3, "tool.execution", {
+			phase: "end",
+			state: "error",
+			severity: "error",
+			correlation,
+			attributes: { ...attemptAttributes, is_error: true, matched_start: false },
+		});
+		const records = telemetryRecords([firstTerminal, start, secondTerminal]);
+
+		expect(records).toHaveLength(2);
+		expect(new Set(records.map((record) => record.id)).size).toBe(2);
+		expect(records[0]?.sourceEventIds).toEqual([firstTerminal.event_id, start.event_id]);
+		expect(records[1]).toMatchObject({
+			kind: "ERROR",
+			identityReuse: true,
+			terminalConflict: true,
+			sourceEventIds: [secondTerminal.event_id],
+		});
+	});
+
+	it("disambiguates settled source attempt ID reuse into local rows", () => {
+		const correlation = {
+			trace_id: "settled-reuse-run",
+			turn_id: "settled-reuse-turn",
+			step_id: "settled-reuse-step",
+			request_id: "settled-reuse-request",
+			tool_call_id: "settled-reuse-call",
+		};
+		const attrs = { tool_name: "read", lifecycle_attempt_id: "settled-reuse-attempt" };
+		const inputs = [
+			event(1, "tool.execution", {
+				phase: "start", state: "running", correlation, attributes: attrs,
+			}),
+			event(2, "tool.execution", {
+				phase: "end", state: "completed", correlation,
+				attributes: { ...attrs, matched_start: true },
+			}),
+			event(3, "tool.execution", {
+				phase: "start", state: "running", correlation, attributes: attrs,
+			}),
+			event(4, "tool.execution", {
+				phase: "end", state: "completed", correlation,
+				attributes: { ...attrs, matched_start: true },
+			}),
+		];
+		const records = telemetryRecords(inputs);
+
+		expect(records).toHaveLength(2);
+		expect(new Set(records.map((record) => record.id)).size).toBe(2);
+		expect(records.map((record) => record.sourceEventIds)).toEqual([
+			["attempt:event:1", "attempt:event:2"],
+			["attempt:event:3", "attempt:event:4"],
+		]);
+		expect(records[1]).toMatchObject({ identityReuse: true, terminalConflict: true });
+	});
+
 	it.each(CASES)("creates two source-scoped $name attempts for two start/end cycles", ({
 		kind,
 		correlation,
@@ -564,6 +749,7 @@ describe("trajectory lifecycle attempts", () => {
 		);
 
 		expect(records).toHaveLength(10_000);
+		expect(new Set(records.map((record) => record.id)).size).toBe(10_000);
 		expect(referenceCount).toBe(10_000);
 		expect(Math.max(...records.map((record) => record.sourceEnvelopes.length))).toBe(1);
 	});
@@ -596,6 +782,7 @@ describe("trajectory lifecycle attempts", () => {
 		);
 
 		expect(records).toHaveLength(5_000);
+		expect(new Set(records.map((record) => record.id)).size).toBe(5_000);
 		expect(referenceCount).toBe(10_000);
 		expect(Math.max(...records.map((record) => record.sourceEnvelopes.length))).toBe(2);
 		expect(records[0]?.attemptOrdinal).toBe(1);

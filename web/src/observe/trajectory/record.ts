@@ -37,7 +37,7 @@ interface TrajectoryRecordBase {
 	readonly kind: TrajectoryRecordKind;
 	/** First source sequence represented by this row. */
 	readonly sequence: number;
-	/** Source-scoped lifecycle attempt ordinal. Absent for gaps/non-lifecycle events. */
+	/** View-local display ordinal. It is not globally complete unless proven separately. */
 	readonly attemptOrdinal?: number;
 	readonly summary: string;
 	readonly summaryTruncated?: boolean;
@@ -82,6 +82,8 @@ export interface TelemetryTrajectoryRecord extends TrajectoryRecordBase {
 	/** At least one replay gap intersects the observed lifecycle interval. */
 	readonly gapTainted: boolean;
 	readonly gapEvidence: readonly TelemetryReplayGap[];
+	/** Source reused one lifecycle attempt ID for distinct evidence. */
+	readonly identityReuse: boolean;
 	/** Two or more distinct terminal envelopes exist without an intervening start. */
 	readonly terminalConflict: boolean;
 	readonly unmatchedTerminal: boolean;
