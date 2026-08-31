@@ -118,6 +118,7 @@ export interface AgentServiceTelemetry {
 }
 
 interface ConversationTelemetryMapper {
+	noteActivity?(nowMs?: number): void;
 	map(event: AgentSessionEvent): PiTelemetryRecord[];
 	observeStall?(nowMs: number): PiTelemetryRecord[];
 	dispose(): void;
@@ -1208,6 +1209,11 @@ export class ClientSession {
 	private emitTelemetry(conv: Conversation, event: AgentSessionEvent): void {
 		const mapper = conv.telemetryMapper;
 		if (!mapper || !this.telemetry) return;
+		try {
+			mapper.noteActivity?.(Date.now());
+		} catch {
+			this.noteTelemetryFailure("mapping", 0);
+		}
 		let records: PiTelemetryRecord[];
 		try {
 			records = mapper.map(event);

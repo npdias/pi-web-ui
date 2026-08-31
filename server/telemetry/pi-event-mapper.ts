@@ -482,8 +482,7 @@ export class PiEventMapper {
 		if (validatedContext && !hasJsonToolSchemas(validatedContext)) return [];
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
-		this.lastEventAt = wallTime;
-		this.stallObserved = false;
+		this.recordActivity(wallTime);
 		const records: PiTelemetryRecord[] = [];
 		let duplicateStart = false;
 		if (event.type === "agent_start") {
@@ -674,6 +673,11 @@ export class PiEventMapper {
 		return records;
 	}
 
+	noteActivity(nowMs = this.wallNow()): void {
+		if (this.disposed || !Number.isFinite(nowMs)) return;
+		this.recordActivity(nowMs);
+	}
+
 	observeStall(nowMs: number): PiTelemetryRecord[] {
 		if (
 			this.disposed ||
@@ -723,6 +727,11 @@ export class PiEventMapper {
 		this.currentTurn = null;
 		this.toolStarts.clear();
 		this.lastEventAt = null;
+		this.stallObserved = false;
+	}
+
+	private recordActivity(nowMs: number): void {
+		this.lastEventAt = nowMs;
 		this.stallObserved = false;
 	}
 

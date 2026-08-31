@@ -519,20 +519,65 @@ try {
 		}
 
 		const secondEpisodeOffset = records.length;
-		firstConversation.session._emit({ type: "turn_start" });
-		const secondTurnStart = await waitFor(
-			() => records.slice(secondEpisodeOffset).find((record) =>
-				record.kind === "agent.turn" && record.phase === "start"),
-			"second stall episode SDK event",
+		const secondEventAt = firstEventAt + 180_002;
+		tickAt(
+			() => firstConversation.session._emit({
+				type: "tool_execution_update",
+				toolCallId: "stall-activity-tool",
+				toolName: "fixture_tool",
+				args: { privateActivityArgument: "PRIVATE_ACTIVITY_PAYLOAD" },
+				partialResult: { privateActivityResult: "PRIVATE_ACTIVITY_PAYLOAD" },
+			}),
+			secondEventAt,
 		);
-		const secondEventAt = secondTurnStart.attributes.source_timestamp_ms;
-		firstConversation.lastSdkEventAt = secondEventAt;
+		if (
+			records.length !== secondEpisodeOffset ||
+			JSON.stringify(records.slice(secondEpisodeOffset)).includes("PRIVATE_ACTIVITY_PAYLOAD")
+		) {
+			throw new Error("unmapped activity emitted or leaked telemetry payload");
+		}
 		tickAt(stallTick, secondEventAt + 180_000);
-		await waitFor(
-			() => records.filter((record) => record.kind === "agent.stall").length === afterFirstStallCount + 1,
+		const secondStall = await waitFor(
+			() => records.slice(secondEpisodeOffset).find((record) => record.kind === "agent.stall"),
 			"second integrated stall record",
 		);
-		if (stallAbortCalls !== 0) throw new Error("stall observation aborted Pi work");
+		if (
+			JSON.stringify(secondStall).includes("PRIVATE_ACTIVITY_PAYLOAD") ||
+			stallAbortCalls !== 0
+		) {
+			throw new Error("activity leaked payload or stall observation aborted Pi work");
+		}
+
+		const activityMapper = firstConversation.telemetryMapper;
+		const originalNoteActivity = activityMapper.noteActivity;
+		activityMapper.noteActivity = () => {
+			throw new Error("fixture activity failure");
+		};
+		const beforeActivityFailure = appModule.telemetryClient.health();
+		const activityFailureOffset = records.length;
+		firstConversation.session._emit({
+			type: "tool_execution_end",
+			toolCallId: "activity-failure-tool",
+			toolName: "fixture_tool",
+			result: { content: [], details: {} },
+			isError: false,
+		});
+		await wire.next("tool_status", (message) => message.toolCallId === "activity-failure-tool");
+		await waitFor(
+			() => records.slice(activityFailureOffset).some((record) =>
+				record.kind === "tool.execution" &&
+				record.correlation?.tool_call_id?.endsWith(":tool:activity-failure-tool")),
+			"mapping after activity failure",
+		);
+		const afterActivityFailure = appModule.telemetryClient.health();
+		activityMapper.noteActivity = originalNoteActivity;
+		if (
+			afterActivityFailure.errors !== beforeActivityFailure.errors + 1 ||
+			afterActivityFailure.gaps !== beforeActivityFailure.gaps ||
+			stallAbortCalls !== 0
+		) {
+			throw new Error("activity failure blocked work or was not accounted");
+		}
 
 		const mapper = firstConversation.telemetryMapper;
 		firstConversation.telemetryMapper = undefined;
@@ -550,7 +595,9 @@ try {
 		if (records.length !== mapperlessRecordOffset || stallAbortCalls !== 0) {
 			throw new Error("mapperless stall changed telemetry or aborted work");
 		}
-		console.log("PASS stall timer emits one warning observation per silence episode without abort");
+		console.log(
+			"PASS stall timer tracks unmapped activity, isolates failure, and emits one observation per episode",
+		);
 	} finally {
 		client.interruptRun = originalInterruptRun;
 		restoreStreaming();
