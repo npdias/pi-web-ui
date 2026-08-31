@@ -9,7 +9,6 @@ Implementation commits:
 - `200f745` (`feat: emit current Pi run telemetry`)
 - `1fffb51` (`fix: harden Pi telemetry session lifecycle`)
 - `266d6bc` (`fix: make Pi telemetry session changes transactional`)
-- `d9b5e2d` (`fix: stabilize Pi replacement and edit lifecycles`)
 
 ## Result
 
@@ -44,12 +43,6 @@ All RED runs used fixture SDK events, temp Pi agent dirs, temp project dirs, and
 19. Switch-session bind race failed with `switchSession bind race did not converge to latest target`.
 20. Provisional bind rejection failed with `rejected provisional bind leaked runtime, terminals, or subscription`.
 21. Force-reset extension bind rejection failed with `timeout waiting for force-reset core binding after extension failure`.
-22. Same-cwd navigation during a gated edit failed with `timeout waiting for same-cwd edit telemetry` after staling the edit-owned runtime.
-23. Overlapping gated edits failed with `timeout waiting for overlapping edit telemetry` when concurrent forks raced one runtime.
-24. SDK replacement extension rejection failed with `timeout waiting for new-session core telemetry after extension failure`.
-25. Edit extension rejection failed with `timeout waiting for edit core telemetry after extension failure`.
-26. Active stale-edit cleanup failed its rebind-callback extension with `timeout waiting for same-cwd edit telemetry` after a later SDK `newSession()`.
-27. Out-of-order cwd validation failed with `slower cwd validation overwrote newer request`.
 
 Each RED failed on missing Task 3 behavior. Corresponding minimal change then made focused fixture pass.
 
@@ -78,28 +71,24 @@ Each RED failed on missing Task 3 behavior. Corresponding minimal change then ma
   - Binds provisional new-chat/cwd/session runtimes before committing conversation map, active ID, displaced removal, or public cwd.
   - Cleans provisional mapper, callback, runtime, and terminals when binding fails or request becomes stale.
   - Keeps core mapper/subscription after force-reset extension binding failure.
-  - Serializes edit/fork operations per conversation; later edits cannot dispose or overwrite runtime owned by an earlier in-flight edit.
-  - Reconciles stale active edit runtime to its concrete SDK session without disposing the registered runtime, and restores the SDK replacement callback on binding fast paths.
-  - Preserves core mapper/subscription after extension binding failure for SDK `newSession`, `switchSession`, `fork`, and edit replacement paths.
-  - Orders actionable navigation by invocation across new-chat, conversation switch, persisted-session switch, and cwd switch. Invalid or actual same-target requests remain no-ops and cannot stale an edit.
 - `server/telemetry/client.ts`
   - `recordFailure()` accounts for adapter-side error/gap loss that occurs before `emit()`.
 
 ## GREEN evidence
 
-Final verification against `d9b5e2d` source plus generated build output:
+Final verification against `266d6bc` source plus generated build output:
 
 | Command | Result |
 | --- | --- |
-| `node tests/pi-telemetry-test.mjs` | Exit 0. Existing cases plus concrete-session ID uniqueness, removal/force-reset edit ownership, same-cwd and overlapping-edit gates, out-of-order cwd validation, setCwd/switchSession/newChat bind gates, provisional rejection cleanup, and replacement/edit extension fallback passed. |
+| `node tests/pi-telemetry-test.mjs` | Exit 0. Existing cases plus concrete-session ID uniqueness, removal/force-reset edit ownership, setCwd/switchSession/newChat bind gates, provisional rejection cleanup, and force-reset core fallback passed. |
 | `npm run check:protocol` | Exit 0. Protocol v10 sync checks passed. |
 | `npm run typecheck` | Exit 0. Server, web, and test TypeScript checks passed. |
 | `npm test -- --run` | Exit 0. 29 files, 310 tests passed. |
 | `npm run build` | Exit 0. Vite plus server TypeScript build passed. |
 | `npm run test:smoke` | Exit 1. New `pi-telemetry-test` passed inside aggregator; overall result 32/33. Existing `settings-test` assertion `skill re-enabled` failed. |
-| `git diff --check` | Exit 0 before `200f745`, `1fffb51`, `266d6bc`, and `d9b5e2d`. |
+| `git diff --check` | Exit 0 before `200f745`, `1fffb51`, and `266d6bc`. |
 
-Independent read-only round-3 review found no remaining Critical or Important Task 3 issues after edit serialization, registered-runtime reconciliation, replacement core fallback, rebind callback recovery, and invocation-ordered navigation fixes.
+Independent read-only round-2 review found no remaining Critical or Important Task 3 issues after unique ID namespace, edit ownership, provisional commit, bind cleanup, and force-reset core fallback fixes.
 
 ## Limits
 
