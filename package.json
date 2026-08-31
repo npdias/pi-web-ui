@@ -21,7 +21,8 @@
     "deploy/",
     "extensions/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "keywords": [
     "pi",
