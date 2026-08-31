@@ -5,6 +5,7 @@
 - Implementation commit: `f6eb1781637ce785071445c9bc91d4a638338d17` (`test: cover Pi telemetry scenarios`).
 - Claim-review fix: `e7c84dbed1fd041d6520049b1e53283fc3c2896b` (`test: harden telemetry scenario fixtures`).
 - Watchdog integration fix: `c8d29e400f4243c0bc28890460b11caea71d63a7` (`fix: emit Pi stall telemetry from watchdog`).
+- All-activity reset fix: `5c2c69a2112cfa086f26b1ddd1d6a1598a27e411` (`fix: reset Pi stall telemetry on all activity`).
 - Five content-free JSONL scenarios exercise current Pi SDK lifecycle facts through `PiEventMapper`.
 - Scenario output crosses the real `TelemetrySocketClient` LF queue and acknowledgement boundary.
 - No provider, model, token, UI, or trajectory-view call runs in the scenario test.
@@ -191,6 +192,72 @@ exit 0
 - Fixtures use narrow lifecycle descriptors. Harness supplies SDK-required empty message metadata plus private tool sentinels in memory; fixture files contain no prompts, provider headers, tool args, tool results, or secrets.
 - No live UnifiedAgent telemetry service acceptance, provider call, model token, browser, or user-observed UI run occurred.
 - Full smoke remains open at existing settings failure. Aggregate also exposed one non-reproduced cleanup race.
+
+## All-SDK-activity review fix
+
+Final review found a state mismatch: ClientSession reset its UI watchdog on every SDK event, while `PiEventMapper.map()` reset telemetry stall state only after validating a supported mapped event. Events such as `message_start`, `message_end`, `tool_execution_update`, `queue_update`, and `bash_execution_update` could keep telemetry falsely deduped after real activity.
+
+RED:
+
+```text
+node tests/pi-telemetry-test.mjs
+PASS ordered records preserve metadata, privacy, and UI snapshot
+FAIL Error: timeout waiting for second integrated stall record
+exit 1
+```
+
+The regression emits a content-bearing `tool_execution_update` after the first stall. Mapper emits no record for that unsupported event, but a second 180-second silence episode must still produce a second stall observation.
+
+GREEN:
+
+```text
+node tests/pi-telemetry-test.mjs
+PASS stall timer tracks unmapped activity, isolates failure, and emits one observation per episode
+PASS normal zero-token telemetry fixture
+exit 0
+
+node tests/pi-telemetry-scenarios-test.mjs
+PASS model-stall: 3 normalized records
+PASS integrated queue boundary: 21/21 accepted
+exit 0
+```
+
+Implementation:
+
+- Optional `ConversationTelemetryMapper.noteActivity(nowMs?)` runs before `map()` for every delivered SDK event.
+- `PiEventMapper.noteActivity()` updates only last-activity timestamp plus stall dedupe state. It emits no record and inspects no event payload.
+- `map()` retains its existing supported-event validation and uses the same private activity-state helper for directly mapped events.
+- An injected `noteActivity` failure increments telemetry errors without adding a gap. Mapping, queue delivery, tool UI projection, and Pi work continue.
+- The unmapped test injects private args/result sentinels. Neither the activity event nor its content appears in telemetry; the later stall record remains content-free.
+
+Fresh final gates:
+
+```text
+npm run typecheck
+exit 0
+
+npm test -- --run
+Test Files  29 passed (29)
+Tests  313 passed (313)
+exit 0
+
+npm run check:protocol
+PROTOCOL_VERSION v10 match passed
+exit 0
+
+npm run build
+vite: 549 modules transformed
+build:web exit 0
+build:server exit 0
+
+npm run test:smoke
+32/33 passed
+settings-test: 27 passed, 1 failed at existing skill re-enabled check
+exit 1
+
+git diff --check
+exit 0
+```
 
 ## Changed files
 
