@@ -236,6 +236,20 @@ describe("TelemetrySocketClient", () => {
 		expect(client.health()).toMatchObject({ queued: 1_000, gaps: 1 });
 	});
 
+	it("accounts for adapter failures and their explicit lost-record count", () => {
+		const client = new TelemetrySocketClient({ socketPath: socketPath() });
+		clients.push(client);
+		const subject = client as TelemetrySocketClient & {
+			recordFailure?: (lostRecords?: number) => void;
+		};
+
+		expect(typeof subject.recordFailure).toBe("function");
+		subject.recordFailure?.(3);
+		subject.recordFailure?.(0);
+
+		expect(client.health()).toMatchObject({ errors: 2, gaps: 3 });
+	});
+
 	it("rejects a serialized source record over 1 MiB without queueing or connecting", () => {
 		let connections = 0;
 		const client = new TelemetrySocketClient({

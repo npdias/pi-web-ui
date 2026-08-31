@@ -111,6 +111,10 @@ import type {
 export interface AgentServiceTelemetry {
 	source: PiTelemetrySource;
 	emit(record: PiTelemetryRecord): void;
+	onFailure?(
+		kind: "construction" | "mapping" | "enqueue" | "disposal",
+		lostRecords: number,
+	): void;
 }
 
 const SNAPSHOT_INTERVAL_MS = 60;
@@ -1179,15 +1183,34 @@ export class ClientSession {
 			conv.telemetryMapper?.dispose();
 		} catch {
 			// Telemetry cleanup cannot affect Pi runtime cleanup.
+			this.noteTelemetryFailure("disposal", 0);
 		}
 		conv.telemetryMapper = undefined;
+	}
+
+	private noteTelemetryFailure(
+		kind: "construction" | "mapping" | "enqueue" | "disposal",
+		lostRecords: number,
+	): void {
+		try {
+			this.telemetry?.onFailure?.(kind, lostRecords);
+		} catch {
+			// Health accounting is telemetry too; never throw into Pi lifecycle.
+		}
 	}
 
 	private emitTelemetry(conv: Conversation, event: AgentSessionEvent): void {
 		const mapper = conv.telemetryMapper;
 		if (!mapper || !this.telemetry) return;
+		let records: PiTelemetryRecord[];
 		try {
-			for (const record of mapper.map(event)) {
+			records = mapper.map(event);
+		} catch {
+			this.noteTelemetryFailure("mapping", 1);
+			return;
+		}
+		for (const record of records) {
+			try {
 				this.telemetry.emit({
 					...record,
 					attributes: {
@@ -1197,9 +1220,9 @@ export class ClientSession {
 						ui_conversation_id: conv.id,
 					},
 				});
+			} catch {
+				this.noteTelemetryFailure("enqueue", 1);
 			}
-		} catch {
-			// Mapping and transport are observability only. UI projection must run.
 		}
 	}
 
@@ -1231,6 +1254,7 @@ export class ClientSession {
 				});
 			} catch {
 				conv.telemetryMapper = undefined;
+				this.noteTelemetryFailure("construction", 0);
 			}
 		}
 		conv.unsubscribe = conv.session.subscribe((event) => {

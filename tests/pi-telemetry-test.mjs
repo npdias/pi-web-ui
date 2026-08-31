@@ -194,8 +194,22 @@ async function runNoEnvChild() {
 	return exitCode;
 }
 
+async function runSystemdQuitChild() {
+	delete process.env.UA_TELEMETRY_SOCKET;
+	const appModule = await import(
+		`${pathToFileURL(join(REPO_ROOT, "dist/server/index.js")).href}?systemd-quit=${randomUUID()}`
+	);
+	Object.defineProperty(process, "platform", { value: "linux" });
+	appModule.service.disposeAll = () => new Promise(() => {});
+	appModule.service.onQuit();
+	await new Promise(() => {});
+}
+
 if (process.argv.includes("--no-env-child")) {
 	process.exit(await runNoEnvChild());
+}
+if (process.argv.includes("--systemd-quit-child")) {
+	await runSystemdQuitChild();
 }
 
 const fixture = fixtureDirs("pi-web-telemetry-");
@@ -263,6 +277,34 @@ try {
 	if (noEnv.stdout) process.stdout.write(noEnv.stdout);
 	if (noEnv.stderr) process.stderr.write(noEnv.stderr);
 	if (noEnv.status !== 0) throw new Error("no-env fixture failed");
+	const systemdFixture = fixtureDirs("pi-web-telemetry-systemd-quit-");
+	const systemdEnv = {
+		...process.env,
+		INVOCATION_ID: "fixture-systemd",
+		PI_WEB_PORT: String(PORT - 2),
+		PI_WEB_DATA_DIR: systemdFixture.dataDir,
+		PI_WEB_CWD: systemdFixture.projectDir,
+		PI_CODING_AGENT_DIR: systemdFixture.agentDir,
+	};
+	delete systemdEnv.UA_TELEMETRY_SOCKET;
+	const systemdQuit = spawnSync(
+		process.execPath,
+		[fileURLToPath(import.meta.url), "--systemd-quit-child"],
+		{
+			cwd: REPO_ROOT,
+			env: systemdEnv,
+			encoding: "utf8",
+			timeout: 2_000,
+			killSignal: "SIGKILL",
+		},
+	);
+	rmSync(systemdFixture.base, { recursive: true, force: true });
+	if (systemdQuit.status !== 3) {
+		throw new Error(
+			`systemd quit waited for cleanup instead of exiting 3: status=${systemdQuit.status} signal=${systemdQuit.signal}`,
+		);
+	}
+	console.log("PASS no-env systemd quit preserves immediate exit code 3");
 
 	await new Promise((resolve, reject) => {
 		telemetryServer.once("error", reject);
@@ -381,8 +423,50 @@ try {
 	await client.bindSession(firstConversation);
 	console.log("PASS rejected extension bind disposes stale mapper");
 
+	const telemetryConfig = client.telemetry;
+	const telemetrySource = telemetryConfig.source;
+	const beforeConstructionFailure = appModule.telemetryClient.health();
+	Object.defineProperty(telemetryConfig, "source", {
+		configurable: true,
+		get() {
+			throw new Error("fixture mapper construction failure");
+		},
+	});
+	await client.bindSession(firstConversation);
+	Object.defineProperty(telemetryConfig, "source", {
+		configurable: true,
+		writable: true,
+		value: telemetrySource,
+	});
+	const afterConstructionFailure = appModule.telemetryClient.health();
+	if (
+		firstConversation.telemetryMapper !== undefined ||
+		afterConstructionFailure.errors !== beforeConstructionFailure.errors + 1 ||
+		afterConstructionFailure.gaps !== beforeConstructionFailure.gaps
+	) {
+		throw new Error("mapper construction failure was not accounted");
+	}
+	await client.bindSession(firstConversation);
+	const disposalFailureMapper = firstConversation.telemetryMapper;
+	const originalDisposeMapper = disposalFailureMapper.dispose.bind(disposalFailureMapper);
+	const beforeDisposalFailure = appModule.telemetryClient.health();
+	disposalFailureMapper.dispose = () => {
+		throw new Error("fixture mapper disposal failure");
+	};
+	await client.bindSession(firstConversation);
+	disposalFailureMapper.dispose = originalDisposeMapper;
+	const afterDisposalFailure = appModule.telemetryClient.health();
+	if (
+		afterDisposalFailure.errors !== beforeDisposalFailure.errors + 1 ||
+		afterDisposalFailure.gaps !== beforeDisposalFailure.gaps
+	) {
+		throw new Error("mapper disposal failure was not accounted");
+	}
+	console.log("PASS mapper construction and disposal failures update health");
+
 	const mapper = firstConversation.telemetryMapper;
 	const originalMap = mapper.map.bind(mapper);
+	const beforeMappingFailure = appModule.telemetryClient.health();
 	mapper.map = () => {
 		throw new Error("fixture mapper failure");
 	};
@@ -394,8 +478,16 @@ try {
 		isError: false,
 	});
 	await wire.next("tool_status", (message) => message.toolCallId === "mapper-failure-tool");
+	const afterMappingFailure = appModule.telemetryClient.health();
+	if (
+		afterMappingFailure.errors !== beforeMappingFailure.errors + 1 ||
+		afterMappingFailure.gaps !== beforeMappingFailure.gaps + 1
+	) {
+		throw new Error("mapping failure was not accounted");
+	}
 	mapper.map = originalMap;
 	const originalEmit = appModule.telemetryClient.emit.bind(appModule.telemetryClient);
+	const beforeEnqueueFailure = appModule.telemetryClient.health();
 	appModule.telemetryClient.emit = () => {
 		throw new Error("fixture enqueue failure");
 	};
@@ -407,7 +499,36 @@ try {
 		isError: false,
 	});
 	await wire.next("tool_status", (message) => message.toolCallId === "enqueue-failure-tool");
+	const afterEnqueueFailure = appModule.telemetryClient.health();
+	if (
+		afterEnqueueFailure.errors !== beforeEnqueueFailure.errors + 1 ||
+		afterEnqueueFailure.gaps !== beforeEnqueueFailure.gaps + 1
+	) {
+		throw new Error("enqueue failure was not accounted");
+	}
 	appModule.telemetryClient.emit = originalEmit;
+	const originalRecordFailure = appModule.telemetryClient.recordFailure.bind(
+		appModule.telemetryClient,
+	);
+	appModule.telemetryClient.recordFailure = () => {
+		throw new Error("fixture health callback failure");
+	};
+	mapper.map = () => {
+		throw new Error("fixture mapper failure with broken health callback");
+	};
+	client.session._emit({
+		type: "tool_execution_end",
+		toolCallId: "health-callback-failure-tool",
+		toolName: "fixture_tool",
+		result: { content: [], details: {} },
+		isError: false,
+	});
+	await wire.next(
+		"tool_status",
+		(message) => message.toolCallId === "health-callback-failure-tool",
+	);
+	mapper.map = originalMap;
+	appModule.telemetryClient.recordFailure = originalRecordFailure;
 	acknowledgementMode = "malformed-once";
 	const malformedConnections = connectionCount;
 	emitFixture(client.session, "malformed-ack-tool");
@@ -418,7 +539,7 @@ try {
 			records.some((record) => recordHasTool(record, "malformed-ack-tool")),
 		"malformed ACK recovery",
 	);
-	console.log("PASS mapper, enqueue, and malformed-ACK failures preserve UI projection");
+	console.log("PASS mapper, enqueue, health callback, and malformed-ACK failures preserve UI");
 
 	firstConversation.listed = true;
 	firstConversation.promptedSinceActive = true;
@@ -526,31 +647,70 @@ try {
 	}
 	console.log("PASS edit fork creates fresh concrete-session namespace");
 
+	await waitFor(
+		() => appModule.telemetryClient.health().queued === 0,
+		"telemetry queue drain before connector isolation",
+	);
+	for (const socket of [...telemetrySockets]) socket.destroy();
+	await new Promise((resolve) => telemetryServer.close(resolve));
+	await waitFor(
+		() => appModule.telemetryClient.health().state === "disconnected",
+		"telemetry disconnect before connector isolation",
+	);
+	let unavailableConnectAttempts = 0;
+	appModule.telemetryClient.connectSocket = () => {
+		unavailableConnectAttempts++;
+		throw new Error("fixture unavailable telemetry socket");
+	};
 	const removedSession = firstConversation.session;
 	const removedMapper = firstConversation.telemetryMapper;
+	const beforeRemovedEvent = appModule.telemetryClient.health();
 	client.removeConversation(firstConversation.id);
 	const removedOffset = records.length;
 	emitFixture(removedSession, "removed-conversation-tool");
-	await sleep(100);
+	await Promise.resolve();
+	const afterRemovedEvent = appModule.telemetryClient.health();
 	if (
 		records.length !== removedOffset ||
-		removedMapper.map({ type: "agent_start" }).length !== 0
+		removedMapper.map({ type: "agent_start" }).length !== 0 ||
+		afterRemovedEvent.queued !== 0 ||
+		afterRemovedEvent.errors !== beforeRemovedEvent.errors ||
+		unavailableConnectAttempts !== 0 ||
+		appModule.telemetryClient.reconnectTimer !== null
 	) {
-		throw new Error("removed conversation mapper still emitted telemetry");
+		throw new Error("removed conversation scheduled telemetry or reconnect work");
 	}
-	console.log("PASS conversation removal disposes mapper and subscription");
+	console.log("PASS mapper disposal prevents later records and reconnect scheduling");
 
 	const shutdownMapper = editConversation.telemetryMapper;
-	for (const socket of [...telemetrySockets]) socket.destroy();
-	await new Promise((resolve) => telemetryServer.close(resolve));
-	client.session._emit({
-		type: "tool_execution_end",
-		toolCallId: "unavailable-socket-tool",
-		toolName: "fixture_tool",
-		result: { content: [], details: {} },
-		isError: false,
-	});
-	await wire.next("tool_status", (message) => message.toolCallId === "unavailable-socket-tool");
+	const saturationMessageOffset = wire.messages.length;
+	const gapsBeforeSaturation = appModule.telemetryClient.health().gaps;
+	for (let index = 0; index < 1_001; index++) {
+		client.session._emit({
+			type: "tool_execution_end",
+			toolCallId: `saturation-tool-${index}`,
+			toolName: "fixture_tool",
+			result: { content: [], details: {} },
+			isError: false,
+		});
+	}
+	await waitFor(
+		() => wire.messages.slice(saturationMessageOffset).filter((message) =>
+			message.type === "tool_status" &&
+			message.toolCallId?.startsWith("saturation-tool-")).length === 1_001,
+		"all saturated telemetry UI projections",
+	);
+	const saturatedHealth = appModule.telemetryClient.health();
+	if (
+		saturatedHealth.queued !== 1_000 ||
+		saturatedHealth.gaps !== gapsBeforeSaturation + 1 ||
+		unavailableConnectAttempts < 1
+	) {
+		throw new Error(
+			`integrated queue bound mismatch: ${JSON.stringify(saturatedHealth)}`,
+		);
+	}
+	console.log("PASS integrated unavailable queue caps at 1000 while all UI events project");
 	ws.close();
 	await new Promise((resolve) => ws.once("close", resolve));
 	await appModule.closeServer();
@@ -561,7 +721,7 @@ try {
 	) {
 		throw new Error("server shutdown did not dispose conversation and shared telemetry");
 	}
-	console.log("PASS unavailable socket is isolated and shutdown disposes telemetry");
+	console.log("PASS shutdown disposes saturated shared telemetry client");
 	console.log("PASS normal zero-token telemetry fixture");
 } catch (error) {
 	exitCode = 1;

@@ -422,6 +422,8 @@ export const service = new AgentService(
 		? {
 			source: telemetrySource,
 			emit: (record) => telemetryClient.emit(record),
+			onFailure: (_kind, lostRecords) =>
+				telemetryClient.recordFailure(lostRecords),
 		}
 		: undefined,
 );
@@ -459,7 +461,8 @@ function scheduleQuit(): boolean {
 	if (isLaunchd || isSystemd || inDocker) {
 		setTimeout(() => {
 			console.log("pi-web-ui:quit — shutting down (supervisor will restart)…");
-			void shutdown(isSystemd ? 3 : 0);
+			if (isSystemd) process.exit(3);
+			void shutdown();
 		}, 300);
 		return true;
 	}

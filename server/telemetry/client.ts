@@ -113,6 +113,14 @@ export class TelemetrySocketClient {
 		};
 	}
 
+	/** Record adapter-side loss that happened before a record reached emit(). */
+	recordFailure(lostRecords = 0): void {
+		this.errors++;
+		if (Number.isSafeInteger(lostRecords) && lostRecords > 0) {
+			this.gaps += lostRecords;
+		}
+	}
+
 	dispose(): void {
 		if (this.state === "disposed") return;
 		this.state = "disposed";
