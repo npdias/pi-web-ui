@@ -803,7 +803,7 @@ export class PiEventMapper {
 				}),
 			);
 		}
-		if (this.currentRun) {
+		if (this.currentRun?.attemptOpen) {
 			records.push(
 				this.record({
 					kind: "agent.run",

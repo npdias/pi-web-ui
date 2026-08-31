@@ -981,6 +981,26 @@ describe("PiEventMapper", () => {
 		]);
 	});
 
+	it("does not fabricate a run terminal while waiting for retry start", () => {
+		const clock = { wall: 1_700_000_000_000, mono: 100 };
+		const subject = mapper(clock);
+		subject.map({ type: "agent_start" });
+		clock.mono = 130;
+		subject.map(agentEnd("error", true));
+		clock.mono = 150;
+
+		const records = subject.forceReset();
+
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			kind: "agent.reset",
+			phase: "observation",
+			state: "forced_reset",
+		});
+		expect(records[0].attributes).not.toHaveProperty("matched_start");
+		expect(JSON.stringify(records)).not.toContain("run-attempt:2");
+	});
+
 	it("reset clears open spans and context while dispose rejects later mapping", () => {
 		const clock = { wall: 1_700_000_000_000, mono: 100 };
 		const subject = mapper(clock);
