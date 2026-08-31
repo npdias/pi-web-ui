@@ -418,6 +418,8 @@ interface Conversation {
 	telemetryMapper?: ConversationTelemetryMapper;
 	/** Invalidates an async bind when another bind or disposal supersedes it. */
 	bindGeneration: number;
+	/** Invalidates edit/reset work when another operation wins this conversation. */
+	operationGeneration: number;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -975,7 +977,13 @@ export class ClientSession {
 				});
 			}
 		}
-		await cs.bindSession(conv, runtime);
+		try {
+			await cs.bindSession(conv, runtime);
+		} catch (err) {
+			terminals.killAll();
+			await runtime.dispose().catch(() => {});
+			throw err;
+		}
 		if (!isCurrent()) {
 			await cs.dispose().catch(() => {});
 			throw new QuiesceRejectedError("会话绑定期间服务已开始关闭");
@@ -1128,6 +1136,7 @@ export class ClientSession {
 			telemetryConversationId: this.telemetry ? randomUUID() : undefined,
 			telemetryMapper: undefined,
 			bindGeneration: 0,
+			operationGeneration: 0,
 			deltaSeq: 0,
 			terminals,
 			msgIds: new Map(),
@@ -1146,6 +1155,7 @@ export class ClientSession {
 	private makeTelemetryMapper(
 		session: AgentSession,
 		conversationId: string | undefined,
+		bindGeneration: number,
 	): ConversationTelemetryMapper | undefined {
 		let telemetryMapper: ConversationTelemetryMapper | undefined;
 		if (this.telemetry && conversationId) {
@@ -1154,6 +1164,7 @@ export class ClientSession {
 					source: { ...this.telemetry.source },
 					sessionId: session.sessionId,
 					conversationId,
+					idNamespace: `${conversationId}:session:${session.sessionId}:binding:${bindGeneration}`,
 				};
 				telemetryMapper = this.telemetry.createMapper?.(options) ?? new PiEventMapper(options);
 			} catch {
@@ -1200,6 +1211,31 @@ export class ClientSession {
 		);
 	}
 
+	private ownsConversationOperation(
+		conv: Conversation,
+		runtime: AgentSessionRuntime,
+		lifecycleGeneration: number,
+		navigationGeneration: number,
+		operationGeneration: number,
+	): boolean {
+		return (
+			this.isLifecycleCurrent(lifecycleGeneration) &&
+			this.navigationGeneration === navigationGeneration &&
+			this.convs.get(conv.id) === conv &&
+			conv.runtime === runtime &&
+			conv.operationGeneration === operationGeneration
+		);
+	}
+
+	private installRuntimeRebind(
+		conv: Conversation,
+		runtime: AgentSessionRuntime,
+	): void {
+		runtime.setRebindSession(async (nextSession) => {
+			await this.bindSession(conv, runtime, nextSession);
+		});
+	}
+
 	private async disposeUninstalledRuntime(
 		runtime: AgentSessionRuntime,
 		terminals?: TerminalManager,
@@ -1207,6 +1243,21 @@ export class ClientSession {
 		terminals?.killAll();
 		runtime.setRebindSession(undefined);
 		await runtime.dispose().catch(() => {});
+	}
+
+	private async discardStaleConversationRuntime(
+		conv: Conversation,
+		runtime: AgentSessionRuntime,
+	): Promise<void> {
+		if (
+			this.convs.get(conv.id) === conv &&
+			conv.runtime === runtime &&
+			this.activeId !== conv.id
+		) {
+			this.removeConversation(conv.id);
+			return;
+		}
+		await this.disposeUninstalledRuntime(runtime);
 	}
 
 	private noteTelemetryFailure(
@@ -1297,18 +1348,28 @@ export class ClientSession {
 		conv: Conversation,
 		runtime: AgentSessionRuntime,
 		session: AgentSession = runtime.session,
-	): Promise<void> {
+		options: {
+			allowUnregistered?: boolean;
+			isCurrent?: () => boolean;
+			preserveCoreOnExtensionFailure?: boolean;
+		} = {},
+	): Promise<boolean> {
+		const ownsConversation = () =>
+			options.allowUnregistered
+				? this.convs.get(conv.id) === undefined
+				: this.convs.get(conv.id) === conv;
 		if (
 			this.disposed ||
 			!this.ownerIsCurrent() ||
-			this.convs.get(conv.id) !== conv
-		) return;
+			!ownsConversation() ||
+			options.isCurrent?.() === false
+		) return false;
 		if (
 			conv.runtime === runtime &&
 			conv.session === session &&
 			conv.unsubscribe
 		) {
-			return;
+			return true;
 		}
 		const bindGeneration = ++conv.bindGeneration;
 		if (conv.runtime !== runtime) conv.runtime.setRebindSession(undefined);
@@ -1320,26 +1381,51 @@ export class ClientSession {
 		conv.telemetryMapper = this.makeTelemetryMapper(
 			session,
 			conv.telemetryConversationId,
+			bindGeneration,
 		);
-		runtime.setRebindSession((nextSession) =>
-			this.bindSession(conv, runtime, nextSession),
-		);
-		await session.bindExtensions({
-			mode: "rpc",
-			uiContext: this.webUi,
-			onError: (err) => {
-				this.emit({ type: "notice", level: "error", text: err.error });
-			},
-		});
+		this.installRuntimeRebind(conv, runtime);
+		try {
+			await session.bindExtensions({
+				mode: "rpc",
+				uiContext: this.webUi,
+				onError: (err) => {
+					this.emit({ type: "notice", level: "error", text: err.error });
+				},
+			});
+		} catch (err) {
+			if (!options.preserveCoreOnExtensionFailure) {
+				if (
+					conv.bindGeneration === bindGeneration &&
+					conv.runtime === runtime &&
+					conv.session === session
+				) {
+					this.clearSessionBinding(conv);
+				}
+				throw err;
+			}
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: `扩展绑定失败，核心对话仍可用：${(err as Error).message}`,
+			});
+		}
 		if (
 			this.disposed ||
 			!this.ownerIsCurrent() ||
 			conv.bindGeneration !== bindGeneration ||
-			this.convs.get(conv.id) !== conv ||
+			!ownsConversation() ||
 			conv.runtime !== runtime ||
-			conv.session !== session
+			conv.session !== session ||
+			options.isCurrent?.() === false
 		) {
-			return;
+			if (
+				conv.bindGeneration === bindGeneration &&
+				conv.runtime === runtime &&
+				conv.session === session
+			) {
+				this.clearSessionBinding(conv);
+			}
+			return false;
 		}
 		conv.unsubscribe = session.subscribe((event) => {
 			this.emitTelemetry(conv, event);
@@ -1349,6 +1435,7 @@ export class ClientSession {
 		this.webUi.refresh();
 		this.startWidgetsTimer();
 		this.startStallTimer();
+		return true;
 	}
 
 	/** Poll extension widgets so TUI-only overlays (e.g. rpiv-todo) stay live. */
@@ -2585,6 +2672,7 @@ export class ClientSession {
 	private async forceResetConversation(conv: Conversation, reason: string): Promise<void> {
 		const lifecycleGeneration = this.lifecycleGeneration;
 		const previousRuntime = conv.runtime;
+		const operationGeneration = ++conv.operationGeneration;
 		try {
 			this.clearSessionBinding(conv);
 			this.clearAllToolWatchdogs(conv);
@@ -2593,7 +2681,8 @@ export class ClientSession {
 			if (
 				!this.isLifecycleCurrent(lifecycleGeneration) ||
 				this.convs.get(conv.id) !== conv ||
-				conv.runtime !== previousRuntime
+				conv.runtime !== previousRuntime ||
+				conv.operationGeneration !== operationGeneration
 			) {
 				return;
 			}
@@ -2608,13 +2697,16 @@ export class ClientSession {
 			if (
 				!this.isLifecycleCurrent(lifecycleGeneration) ||
 				this.convs.get(conv.id) !== conv ||
-				conv.runtime !== previousRuntime
+				conv.runtime !== previousRuntime ||
+				conv.operationGeneration !== operationGeneration
 			) {
 				await this.disposeUninstalledRuntime(runtime);
 				return;
 			}
 			this.emit({ type: "notice", level: "warning", text: reason });
-			await this.bindSession(conv, runtime);
+			await this.bindSession(conv, runtime, runtime.session, {
+				preserveCoreOnExtensionFailure: true,
+			});
 			this.emitConversations();
 			void this.pushSlashCommands();
 		} catch (err) {
@@ -2670,22 +2762,19 @@ export class ClientSession {
 			});
 			return;
 		}
-		// The outgoing conversation is left behind — apply the running-list
-		// lifecycle. Removal is deferred until the new chat exists so the active
-		// conversation stays valid during the (async) runtime creation.
-		const displaced = this.displaceActive();
 		// Carry the model chosen in the active chat over to the new chat so it
 		// doesn't silently revert to the ModelRuntime default model.
 		const prevModel = this.conv.session.agent.state.model ?? null;
+		const targetCwd = this.cwd;
 		try {
 			const conversationId = this.nextConversationId();
-			const terminals = this.makeTerminalManager(conversationId, this.cwd);
+			const terminals = this.makeTerminalManager(conversationId, targetCwd);
 			const runtime = await createAgentSessionRuntime(
 				this.makeRuntimeFactory(terminals),
 				{
-					cwd: this.cwd,
+					cwd: targetCwd,
 					agentDir: this.agentDir,
-					sessionManager: SessionManager.create(this.cwd),
+					sessionManager: SessionManager.create(targetCwd),
 				},
 			);
 			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) {
@@ -2693,11 +2782,25 @@ export class ClientSession {
 				return;
 			}
 			const conv = this.makeConversation(runtime, conversationId, terminals);
+			let bound: boolean;
+			try {
+				bound = await this.bindSession(conv, runtime, runtime.session, {
+					allowUnregistered: true,
+					isCurrent: () =>
+						this.isNavigationCurrent(lifecycleGeneration, navigationGeneration),
+				});
+			} catch (err) {
+				await this.disposeUninstalledRuntime(runtime, terminals);
+				throw err;
+			}
+			if (!bound) {
+				await this.disposeUninstalledRuntime(runtime, terminals);
+				return;
+			}
+			const displaced = this.displaceActive();
 			this.convs.set(conv.id, conv);
 			this.activeId = conv.id;
 			if (displaced) this.removeConversation(displaced.id);
-			await this.bindSession(conv, runtime);
-			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			// A fresh transcript appeared in the sessions dir — the next listing
 			// must see it, not the pre-newChat fridge snapshot.
 			this.invalidateSessionInfos();
@@ -2705,7 +2808,7 @@ export class ClientSession {
 			// model the user had selected in the previous chat.
 			if (prevModel && this.sharedModelRuntime) {
 				try {
-					await this.session.setModel(prevModel);
+					await conv.session.setModel(prevModel);
 				} catch {
 					// model no longer resolvable — keep the default
 				}
@@ -2772,6 +2875,7 @@ export class ClientSession {
 		const conv = this.convs.get(id);
 		if (!conv || id === this.activeId) return;
 		this.convs.delete(id);
+		conv.operationGeneration++;
 		this.clearAllToolWatchdogs(conv);
 		conv.terminals.killAll();
 		this.clearSessionBinding(conv);
@@ -2780,8 +2884,33 @@ export class ClientSession {
 
 	/** Switch the ACTIVE conversation without interrupting any other chat. */
 	async switchConversation(id: string): Promise<void> {
-		if (!this.convs.has(id) || id === this.activeId) return;
+		if (!this.convs.has(id)) return;
 		this.navigationGeneration++;
+		if (id === this.activeId) {
+			const conv = this.conv;
+			if (this.cwd !== conv.cwd) {
+				this.cwd = conv.cwd;
+				try {
+					this.onCwdChanged?.(conv.cwd);
+				} catch {
+					/* hook failure must not break convergence */
+				}
+				this.stateStore.remember(this.clientId, conv.cwd);
+				void this.pushProjects();
+				void this.refreshSessions();
+				void this.listFiles(undefined);
+				void this.listCommands();
+			}
+			conv.promptedSinceActive = false;
+			conv.lastActiveAt = Date.now();
+			this.webUi.refresh();
+			this.emitConversations();
+			this.goalSvc.emitGoalStatus();
+			this.pushTerminals();
+			void this.pushSlashCommands();
+			this.flushSnapshot();
+			return;
+		}
 		const displaced = this.displaceActive();
 		this.activeId = id;
 		const newCwd = this.conv.cwd;
@@ -3066,8 +3195,27 @@ export class ClientSession {
 				return;
 			}
 
-			// Only displace the old active conversation after the replacement runtime
-			// is known-good. This keeps a failed history open entirely non-destructive.
+			const conv = this.makeConversation(
+				openedRuntime,
+				conversationId,
+				openedTerminals,
+			);
+			// Deliberately resumed — must not be dismissed when the user later
+			// switches away without sending a new message.
+			conv.promptedSinceActive = true;
+			const bound = await this.bindSession(conv, openedRuntime, openedRuntime.session, {
+				allowUnregistered: true,
+				isCurrent: () =>
+					this.isNavigationCurrent(lifecycleGeneration, navigationGeneration),
+			});
+			if (!bound) {
+				openedTerminals.killAll();
+				await this.disposeUninstalledRuntime(openedRuntime);
+				openedRuntime = null;
+				openedTerminals = null;
+				return;
+			}
+			// Commit only after extension binding succeeds under the current request.
 			const oldListed = this.conv.listed;
 			const displaced = this.displaceActive();
 			const openInProject =
@@ -3075,10 +3223,8 @@ export class ClientSession {
 				1 -
 				(displaced?.cwd === targetCwd ? 1 : 0);
 			if (openInProject > MAX_OPEN_CONVERSATIONS) {
-				// displaceActive() may have promoted a streaming conversation into the
-				// running list. Roll that presentation-only mutation back because no
-				// switch will take place.
 				this.conv.listed = oldListed;
+				this.clearSessionBinding(conv);
 				openedTerminals.killAll();
 				await openedRuntime.dispose();
 				openedRuntime = null;
@@ -3090,22 +3236,11 @@ export class ClientSession {
 				});
 				return;
 			}
-
-			const conv = this.makeConversation(
-				openedRuntime,
-				conversationId,
-				openedTerminals,
-			);
-			// Deliberately resumed — must not be dismissed when the user later
-			// switches away without sending a new message.
-			conv.promptedSinceActive = true;
 			this.convs.set(conv.id, conv);
 			this.activeId = conv.id;
 			openedRuntime = null;
 			openedTerminals = null;
 			if (displaced) this.removeConversation(displaced.id);
-			await this.bindSession(conv, conv.runtime);
-			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			this.cwd = targetCwd;
 			this.conv.lastActiveAt = Date.now();
 			this.webUi.refresh();
@@ -3189,18 +3324,28 @@ export class ClientSession {
 			this.flushSnapshot();
 			return;
 		}
+		const conv = this.conv;
+		const runtime = conv.runtime;
+		const navigationGeneration = this.navigationGeneration;
+		const operationGeneration = ++conv.operationGeneration;
+		const prevModel = conv.session.agent.state.model ?? null;
+		runtime.setRebindSession(undefined);
 		try {
 			// Preserve the model the user had selected — fork() seeds a new
 			// branch with the ModelRuntime default model otherwise.
-			const conv = this.conv;
-			const runtime = conv.runtime;
-			const prevModel = conv.session.agent.state.model ?? null;
 			const result = await runtime.fork(entryId);
-			if (!this.isLifecycleCurrent(lifecycleGeneration)) {
-				await this.disposeUninstalledRuntime(runtime);
+			if (!this.ownsConversationOperation(
+				conv,
+				runtime,
+				lifecycleGeneration,
+				navigationGeneration,
+				operationGeneration,
+			)) {
+				await this.discardStaleConversationRuntime(conv, runtime);
 				return;
 			}
 			if (result.cancelled) {
+				this.installRuntimeRebind(conv, runtime);
 				this.emit({
 					type: "notice",
 					level: "info",
@@ -3210,12 +3355,13 @@ export class ClientSession {
 				return;
 			}
 			await this.bindSession(conv, runtime, runtime.session);
-			if (!this.isLifecycleCurrent(lifecycleGeneration)) return;
-			if (
-				this.activeId !== conv.id ||
-				this.convs.get(conv.id) !== conv ||
-				conv.runtime !== runtime
-			) return;
+			if (!this.ownsConversationOperation(
+				conv,
+				runtime,
+				lifecycleGeneration,
+				navigationGeneration,
+				operationGeneration,
+			)) return;
 			// Restore the previously-selected model on the forked branch.
 			if (prevModel && this.sharedModelRuntime) {
 				try {
@@ -3224,11 +3370,13 @@ export class ClientSession {
 					// model no longer resolvable — keep the default
 				}
 			}
-			if (
-				this.activeId !== conv.id ||
-				this.convs.get(conv.id) !== conv ||
-				conv.runtime !== runtime
-			) return;
+			if (!this.ownsConversationOperation(
+				conv,
+				runtime,
+				lifecycleGeneration,
+				navigationGeneration,
+				operationGeneration,
+			)) return;
 			await this.prompt(trimmed, attachments);
 			this.emit({
 				type: "notice",
@@ -3236,6 +3384,15 @@ export class ClientSession {
 				text: "已从该问题重新提问（原对话保留在会话列表中）",
 			});
 		} catch (err) {
+			if (this.ownsConversationOperation(
+				conv,
+				runtime,
+				lifecycleGeneration,
+				navigationGeneration,
+				operationGeneration,
+			)) {
+				this.installRuntimeRebind(conv, runtime);
+			}
 			this.emit({
 				type: "notice",
 				level: "error",
@@ -3381,7 +3538,11 @@ export class ClientSession {
 			if (!st.isDirectory()) {
 				throw new Error("路径不是目录");
 			}
-			if (abs === this.cwd) {
+			if (
+				abs === this.cwd &&
+				this.conv.cwd === abs &&
+				this.conv.session.sessionManager.getCwd() === abs
+			) {
 				this.emit({
 					type: "notice",
 					level: "info",
@@ -3390,11 +3551,6 @@ export class ClientSession {
 				this.flushSnapshot();
 				return;
 			}
-
-			// The outgoing conversation is left behind — apply the running-list
-			// lifecycle (removal is deferred until the active conversation is
-			// safely switched away).
-			const displaced = this.displaceActive();
 
 			// Prefer the target project's own most recently active conversation;
 			// only create a fresh one (resuming its most recent session) when the
@@ -3410,6 +3566,7 @@ export class ClientSession {
 			}
 
 			if (target) {
+				const displaced = this.displaceActive();
 				this.activeId = target.id;
 				if (displaced) this.removeConversation(displaced.id);
 			} else {
@@ -3429,6 +3586,22 @@ export class ClientSession {
 					return;
 				}
 				const conv = this.makeConversation(newRuntime, conversationId, terminals);
+				let bound: boolean;
+				try {
+					bound = await this.bindSession(conv, newRuntime, newRuntime.session, {
+						allowUnregistered: true,
+						isCurrent: () =>
+							this.isNavigationCurrent(lifecycleGeneration, navigationGeneration),
+					});
+				} catch (err) {
+					await this.disposeUninstalledRuntime(newRuntime, terminals);
+					throw err;
+				}
+				if (!bound) {
+					await this.disposeUninstalledRuntime(newRuntime, terminals);
+					return;
+				}
+				const displaced = this.displaceActive();
 				this.convs.set(conv.id, conv);
 				this.activeId = conv.id;
 				if (displaced) this.removeConversation(displaced.id);
@@ -3437,8 +3610,6 @@ export class ClientSession {
 						this.emit({ type: "notice", level: d.type, text: d.message });
 					}
 				}
-				await this.bindSession(conv, newRuntime);
-				if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			}
 
 			this.pushTerminals();
