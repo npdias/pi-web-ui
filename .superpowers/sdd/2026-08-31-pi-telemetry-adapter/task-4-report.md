@@ -4,6 +4,7 @@
 
 - Implementation commit: `f6eb1781637ce785071445c9bc91d4a638338d17` (`test: cover Pi telemetry scenarios`).
 - Claim-review fix: `e7c84dbed1fd041d6520049b1e53283fc3c2896b` (`test: harden telemetry scenario fixtures`).
+- Watchdog integration fix: `c8d29e400f4243c0bc28890460b11caea71d63a7` (`fix: emit Pi stall telemetry from watchdog`).
 - Five content-free JSONL scenarios exercise current Pi SDK lifecycle facts through `PiEventMapper`.
 - Scenario output crosses the real `TelemetrySocketClient` LF queue and acknowledgement boundary.
 - No provider, model, token, UI, or trajectory-view call runs in the scenario test.
@@ -115,9 +116,77 @@ exit 1
 
 Telemetry smoke passed inside the aggregate. This report does not claim full smoke closure.
 
+## Watchdog integration review fix
+
+Review found `PiEventMapper.observeStall()` had diagnostic coverage but no production caller. Follow-up test drove ClientSession's existing watchdog through a captured interval callback plus fake `Date.now`.
+
+RED at exactly 180 seconds:
+
+```text
+node tests/pi-telemetry-test.mjs
+FAIL no-env Error: timeout waiting for no-env stall warning
+exit 1
+```
+
+The existing UI predicate used `>` rather than `>=`, so the exact threshold did not warn. Production still had no path from the watchdog into `observeStall()`.
+
+GREEN:
+
+```text
+node tests/pi-telemetry-test.mjs
+PASS no env preserves stall warning without telemetry mapper
+PASS stall timer emits one warning observation per silence episode without abort
+PASS normal zero-token telemetry fixture
+exit 0
+
+node tests/pi-telemetry-scenarios-test.mjs
+PASS model-stall: 3 normalized records
+PASS integrated queue boundary: 21/21 accepted
+exit 0
+```
+
+Production behavior:
+
+- ClientSession's existing stall timer remains the polling owner.
+- Timer passes its `Date.now()` value to optional `ConversationTelemetryMapper.observeStall(nowMs)`.
+- Mapper gets the same configured threshold at construction and calculates silence from SDK-event wall timestamps.
+- The timer branch now triggers at `>= STALL_NOTIFY_MS`. Default threshold is exactly 180,000 ms.
+- `conv.stallNoticed` emits one UI warning plus one telemetry observation per silence episode. Any later SDK event resets UI and mapper dedupe state.
+- Stall mapping and queue output reuse mapping/enqueue failure isolation. No mapper or no telemetry still emits the same warning.
+- Stall handling never calls interruption and emits no end, completed, or cancelled state.
+
+Fresh review-fix gates:
+
+```text
+npm run typecheck
+exit 0
+
+npm test -- --run
+Test Files  29 passed (29)
+Tests  313 passed (313)
+exit 0
+
+npm run check:protocol
+PROTOCOL_VERSION v10 match passed
+exit 0
+
+npm run build
+vite: 549 modules transformed
+build:web exit 0
+build:server exit 0
+
+npm run test:smoke
+32/33 passed
+settings-test: 27 passed, 1 failed at existing skill re-enabled check
+exit 1
+
+git diff --check
+exit 0
+```
+
 ## Limits
 
-- `observeStall()` maps an explicit polling observation. Task 4 does not change Pi's existing UI timer, abort policy, or trajectory view.
+- Existing Pi watchdog now forwards its observation to telemetry. Abort policy, warning text, and trajectory view remain unchanged.
 - Stall is an observation, not proof of failure. Deep model work can remain quiet for 180 seconds.
 - Fixtures use narrow lifecycle descriptors. Harness supplies SDK-required empty message metadata plus private tool sentinels in memory; fixture files contain no prompts, provider headers, tool args, tool results, or secrets.
 - No live UnifiedAgent telemetry service acceptance, provider call, model token, browser, or user-observed UI run occurred.
@@ -126,6 +195,7 @@ Telemetry smoke passed inside the aggregate. This report does not claim full smo
 ## Changed files
 
 - `server/telemetry/pi-event-mapper.ts`
+- `server/agent-service.ts`
 - `tests/pi-telemetry-scenarios-test.mjs`
 - `tests/fixtures/telemetry/normal.jsonl`
 - `tests/fixtures/telemetry/model-stall.jsonl`
