@@ -53,6 +53,110 @@ interface FinalState {
 	severity: TelemetrySeverity;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isContentIndex(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isAssistantMessageEvent(value: unknown): boolean {
+	if (!isRecord(value) || typeof value.type !== "string") return false;
+	const hasPartial = isRecord(value.partial);
+	switch (value.type) {
+		case "start":
+			return hasPartial;
+		case "text_start":
+		case "thinking_start":
+		case "toolcall_start":
+			return isContentIndex(value.contentIndex) && hasPartial;
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta":
+			return isContentIndex(value.contentIndex) && typeof value.delta === "string" && hasPartial;
+		case "text_end":
+		case "thinking_end":
+			return isContentIndex(value.contentIndex) && typeof value.content === "string" && hasPartial;
+		case "toolcall_end":
+			return isContentIndex(value.contentIndex) && isRecord(value.toolCall) && hasPartial;
+		case "done":
+			return (
+				(value.reason === "stop" ||
+					value.reason === "length" ||
+					value.reason === "toolUse" ||
+					value.reason === "deferred") &&
+				isRecord(value.message)
+			);
+		case "error":
+			return (value.reason === "aborted" || value.reason === "error") && isRecord(value.error);
+		default:
+			return false;
+	}
+}
+
+function isSupportedEvent(value: unknown): value is AgentSessionEvent {
+	if (!isRecord(value) || typeof value.type !== "string") return false;
+	switch (value.type) {
+		case "agent_start":
+		case "turn_start":
+		case "agent_settled":
+			return true;
+		case "agent_end":
+			return (
+				Array.isArray(value.messages) &&
+				value.messages.every(isRecord) &&
+				typeof value.willRetry === "boolean"
+			);
+		case "turn_end":
+			return isRecord(value.message) && Array.isArray(value.toolResults);
+		case "tool_execution_start":
+			return (
+				typeof value.toolCallId === "string" &&
+				value.toolCallId.length > 0 &&
+				typeof value.toolName === "string" &&
+				value.toolName.length > 0 &&
+				Object.hasOwn(value, "args")
+			);
+		case "tool_execution_end":
+			return (
+				typeof value.toolCallId === "string" &&
+				value.toolCallId.length > 0 &&
+				typeof value.toolName === "string" &&
+				value.toolName.length > 0 &&
+				Object.hasOwn(value, "result") &&
+				typeof value.isError === "boolean"
+			);
+		case "message_update":
+			return isRecord(value.message) && isAssistantMessageEvent(value.assistantMessageEvent);
+		case "auto_retry_end":
+			return (
+				typeof value.success === "boolean" &&
+				typeof value.attempt === "number" &&
+				Number.isSafeInteger(value.attempt) &&
+				value.attempt >= 0 &&
+				(value.finalError === undefined || typeof value.finalError === "string")
+			);
+		default:
+			return false;
+	}
+}
+
+function isTelemetryContext(value: unknown): value is PiTelemetryContext {
+	return (
+		isRecord(value) &&
+		typeof value.systemPrompt === "string" &&
+		Array.isArray(value.toolSchemas) &&
+		value.toolSchemas.every(
+			(tool) =>
+				isRecord(tool) &&
+				typeof tool.name === "string" &&
+				tool.name.length > 0 &&
+				Object.hasOwn(tool, "schema"),
+		)
+	);
+}
+
 function stableValue(value: unknown, seen = new Set<object>()): JsonValue {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
 	if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
@@ -136,23 +240,40 @@ export class PiEventMapper {
 
 	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[] {
 		if (this.disposed) return [];
+		if (!isSupportedEvent(event)) return [];
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
 		const records: PiTelemetryRecord[] = [];
-		const contextRecord = context
+		let duplicateStart = false;
+		if (event.type === "agent_start") {
+			duplicateStart = this.currentRun !== null;
+			if (!this.currentRun) {
+				this.currentRun = {
+					id: `${this.conversationId}:run:${++this.runSequence}`,
+					startedAt: monotonicTime,
+				};
+			}
+		} else if (event.type === "turn_start") {
+			duplicateStart = this.currentTurn !== null;
+			if (!this.currentTurn) {
+				const sequence = ++this.turnSequence;
+				this.currentTurn = {
+					ids: {
+						turn_id: `${this.conversationId}:turn:${sequence}`,
+						step_id: `${this.conversationId}:step:${sequence}`,
+						request_id: `${this.conversationId}:request:${sequence}`,
+					},
+					startedAt: monotonicTime,
+				};
+			}
+		}
+		const contextRecord = isTelemetryContext(context)
 			? this.mapContext(context, wallTime)
 			: undefined;
 		if (contextRecord) records.push(contextRecord);
 
 		switch (event.type) {
 			case "agent_start": {
-				const duplicate = this.currentRun !== null;
-				if (!this.currentRun) {
-					this.currentRun = {
-						id: `${this.conversationId}:run:${++this.runSequence}`,
-						startedAt: monotonicTime,
-					};
-				}
 				records.push(
 					this.record({
 						kind: "agent.run",
@@ -161,7 +282,7 @@ export class PiEventMapper {
 						severity: "info",
 						wallTime,
 						parentId: this.sessionId,
-						attributes: duplicate ? { duplicate_start: true } : {},
+						attributes: duplicateStart ? { duplicate_start: true } : {},
 					}),
 				);
 				break;
@@ -193,18 +314,6 @@ export class PiEventMapper {
 				break;
 			}
 			case "turn_start": {
-				const duplicate = this.currentTurn !== null;
-				if (!this.currentTurn) {
-					const sequence = ++this.turnSequence;
-					this.currentTurn = {
-						ids: {
-							turn_id: `${this.conversationId}:turn:${sequence}`,
-							step_id: `${this.conversationId}:step:${sequence}`,
-							request_id: `${this.conversationId}:request:${sequence}`,
-						},
-						startedAt: monotonicTime,
-					};
-				}
 				records.push(
 					this.record({
 						kind: "agent.turn",
@@ -214,7 +323,7 @@ export class PiEventMapper {
 						wallTime,
 						parentId: this.currentRun?.id ?? this.sessionId,
 						span: this.currentSpan(),
-						attributes: duplicate ? { duplicate_start: true } : {},
+						attributes: duplicateStart ? { duplicate_start: true } : {},
 					}),
 				);
 				break;
@@ -311,6 +420,12 @@ export class PiEventMapper {
 				);
 				break;
 			}
+			case "auto_retry_end":
+				if (event.success === false) this.clearOpenSpans();
+				break;
+			case "agent_settled":
+				this.clearOpenSpans();
+				break;
 			default:
 				break;
 		}
@@ -320,9 +435,7 @@ export class PiEventMapper {
 
 	reset(): void {
 		if (this.disposed) return;
-		this.currentRun = null;
-		this.currentTurn = null;
-		this.toolStarts.clear();
+		this.clearOpenSpans();
 		this.contextHashes = null;
 	}
 
@@ -330,6 +443,12 @@ export class PiEventMapper {
 		if (this.disposed) return;
 		this.reset();
 		this.disposed = true;
+	}
+
+	private clearOpenSpans(): void {
+		this.currentRun = null;
+		this.currentTurn = null;
+		this.toolStarts.clear();
 	}
 
 	private mapContext(context: PiTelemetryContext, wallTime: number): PiTelemetryRecord | undefined {

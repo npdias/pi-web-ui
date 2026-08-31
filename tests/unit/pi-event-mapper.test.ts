@@ -282,6 +282,38 @@ describe("PiEventMapper", () => {
 		expect(nextStart.correlation?.trace_id).toBe("conversation-1:run:2");
 	});
 
+	it.each(
+		[
+			[
+				"failed auto retry",
+				{ type: "auto_retry_end", success: false, attempt: 1, finalError: "failed" },
+			],
+			["settled run", { type: "agent_settled" }],
+		] satisfies Array<[string, AgentSessionEvent]>,
+	)(
+		"clears retry state after %s before a later agent start",
+		(_name, terminalEvent) => {
+			const clock = { wall: 1_700_000_000_000, mono: 100 };
+			const subject = mapper(clock);
+			const [firstStart] = subject.map({ type: "agent_start" });
+			clock.mono = 110;
+			subject.map(agentEnd("error", true));
+			clock.mono = 120;
+
+			expect(subject.map(terminalEvent)).toEqual([]);
+
+			clock.mono = 200;
+			const [nextStart] = subject.map({ type: "agent_start" });
+			clock.mono = 230;
+			const [nextEnd] = subject.map(agentEnd("stop"));
+
+			expect(firstStart.correlation?.trace_id).toBe("conversation-1:run:1");
+			expect(nextStart.correlation?.trace_id).toBe("conversation-1:run:2");
+			expect(nextStart.attributes).not.toHaveProperty("duplicate_start");
+			expect(nextEnd.duration_ms).toBe(30);
+		},
+	);
+
 	it("does not overwrite first tool start on duplicate start or reuse it after end", () => {
 		const clock = { wall: 1_700_000_000_000, mono: 100 };
 		const subject = mapper(clock);
@@ -353,9 +385,22 @@ describe("PiEventMapper", () => {
 		});
 
 		expect(initialRecords.map((record) => record.kind)).toEqual(["context.changed", "agent.run"]);
+		expect(initialRecords[0].correlation).toMatchObject({
+			trace_id: "conversation-1:run:1",
+			parent_id: "conversation-1:run:1",
+			session_id: "session-1",
+			conversation_id: "conversation-1",
+		});
 		expect(reorderedRecords.map((record) => record.kind)).toEqual(["agent.turn"]);
 		expect(promptChanged.map((record) => record.kind)).toEqual(["context.changed", "agent.turn"]);
 		expect(schemaChanged.map((record) => record.kind)).toEqual(["context.changed", "agent.turn"]);
+		expect(schemaChanged[0].correlation).toMatchObject({
+			trace_id: "conversation-1:run:1",
+			turn_id: "conversation-1:turn:2",
+			step_id: "conversation-1:step:2",
+			request_id: "conversation-1:request:2",
+			parent_id: "conversation-1:request:2",
+		});
 		for (const record of [initialRecords[0], promptChanged[0], schemaChanged[0]]) {
 			expect(record.attributes).toMatchObject({
 				system_prompt_hash: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
@@ -416,6 +461,110 @@ describe("PiEventMapper", () => {
 			}),
 		]);
 	});
+
+	it.each([
+		["agent_end messages", { type: "agent_end", messages: null, willRetry: false }],
+		["agent_end message entry", { type: "agent_end", messages: [null], willRetry: false }],
+		["turn_end message", { type: "turn_end", message: null, toolResults: [] }],
+		["tool start identity", { type: "tool_execution_start", toolCallId: 7, toolName: "bash", args: {} }],
+		["tool end error flag", { type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: {}, isError: "false" }],
+		["message update payload", { type: "message_update", message: assistant("pending"), assistantMessageEvent: null }],
+		["retry end result", { type: "auto_retry_end", success: "false", attempt: 1 }],
+	] as const)(
+		"ignores malformed %s without emitting context or changing turn correlation",
+		(_name, malformed) => {
+			const subject = mapper();
+			const initial: PiTelemetryContext = { systemPrompt: "prompt-1", toolSchemas: [] };
+			const changed: PiTelemetryContext = { systemPrompt: "prompt-2", toolSchemas: [] };
+			subject.map({ type: "agent_start" }, initial);
+			const [, firstTurn] = subject.map({ type: "turn_start" }, changed);
+			let malformedRecords: ReturnType<PiEventMapper["map"]> = [];
+
+			expect(() => {
+				malformedRecords = subject.map(malformed as unknown as AgentSessionEvent, initial);
+			}).not.toThrow();
+			expect(malformedRecords).toEqual([]);
+
+			const nextRecords = subject.map({ type: "turn_start" }, initial);
+			expect(nextRecords.map((record) => record.kind)).toEqual([
+				"context.changed",
+				"agent.turn",
+			]);
+			expect(nextRecords[1].attributes).toMatchObject({ duplicate_start: true });
+			expect(nextRecords[1].correlation).toMatchObject({
+				turn_id: firstTurn.correlation?.turn_id,
+				step_id: firstTurn.correlation?.step_id,
+				request_id: firstTurn.correlation?.request_id,
+			});
+		},
+	);
+
+	it("does not consume a matched tool start when malformed tool end arrives", () => {
+		const clock = { wall: 1_700_000_000_000, mono: 100 };
+		const subject = mapper(clock);
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		subject.map({
+			type: "tool_execution_start",
+			toolCallId: "call-1",
+			toolName: "bash",
+			args: {},
+		});
+		clock.mono = 120;
+
+		expect(
+			subject.map({
+				type: "tool_execution_end",
+				toolCallId: "call-1",
+				toolName: "bash",
+				result: {},
+				isError: "false",
+			} as unknown as AgentSessionEvent),
+		).toEqual([]);
+
+		clock.mono = 135;
+		const [validEnd] = subject.map(toolEnd());
+		expect(validEnd.duration_ms).toBe(35);
+		expect(validEnd.attributes).toMatchObject({ matched_start: true });
+	});
+
+	it("does not emit or suppress context changes for an unknown event", () => {
+		const subject = mapper();
+		const initial: PiTelemetryContext = { systemPrompt: "prompt-1", toolSchemas: [] };
+		const changed: PiTelemetryContext = { systemPrompt: "prompt-2", toolSchemas: [] };
+		subject.map({ type: "agent_start" }, initial);
+
+		expect(
+			subject.map(
+				{ type: "future_event", systemPrompt: "spoof" } as unknown as AgentSessionEvent,
+				changed,
+			),
+		).toEqual([]);
+
+		const validRecords = subject.map({ type: "turn_start" }, changed);
+		expect(validRecords.map((record) => record.kind)).toEqual(["context.changed", "agent.turn"]);
+	});
+
+	it.each([
+		["system prompt", { systemPrompt: 7, toolSchemas: [] }],
+		["tool schema list", { systemPrompt: "prompt", toolSchemas: null }],
+		["tool schema name", { systemPrompt: "prompt", toolSchemas: [{ name: 7, schema: {} }] }],
+	] as const)(
+		"ignores malformed context %s while preserving valid lifecycle mapping",
+		(_name, malformedContext) => {
+			const subject = mapper();
+			let records: ReturnType<PiEventMapper["map"]> = [];
+
+			expect(() => {
+				records = subject.map(
+					{ type: "agent_start" },
+					malformedContext as unknown as PiTelemetryContext,
+				);
+			}).not.toThrow();
+			expect(records.map((record) => record.kind)).toEqual(["agent.run"]);
+			expect(records[0].correlation).toMatchObject({ trace_id: "conversation-1:run:1" });
+		},
+	);
 
 	it("reset clears open spans and context while dispose rejects later mapping", () => {
 		const clock = { wall: 1_700_000_000_000, mono: 100 };
