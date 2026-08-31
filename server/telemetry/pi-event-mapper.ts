@@ -458,6 +458,8 @@ export class PiEventMapper {
 	private currentTurn: TurnSpan | null = null;
 	private readonly toolStarts = new Map<string, ToolSpan>();
 	private contextHashes: { systemPrompt: string; toolSchemas: string } | null = null;
+	private lastEventAt: number | null = null;
+	private stallObserved = false;
 	private disposed = false;
 
 	constructor(options: PiEventMapperOptions) {
@@ -477,6 +479,8 @@ export class PiEventMapper {
 		if (validatedContext && !hasJsonToolSchemas(validatedContext)) return [];
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
+		this.lastEventAt = monotonicTime;
+		this.stallObserved = false;
 		const records: PiTelemetryRecord[] = [];
 		let duplicateStart = false;
 		if (event.type === "agent_start") {
@@ -667,6 +671,40 @@ export class PiEventMapper {
 		return records;
 	}
 
+	observeStall(thresholdMs = 180_000): PiTelemetryRecord[] {
+		if (
+			this.disposed ||
+			!this.currentRun ||
+			this.lastEventAt === null ||
+			this.stallObserved ||
+			!Number.isFinite(thresholdMs) ||
+			thresholdMs < 0
+		) {
+			return [];
+		}
+		const monotonicTime = this.monotonicNow();
+		const silenceMs = monotonicTime - this.lastEventAt;
+		if (silenceMs < thresholdMs) return [];
+		this.stallObserved = true;
+		const span = this.currentSpan();
+		return [
+			this.record({
+				kind: "agent.stall",
+				phase: "observation",
+				state: "possibly_stalled",
+				severity: "warning",
+				wallTime: this.wallNow(),
+				parentId: span.request_id ?? span.trace_id ?? this.sessionId,
+				span,
+				durationMs: silenceMs,
+				attributes: {
+					silence_ms: silenceMs,
+					threshold_ms: thresholdMs,
+				},
+			}),
+		];
+	}
+
 	reset(): void {
 		if (this.disposed) return;
 		this.clearOpenSpans();
@@ -683,6 +721,8 @@ export class PiEventMapper {
 		this.currentRun = null;
 		this.currentTurn = null;
 		this.toolStarts.clear();
+		this.lastEventAt = null;
+		this.stallObserved = false;
 	}
 
 	private mapContext(context: PiTelemetryContext, wallTime: number): PiTelemetryRecord | undefined {
