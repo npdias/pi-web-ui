@@ -41,7 +41,7 @@ interface TrajectoryRecordBase {
 	readonly summaryTruncated?: boolean;
 	/** Recorded duration only. `null` means unknown, never zero-filled. */
 	readonly durationMs: number | null;
-	/** Distinguishes an in-flight span from a closed record with unknown duration. */
+	/** True only while evidence confirms the span remains open. Gap-unknown closure is false. */
 	readonly isOpen: boolean;
 	readonly isError: boolean;
 	readonly sourceEventIds: readonly string[];
@@ -73,8 +73,17 @@ export interface TelemetryTrajectoryRecord extends TrajectoryRecordBase {
 	readonly source: TelemetrySource;
 	readonly correlation?: TelemetryCorrelation;
 	readonly attributes: Readonly<Record<string, TelemetryJson>>;
+	/** A replay gap may contain the missing terminal, so active/closed state is unknown. */
+	readonly closureUnknown: boolean;
+	/** At least one replay gap intersects the observed lifecycle interval. */
+	readonly gapTainted: boolean;
+	readonly gapEvidence: readonly TelemetryReplayGap[];
+	/** Two or more distinct terminal envelopes exist without an intervening start. */
+	readonly terminalConflict: boolean;
+	/** Normalized source envelopes retained in server sequence order; payloads stay references. */
+	readonly sourceEnvelopes: readonly TelemetryEvent[];
 	readonly privacyClass?: string;
-	readonly payloadRef?: string;
+	readonly payloadRefs: readonly string[];
 	readonly redaction?: Readonly<Record<string, TelemetryJson>>;
 }
 

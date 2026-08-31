@@ -16,6 +16,7 @@ import {
 	trajectoryRecordId,
 } from "../../web/src/observe/trajectory/record.js";
 import type { TelemetryTrajectoryRecord } from "../../web/src/observe/trajectory/record.js";
+import type { TrajectoryProjectionInput } from "../../web/src/observe/trajectory/record.js";
 import type {
 	TelemetryEvent,
 	TelemetryReplayGap,
@@ -125,7 +126,7 @@ function envelope(
 	});
 }
 
-function records(events: readonly TelemetryEvent[]) {
+function records(events: readonly TrajectoryProjectionInput[]) {
 	return flattenTrajectoryRecords(projectTrajectory(events));
 }
 
@@ -344,7 +345,7 @@ describe("projectTrajectory", () => {
 		});
 	});
 
-	it("keeps retry starts open by sequence and folds diagnostic duplicate tool starts", () => {
+	it("keeps retry starts open and surfaces duplicate tool terminal conflict", () => {
 		const run = { trace_id: "retry-run", session_id: "session-retry" };
 		const tool = {
 			...run,
@@ -406,12 +407,176 @@ describe("projectTrajectory", () => {
 		expect(tools).toHaveLength(1);
 		expect(tools[0]).toMatchObject({
 			isOpen: false,
-			durationMs: 2,
+			durationMs: null,
+			state: "conflict",
+			terminalConflict: true,
 			sourceEventIds: [
 				"synthetic:event:4",
 				"synthetic:event:5",
 				"synthetic:event:6",
 				"synthetic:event:7",
+			],
+		});
+	});
+
+	it("treats a terminal after a retry start as a new attempt, not conflicting evidence", () => {
+		const correlation = { trace_id: "retry-complete-run", session_id: "retry-session" };
+		const all = records([
+			envelope(1, "agent.run", {
+				phase: "start",
+				state: "running",
+				correlation,
+			}),
+			envelope(2, "agent.run", {
+				phase: "end",
+				state: "retrying",
+				severity: "warning",
+				correlation,
+			}),
+			envelope(3, "agent.run", {
+				phase: "start",
+				state: "running",
+				correlation,
+				attributes: { duplicate_start: true },
+			}),
+			envelope(4, "agent.run", {
+				phase: "end",
+				state: "completed",
+				correlation,
+				duration_ms: 1,
+				attributes: { matched_start: true },
+			}),
+		]);
+		const terminals = all.filter(
+			(record) => record.eventKind === "agent.run" && record.phase === "end",
+		);
+
+		expect(terminals).toHaveLength(2);
+		expect(terminals.map((record) => record.state)).toEqual(["retrying", "completed"]);
+		expect(
+			terminals.every(
+				(record) => (record as { terminalConflict?: boolean }).terminalConflict === false,
+			),
+		).toBe(true);
+	});
+
+	it("surfaces completed-then-error tool terminals in one stable conflict record", () => {
+		const correlation = {
+			trace_id: "conflict-run",
+			turn_id: "conflict-turn",
+			step_id: "conflict-step",
+			request_id: "conflict-request",
+			tool_call_id: "conflict-tool",
+		};
+		const start = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read" },
+		});
+		const completed = envelope(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 10,
+			attributes: { tool_name: "read", matched_start: true },
+		});
+		const failed = envelope(3, "tool.execution", {
+			phase: "end",
+			state: "error",
+			severity: "error",
+			correlation,
+			duration_ms: 11,
+			attributes: { tool_name: "read", is_error: true, matched_start: false },
+		});
+		const settledId = records([start, completed])[0]?.id;
+		const conflicted = records([start, completed, failed, failed]).filter(
+			(record) => record.eventKind === "tool.execution",
+		);
+
+		expect(conflicted).toHaveLength(1);
+		expect(conflicted[0]).toMatchObject({
+			id: settledId,
+			kind: "ERROR",
+			severity: "error",
+			state: "conflict",
+			isError: true,
+			isOpen: false,
+			durationMs: null,
+			terminalConflict: true,
+			sourceEventIds: [
+				"synthetic:event:1",
+				"synthetic:event:2",
+				"synthetic:event:3",
+			],
+		});
+	});
+
+	it.each([
+		{
+			name: "run",
+			kind: "agent.run",
+			correlation: { trace_id: "terminal-conflict-run" },
+		},
+		{
+			name: "turn",
+			kind: "agent.turn",
+			correlation: {
+				trace_id: "terminal-conflict-run",
+				turn_id: "terminal-conflict-turn",
+				step_id: "terminal-conflict-step",
+				request_id: "terminal-conflict-request",
+			},
+		},
+	])("keeps first $name terminal plus explicit highest-severity conflict evidence", ({
+		kind,
+		correlation,
+	}) => {
+		const start = envelope(1, kind, {
+			phase: "start",
+			state: "running",
+			correlation,
+		});
+		const completed = envelope(2, kind, {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 10,
+			attributes: { matched_start: true },
+		});
+		const failed = envelope(3, kind, {
+			phase: "end",
+			state: "error",
+			severity: "error",
+			correlation,
+			duration_ms: 11,
+			attributes: { is_error: true, matched_start: false },
+		});
+		const ordinaryTerminalId = records([start, failed]).find(
+			(record) => record.sourceEventIds.includes(failed.event_id),
+		)?.id;
+		const all = records([start, completed, failed, failed]);
+		const conflict = all.find(
+			(record) =>
+				record.eventKind === kind &&
+				(record as { terminalConflict?: boolean }).terminalConflict === true,
+		);
+
+		expect(all.filter((record) => record.eventKind === kind)).toHaveLength(3);
+		expect(conflict).toMatchObject({
+			id: ordinaryTerminalId,
+			sequence: 3,
+			kind: "ERROR",
+			severity: "error",
+			state: "conflict",
+			isError: true,
+			isOpen: false,
+			durationMs: null,
+			terminalConflict: true,
+			sourceEventIds: [
+				"synthetic:event:1",
+				"synthetic:event:2",
+				"synthetic:event:3",
 			],
 		});
 	});
@@ -531,5 +696,335 @@ describe("projectTrajectory", () => {
 		expect(projected?.summary.length).toBeLessThanOrEqual(512);
 		expect(projected).toMatchObject({ summaryTruncated: true });
 		expect(projected?.summary.endsWith("…")).toBe(true);
+	});
+
+	it.each([
+		{
+			name: "run",
+			kind: "agent.run",
+			correlation: { trace_id: "gap-run" },
+		},
+		{
+			name: "turn",
+			kind: "agent.turn",
+			correlation: {
+				trace_id: "gap-run",
+				turn_id: "gap-turn",
+				step_id: "gap-step",
+				request_id: "gap-request",
+			},
+		},
+		{
+			name: "tool",
+			kind: "tool.execution",
+			correlation: {
+				trace_id: "gap-run",
+				turn_id: "gap-turn",
+				step_id: "gap-step",
+				request_id: "gap-request",
+				tool_call_id: "gap-tool",
+			},
+		},
+	])("marks $name closure unknown when its open span crosses a replay gap", ({
+		kind,
+		correlation,
+	}) => {
+		const gap: TelemetryReplayGap = {
+			requested: 4,
+			earliest_available: 6,
+			resume_after: 5,
+		};
+		const start = envelope(4, kind, {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: kind === "tool.execution" ? { tool_name: "read" } : {},
+		});
+		const resumed = envelope(6, "context.changed", {
+			phase: "snapshot",
+			state: "changed",
+			correlation,
+		});
+		const span = records([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: resumed },
+		]).find((record) => record.sourceEventIds.includes(start.event_id));
+
+		expect(span).toMatchObject({
+			isOpen: false,
+			closureUnknown: true,
+			gapTainted: true,
+			gapEvidence: [gap],
+		});
+	});
+
+	it("uses earliest duplicate start when terminal row retains crossed-gap evidence", () => {
+		const correlation = {
+			trace_id: "duplicate-gap-run",
+			turn_id: "duplicate-gap-turn",
+			step_id: "duplicate-gap-step",
+			request_id: "duplicate-gap-request",
+		};
+		const gap: TelemetryReplayGap = {
+			requested: 4,
+			earliest_available: 6,
+			resume_after: 5,
+		};
+		const start = envelope(4, "agent.turn", {
+			phase: "start",
+			state: "running",
+			correlation,
+		});
+		const duplicate = envelope(6, "agent.turn", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { duplicate_start: true },
+		});
+		const end = envelope(7, "agent.turn", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: { matched_start: true },
+		});
+		const terminal = records([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: duplicate },
+			{ type: "event", event: end },
+		]).find((record) => record.sourceEventIds.includes(end.event_id));
+
+		expect(terminal).toMatchObject({
+			gapTainted: true,
+			gapEvidence: [gap],
+		});
+	});
+
+	it.each([
+		{
+			name: "run",
+			kind: "agent.run",
+			correlation: { trace_id: "gap-run" },
+		},
+		{
+			name: "turn",
+			kind: "agent.turn",
+			correlation: {
+				trace_id: "gap-run",
+				turn_id: "gap-turn",
+				step_id: "gap-step",
+				request_id: "gap-request",
+			},
+		},
+		{
+			name: "tool",
+			kind: "tool.execution",
+			correlation: {
+				trace_id: "gap-run",
+				turn_id: "gap-turn",
+				step_id: "gap-step",
+				request_id: "gap-request",
+				tool_call_id: "gap-tool",
+			},
+		},
+	])("closes $name normally after an exact terminal while retaining gap evidence", ({
+		kind,
+		correlation,
+	}) => {
+		const gap: TelemetryReplayGap = {
+			requested: 4,
+			earliest_available: 6,
+			resume_after: 5,
+		};
+		const start = envelope(4, kind, {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: kind === "tool.execution" ? { tool_name: "read" } : {},
+		});
+		const resumed = envelope(6, "context.changed", {
+			phase: "snapshot",
+			state: "changed",
+			correlation,
+		});
+		const end = envelope(7, kind, {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 3,
+			attributes:
+				kind === "tool.execution"
+					? { tool_name: "read", matched_start: true }
+					: { matched_start: true },
+		});
+		const all = records([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: resumed },
+			{ type: "event", event: end },
+		]);
+		const span = all.find((record) => record.sourceEventIds.includes(start.event_id));
+		const terminal = kind === "tool.execution"
+			? span
+			: all.find((record) => record.sourceEventIds.includes(end.event_id));
+
+		expect(span).toMatchObject({
+			isOpen: false,
+			closureUnknown: false,
+			gapTainted: true,
+			gapEvidence: [gap],
+		});
+		expect(terminal).toMatchObject({
+			closureUnknown: false,
+			gapTainted: true,
+			gapEvidence: [gap],
+		});
+	});
+
+	it("preserves paired source envelopes and aggregates privacy metadata losslessly", () => {
+		const correlation = {
+			trace_id: "metadata-run",
+			turn_id: "metadata-turn",
+			step_id: "metadata-step",
+			request_id: "metadata-request",
+			tool_call_id: "metadata-tool",
+		};
+		const start = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read" },
+			privacy_class: "operator",
+			payload_ref: "payloads/start",
+			redaction: {
+				applied: false,
+				fields: ["headers.authorization"],
+				policy: "start-policy",
+			},
+		});
+		const end = envelope(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 10,
+			attributes: { tool_name: "read", matched_start: true },
+			privacy_class: "restricted",
+			payload_ref: "payloads/end",
+			redaction: {
+				applied: true,
+				fields: ["body.secret", "headers.authorization"],
+				policy: "end-policy",
+			},
+		});
+		const tool = records([start, end]).find(
+			(record) => record.eventKind === "tool.execution",
+		);
+
+		expect(tool).toMatchObject({
+			privacyClass: "restricted",
+			payloadRefs: ["payloads/start", "payloads/end"],
+			redaction: {
+				applied: true,
+				fields: ["body.secret", "headers.authorization"],
+			},
+		});
+		expect(
+			(tool as unknown as { sourceEnvelopes: readonly TelemetryEvent[] }).sourceEnvelopes,
+		).toEqual([start, end]);
+		expect(tool).not.toHaveProperty("payloadContent");
+	});
+
+	it("retains duplicate start envelopes while tool remains open", () => {
+		const correlation = {
+			trace_id: "open-metadata-run",
+			turn_id: "open-metadata-turn",
+			step_id: "open-metadata-step",
+			request_id: "open-metadata-request",
+			tool_call_id: "open-metadata-tool",
+		};
+		const start = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read" },
+			privacy_class: "operator",
+			payload_ref: "payloads/first-start",
+			redaction: { applied: false, fields: ["a"] },
+		});
+		const duplicate = envelope(2, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read", duplicate_start: true },
+			privacy_class: "restricted",
+			payload_ref: "payloads/duplicate-start",
+			redaction: { applied: true, fields: ["b"] },
+		});
+		const tool = records([start, duplicate]).find(
+			(record) => record.eventKind === "tool.execution",
+		);
+
+		expect(tool).toMatchObject({
+			isOpen: true,
+			privacyClass: "restricted",
+			payloadRefs: ["payloads/first-start", "payloads/duplicate-start"],
+			redaction: { applied: true, fields: ["a", "b"] },
+		});
+		expect(
+			(tool as unknown as { sourceEnvelopes: readonly TelemetryEvent[] }).sourceEnvelopes,
+		).toEqual([start, duplicate]);
+	});
+
+	it("retains every conflicting terminal envelope in conservative metadata aggregates", () => {
+		const correlation = {
+			trace_id: "metadata-conflict-run",
+			turn_id: "metadata-conflict-turn",
+			step_id: "metadata-conflict-step",
+			request_id: "metadata-conflict-request",
+			tool_call_id: "metadata-conflict-tool",
+		};
+		const start = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read" },
+			privacy_class: "public",
+			payload_ref: "payloads/start",
+			redaction: { applied: false, fields: ["a"] },
+		});
+		const completed = envelope(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: { tool_name: "read", matched_start: true },
+			privacy_class: "operator",
+			payload_ref: "payloads/completed",
+			redaction: { applied: false, fields: ["b"] },
+		});
+		const failed = envelope(3, "tool.execution", {
+			phase: "end",
+			state: "error",
+			severity: "error",
+			correlation,
+			attributes: { tool_name: "read", is_error: true, matched_start: false },
+			privacy_class: "secret",
+			payload_ref: "payloads/failed",
+			redaction: { applied: true, fields: ["c", "a"] },
+		});
+		const conflict = records([start, completed, failed]).find(
+			(record) =>
+				record.eventKind === "tool.execution" &&
+				(record as { terminalConflict?: boolean }).terminalConflict === true,
+		);
+
+		expect(conflict).toMatchObject({
+			privacyClass: "secret",
+			payloadRefs: ["payloads/start", "payloads/completed", "payloads/failed"],
+			redaction: { applied: true, fields: ["a", "b", "c"] },
+		});
+		expect(
+			(conflict as unknown as { sourceEnvelopes: readonly TelemetryEvent[] }).sourceEnvelopes,
+		).toEqual([start, completed, failed]);
 	});
 });
