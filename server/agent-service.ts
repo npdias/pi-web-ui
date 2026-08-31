@@ -412,8 +412,12 @@ interface Conversation {
 	wizardRunning: boolean;
 	/** Session event subscription — events are routed to THIS conversation. */
 	unsubscribe?: () => void;
+	/** Stable telemetry conversation identity across Pi session replacements. */
+	telemetryConversationId?: string;
 	/** Telemetry correlation state belongs to this conversation/runtime only. */
 	telemetryMapper?: ConversationTelemetryMapper;
+	/** Invalidates an async bind when another bind or disposal supersedes it. */
+	bindGeneration: number;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -456,6 +460,9 @@ const TOOL_WATCHDOG_TIMEOUT_MS = (() => {
  *  runtime alive; conversations of other projects keep their own lists). */
 const MAX_OPEN_CONVERSATIONS = 8;
 const DEFAULT_CONV_TITLE = "新对话";
+/** Shutdown waits briefly for admitted client creation, then leaves a generation
+ * guard to dispose any runtime that resolves later. */
+const PENDING_CREATE_SHUTDOWN_GRACE_MS = 250;
 
 
 /** First user text in a session, truncated for the conversation list. */
@@ -836,6 +843,8 @@ export class ClientSession {
 	 * Conversation — see Conversation above.
 	 */
 	private disposed = false;
+	private lifecycleGeneration = 0;
+	private navigationGeneration = 0;
 	/** pi-config readiness check, cached briefly so 60ms snapshots don't hit disk. */
 	private piCheckCache: { at: number; configured: boolean } | null = null;
 
@@ -861,6 +870,7 @@ export class ClientSession {
 		agentDir: string,
 		stateStore: ClientStateStore,
 		private readonly telemetry?: AgentServiceTelemetry,
+		private readonly ownerIsCurrent: () => boolean = () => true,
 	) {
 		this.clientId = clientId;
 		this.cwd = cwd;
@@ -923,10 +933,18 @@ export class ClientSession {
 		cwd: string,
 		stateStore: ClientStateStore,
 		telemetry?: AgentServiceTelemetry,
+		isCurrent: () => boolean = () => true,
 	): Promise<ClientSession> {
 		const agentDir = process.env.PI_CODING_AGENT_DIR ?? getAgentDir();
 
-		const cs = new ClientSession(clientId, cwd, agentDir, stateStore, telemetry);
+		const cs = new ClientSession(
+			clientId,
+			cwd,
+			agentDir,
+			stateStore,
+			telemetry,
+			isCurrent,
+		);
 		const conversationId = cs.nextConversationId();
 		const terminals = cs.makeTerminalManager(conversationId, cwd);
 		const runtime = await createAgentSessionRuntime(cs.makeRuntimeFactory(terminals), {
@@ -937,6 +955,11 @@ export class ClientSession {
 			// pi CLI/TUI) — or start a fresh one on first visit.
 			sessionManager: SessionManager.continueRecent(cwd),
 		});
+		if (!isCurrent()) {
+			terminals.killAll();
+			await runtime.dispose().catch(() => {});
+			throw new QuiesceRejectedError("会话创建期间服务已开始关闭");
+		}
 		// First conversation = the resumed session; it also seeds the shared
 		// ModelRuntime that every later conversation reuses.
 		cs.sharedModelRuntime = runtime.services.modelRuntime;
@@ -952,7 +975,11 @@ export class ClientSession {
 				});
 			}
 		}
-		await cs.bindSession();
+		await cs.bindSession(conv, runtime);
+		if (!isCurrent()) {
+			await cs.dispose().catch(() => {});
+			throw new QuiesceRejectedError("会话绑定期间服务已开始关闭");
+		}
 		return cs;
 	}
 
@@ -1080,7 +1107,6 @@ export class ClientSession {
 		id: string,
 		terminals: TerminalManager,
 	): Conversation {
-		const telemetryMapper = this.makeTelemetryMapper(runtime);
 		return {
 			id,
 			title: conversationTitle(runtime.session),
@@ -1099,7 +1125,9 @@ export class ClientSession {
 			goalGeneration: 0,
 			goalReviewGeneration: 0,
 			wizardRunning: false,
-			telemetryMapper,
+			telemetryConversationId: this.telemetry ? randomUUID() : undefined,
+			telemetryMapper: undefined,
+			bindGeneration: 0,
 			deltaSeq: 0,
 			terminals,
 			msgIds: new Map(),
@@ -1116,15 +1144,16 @@ export class ClientSession {
 	}
 
 	private makeTelemetryMapper(
-		runtime: AgentSessionRuntime,
+		session: AgentSession,
+		conversationId: string | undefined,
 	): ConversationTelemetryMapper | undefined {
 		let telemetryMapper: ConversationTelemetryMapper | undefined;
-		if (this.telemetry) {
+		if (this.telemetry && conversationId) {
 			try {
 				const options: PiEventMapperOptions = {
 					source: { ...this.telemetry.source },
-					sessionId: runtime.session.sessionId,
-					conversationId: randomUUID(),
+					sessionId: session.sessionId,
+					conversationId,
 				};
 				telemetryMapper = this.telemetry.createMapper?.(options) ?? new PiEventMapper(options);
 			} catch {
@@ -1143,6 +1172,41 @@ export class ClientSession {
 			this.noteTelemetryFailure("disposal", 0);
 		}
 		conv.telemetryMapper = undefined;
+	}
+
+	private clearSessionBinding(conv: Conversation): void {
+		conv.bindGeneration++;
+		conv.runtime.setRebindSession(undefined);
+		conv.unsubscribe?.();
+		conv.unsubscribe = undefined;
+		this.disposeTelemetryMapper(conv);
+	}
+
+	private isLifecycleCurrent(generation: number): boolean {
+		return (
+			!this.disposed &&
+			this.lifecycleGeneration === generation &&
+			this.ownerIsCurrent()
+		);
+	}
+
+	private isNavigationCurrent(
+		lifecycleGeneration: number,
+		navigationGeneration: number,
+	): boolean {
+		return (
+			this.isLifecycleCurrent(lifecycleGeneration) &&
+			this.navigationGeneration === navigationGeneration
+		);
+	}
+
+	private async disposeUninstalledRuntime(
+		runtime: AgentSessionRuntime,
+		terminals?: TerminalManager,
+	): Promise<void> {
+		terminals?.killAll();
+		runtime.setRebindSession(undefined);
+		await runtime.dispose().catch(() => {});
 	}
 
 	private noteTelemetryFailure(
@@ -1228,19 +1292,56 @@ export class ClientSession {
 		for (const sink of [...this.sinks]) sink(msg);
 	}
 
-	/** (Re)attach event plumbing to the ACTIVE conversation's session. */
-	private async bindSession(): Promise<void> {
-		const conv = this.conv;
+	/** Attach one conversation to one concrete runtime/session identity. */
+	private async bindSession(
+		conv: Conversation,
+		runtime: AgentSessionRuntime,
+		session: AgentSession = runtime.session,
+	): Promise<void> {
+		if (
+			this.disposed ||
+			!this.ownerIsCurrent() ||
+			this.convs.get(conv.id) !== conv
+		) return;
+		if (
+			conv.runtime === runtime &&
+			conv.session === session &&
+			conv.unsubscribe
+		) {
+			return;
+		}
+		const bindGeneration = ++conv.bindGeneration;
+		if (conv.runtime !== runtime) conv.runtime.setRebindSession(undefined);
 		conv.unsubscribe?.();
-		conv.session = conv.runtime.session;
-		await conv.session.bindExtensions({
+		conv.unsubscribe = undefined;
+		this.disposeTelemetryMapper(conv);
+		conv.runtime = runtime;
+		conv.session = session;
+		conv.telemetryMapper = this.makeTelemetryMapper(
+			session,
+			conv.telemetryConversationId,
+		);
+		runtime.setRebindSession((nextSession) =>
+			this.bindSession(conv, runtime, nextSession),
+		);
+		await session.bindExtensions({
 			mode: "rpc",
 			uiContext: this.webUi,
 			onError: (err) => {
 				this.emit({ type: "notice", level: "error", text: err.error });
 			},
 		});
-		conv.unsubscribe = conv.session.subscribe((event) => {
+		if (
+			this.disposed ||
+			!this.ownerIsCurrent() ||
+			conv.bindGeneration !== bindGeneration ||
+			this.convs.get(conv.id) !== conv ||
+			conv.runtime !== runtime ||
+			conv.session !== session
+		) {
+			return;
+		}
+		conv.unsubscribe = session.subscribe((event) => {
 			this.emitTelemetry(conv, event);
 			this.onEvent(conv, event);
 		});
@@ -2482,13 +2583,20 @@ export class ClientSession {
 	 *  persisted session. The conversation record itself is kept (same id,
 	 *  same cwd, same serialization caches), so the UI stays attached. */
 	private async forceResetConversation(conv: Conversation, reason: string): Promise<void> {
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const previousRuntime = conv.runtime;
 		try {
-			conv.unsubscribe?.();
-			conv.unsubscribe = undefined;
+			this.clearSessionBinding(conv);
 			this.clearAllToolWatchdogs(conv);
 			conv.toolStartTimes.clear();
-			this.disposeTelemetryMapper(conv);
-			await conv.runtime.dispose();
+			await previousRuntime.dispose();
+			if (
+				!this.isLifecycleCurrent(lifecycleGeneration) ||
+				this.convs.get(conv.id) !== conv ||
+				conv.runtime !== previousRuntime
+			) {
+				return;
+			}
 			const runtime = await createAgentSessionRuntime(
 				this.makeRuntimeFactory(conv.terminals),
 				{
@@ -2497,11 +2605,16 @@ export class ClientSession {
 					sessionManager: SessionManager.continueRecent(conv.cwd),
 				},
 			);
-			conv.runtime = runtime;
-			conv.session = runtime.session;
-			conv.telemetryMapper = this.makeTelemetryMapper(runtime);
+			if (
+				!this.isLifecycleCurrent(lifecycleGeneration) ||
+				this.convs.get(conv.id) !== conv ||
+				conv.runtime !== previousRuntime
+			) {
+				await this.disposeUninstalledRuntime(runtime);
+				return;
+			}
 			this.emit({ type: "notice", level: "warning", text: reason });
-			await this.bindSession();
+			await this.bindSession(conv, runtime);
 			this.emitConversations();
 			void this.pushSlashCommands();
 		} catch (err) {
@@ -2515,6 +2628,8 @@ export class ClientSession {
 
 	async newChat(): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const navigationGeneration = ++this.navigationGeneration;
 		// Reuse an already-open blank conversation instead of piling up new ones
 		// on every click: if the active chat has no messages it IS the new chat
 		// (focus already on it); otherwise switch to the first blank one (under
@@ -2537,6 +2652,7 @@ export class ClientSession {
 			if (conv.id === this.activeId) continue;
 			if (isBlank(conv)) {
 				await this.switchConversation(conv.id);
+				if (!this.isLifecycleCurrent(lifecycleGeneration)) return;
 				this.flushSnapshot();
 				return;
 			}
@@ -2572,11 +2688,16 @@ export class ClientSession {
 					sessionManager: SessionManager.create(this.cwd),
 				},
 			);
+			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) {
+				await this.disposeUninstalledRuntime(runtime, terminals);
+				return;
+			}
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			this.convs.set(conv.id, conv);
 			this.activeId = conv.id;
 			if (displaced) this.removeConversation(displaced.id);
-			await this.bindSession();
+			await this.bindSession(conv, runtime);
+			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			// A fresh transcript appeared in the sessions dir — the next listing
 			// must see it, not the pre-newChat fridge snapshot.
 			this.invalidateSessionInfos();
@@ -2653,15 +2774,14 @@ export class ClientSession {
 		this.convs.delete(id);
 		this.clearAllToolWatchdogs(conv);
 		conv.terminals.killAll();
-		conv.unsubscribe?.();
-		conv.unsubscribe = undefined;
-		this.disposeTelemetryMapper(conv);
+		this.clearSessionBinding(conv);
 		void conv.runtime.dispose().catch(() => {});
 	}
 
 	/** Switch the ACTIVE conversation without interrupting any other chat. */
 	async switchConversation(id: string): Promise<void> {
 		if (!this.convs.has(id) || id === this.activeId) return;
+		this.navigationGeneration++;
 		const displaced = this.displaceActive();
 		this.activeId = id;
 		const newCwd = this.conv.cwd;
@@ -2908,6 +3028,8 @@ export class ClientSession {
 	 */
 	async switchSession(path: string): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const navigationGeneration = ++this.navigationGeneration;
 		let openedRuntime: AgentSessionRuntime | null = null;
 		let openedTerminals: TerminalManager | null = null;
 		try {
@@ -2919,6 +3041,7 @@ export class ClientSession {
 				const sessionFile = conv.session.sessionFile;
 				if (sessionFile && resolve(sessionFile) === targetPath) {
 					await this.switchConversation(conv.id);
+					if (!this.isLifecycleCurrent(lifecycleGeneration)) return;
 					return;
 				}
 			}
@@ -2935,6 +3058,13 @@ export class ClientSession {
 					sessionManager,
 				},
 			);
+			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) {
+				openedTerminals.killAll();
+				await this.disposeUninstalledRuntime(openedRuntime);
+				openedRuntime = null;
+				openedTerminals = null;
+				return;
+			}
 
 			// Only displace the old active conversation after the replacement runtime
 			// is known-good. This keeps a failed history open entirely non-destructive.
@@ -2974,7 +3104,8 @@ export class ClientSession {
 			openedRuntime = null;
 			openedTerminals = null;
 			if (displaced) this.removeConversation(displaced.id);
-			await this.bindSession();
+			await this.bindSession(conv, conv.runtime);
+			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			this.cwd = targetCwd;
 			this.conv.lastActiveAt = Date.now();
 			this.webUi.refresh();
@@ -3037,6 +3168,7 @@ export class ClientSession {
 		attachments?: Parameters<ClientSession["prompt"]>[1],
 	): Promise<void> {
 		if (this.quiesceBlocked()) return;
+		const lifecycleGeneration = this.lifecycleGeneration;
 		const trimmed = text.trim();
 		if (!trimmed) {
 			this.emit({
@@ -3060,8 +3192,14 @@ export class ClientSession {
 		try {
 			// Preserve the model the user had selected — fork() seeds a new
 			// branch with the ModelRuntime default model otherwise.
-			const prevModel = this.session.agent.state.model ?? null;
-			const result = await this.runtime.fork(entryId);
+			const conv = this.conv;
+			const runtime = conv.runtime;
+			const prevModel = conv.session.agent.state.model ?? null;
+			const result = await runtime.fork(entryId);
+			if (!this.isLifecycleCurrent(lifecycleGeneration)) {
+				await this.disposeUninstalledRuntime(runtime);
+				return;
+			}
 			if (result.cancelled) {
 				this.emit({
 					type: "notice",
@@ -3071,15 +3209,26 @@ export class ClientSession {
 				this.flushSnapshot();
 				return;
 			}
-			await this.bindSession();
+			await this.bindSession(conv, runtime, runtime.session);
+			if (!this.isLifecycleCurrent(lifecycleGeneration)) return;
+			if (
+				this.activeId !== conv.id ||
+				this.convs.get(conv.id) !== conv ||
+				conv.runtime !== runtime
+			) return;
 			// Restore the previously-selected model on the forked branch.
 			if (prevModel && this.sharedModelRuntime) {
 				try {
-					await this.session.setModel(prevModel);
+					await conv.session.setModel(prevModel);
 				} catch {
 					// model no longer resolvable — keep the default
 				}
 			}
+			if (
+				this.activeId !== conv.id ||
+				this.convs.get(conv.id) !== conv ||
+				conv.runtime !== runtime
+			) return;
 			await this.prompt(trimmed, attachments);
 			this.emit({
 				type: "notice",
@@ -3220,12 +3369,15 @@ export class ClientSession {
 	}
 
 	async setCwd(newCwd: string): Promise<void> {
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const navigationGeneration = ++this.navigationGeneration;
 		try {
 			const { resolve } = await import("node:path");
 			this.files.unwatchGit(); // stale repo's watcher must not fire across projects
 			const fs = await import("node:fs/promises");
 			const abs = resolve(newCwd);
 			const st = await fs.stat(abs);
+			if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			if (!st.isDirectory()) {
 				throw new Error("路径不是目录");
 			}
@@ -3272,6 +3424,10 @@ export class ClientSession {
 						sessionManager: SessionManager.continueRecent(abs),
 					},
 				);
+				if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) {
+					await this.disposeUninstalledRuntime(newRuntime, terminals);
+					return;
+				}
 				const conv = this.makeConversation(newRuntime, conversationId, terminals);
 				this.convs.set(conv.id, conv);
 				this.activeId = conv.id;
@@ -3281,7 +3437,8 @@ export class ClientSession {
 						this.emit({ type: "notice", level: d.type, text: d.message });
 					}
 				}
-				await this.bindSession();
+				await this.bindSession(conv, newRuntime);
+				if (!this.isNavigationCurrent(lifecycleGeneration, navigationGeneration)) return;
 			}
 
 			this.pushTerminals();
@@ -3473,7 +3630,9 @@ export class ClientSession {
 	}
 
 	async dispose(): Promise<void> {
+		if (this.disposed) return;
 		this.disposed = true;
+		this.lifecycleGeneration++;
 		for (const conv of this.convs.values()) conv.terminals.killAll();
 		if (this.snapshotTimer) {
 			clearTimeout(this.snapshotTimer);
@@ -3497,8 +3656,7 @@ export class ClientSession {
 		this.bg.stop();
 		for (const conv of this.convs.values()) {
 			this.clearAllToolWatchdogs(conv);
-			conv.unsubscribe?.();
-			this.disposeTelemetryMapper(conv);
+			this.clearSessionBinding(conv);
 			try {
 				await conv.runtime.dispose();
 			} catch {
@@ -3520,6 +3678,8 @@ export class AgentService {
 	/** index.ts 注入：停止插件任务（kill_background_server with taskId）。 */
 	pluginStopBgTask: ((taskId: string) => boolean) | undefined = undefined;
 	private clients = new Map<string, ClientSession>();
+	private disposed = false;
+	private lifecycleGeneration = 0;
 	/** Quiesce (draining) state — the service refuses NEW work (prompts, forks,
 	 *  session resumes, new clients) so a deploy/upgrade/backup can stop cleanly
 	 *  once existing runs finish. Controlled via the local control socket:
@@ -3619,6 +3779,12 @@ export class AgentService {
 		clientId: string,
 		send: (msg: ServerMessage) => void,
 	): Promise<ClientSession> {
+		if (this.disposed) {
+			throw new QuiesceRejectedError("服务已关闭");
+		}
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const isCurrent = () =>
+			!this.disposed && this.lifecycleGeneration === lifecycleGeneration;
 		let cs = this.clients.get(clientId);
 		if (!cs) {
 			const inflight = this.pending.get(clientId);
@@ -3649,11 +3815,16 @@ export class AgentService {
 					cwd,
 					this.stateStore,
 					this.telemetry,
+					isCurrent,
 				).finally(() => {
 					this.pending.delete(clientId);
 				});
 				this.pending.set(clientId, creating);
 				cs = await creating;
+				if (!isCurrent()) {
+					await cs.dispose().catch(() => {});
+					throw new QuiesceRejectedError("会话创建完成时服务已关闭");
+				}
 				this.clients.set(clientId, cs);
 				// Make sure the restored/default workspace appears in the project list.
 				this.stateStore.remember(clientId, cwd);
@@ -3665,6 +3836,9 @@ export class AgentService {
 					});
 				}
 			}
+		}
+		if (!isCurrent()) {
+			throw new QuiesceRejectedError("会话接入完成时服务已关闭");
 		}
 		// First attach after a restart: report runs that were interrupted when
 		// the previous process shut down (consumed once, then cleared). Queue
@@ -3712,9 +3886,9 @@ export class AgentService {
 
 	async disposeAll(): Promise<void> {
 		this.quiesce();
-		while (this.pending.size > 0) {
-			await Promise.allSettled([...this.pending.values()]);
-		}
+		if (this.disposed) return;
+		this.disposed = true;
+		this.lifecycleGeneration++;
 		// Record still-streaming conversations BEFORE tearing anything down, so
 		// the next attach can tell the user what was lost (SIGTERM / update).
 		for (const [clientId, cs] of [...this.clients]) {
@@ -3732,6 +3906,18 @@ export class AgentService {
 		}
 		const all = [...this.clients.values()];
 		this.clients.clear();
-		await Promise.all(all.map((cs) => cs.dispose()));
+		const disposing = Promise.all(all.map((cs) => cs.dispose()));
+		const pending = [...this.pending.values()];
+		if (pending.length > 0) {
+			let deadline: ReturnType<typeof setTimeout> | undefined;
+			await Promise.race([
+				Promise.allSettled(pending),
+				new Promise<void>((resolveDeadline) => {
+					deadline = setTimeout(resolveDeadline, PENDING_CREATE_SHUTDOWN_GRACE_MS);
+				}),
+			]);
+			if (deadline) clearTimeout(deadline);
+		}
+		await disposing;
 	}
 }
