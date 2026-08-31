@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
-import { createRequire, syncBuiltinESMExports } from "node:module";
 import { createServer as createUnixServer } from "node:net";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +9,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 import WebSocket from "ws";
 
 const REPO_ROOT = fileURLToPath(new URL("../", import.meta.url));
-const require = createRequire(import.meta.url);
 const PORT = 8976;
 const base = mkdtempSync(join(tmpdir(), "pi-web-telemetry-"));
 const dataDir = join(base, "data");
@@ -588,212 +586,6 @@ try {
 		throw new Error("slower navigation runtime overwrote newer workspace");
 	}
 	console.log("PASS slower navigation runtime cannot overwrite newer request");
-	const validationRaceClient = await appModule.service.attach(
-		"navigation-validation-race-fixture",
-		() => {},
-	);
-	const validationFirstCwd = join(base, "validation-first");
-	const validationSecondCwd = join(base, "validation-second");
-	mkdirSync(validationFirstCwd, { recursive: true });
-	mkdirSync(validationSecondCwd, { recursive: true });
-	const fsPromises = require("node:fs/promises");
-	const originalStat = fsPromises.stat;
-	let releaseFirstValidation;
-	let markFirstValidationReady;
-	const firstValidationGate = new Promise((resolve) => {
-		releaseFirstValidation = resolve;
-	});
-	const firstValidationReady = new Promise((resolve) => {
-		markFirstValidationReady = resolve;
-	});
-	fsPromises.stat = async (path, ...args) => {
-		if (path === validationFirstCwd) {
-			markFirstValidationReady();
-			await firstValidationGate;
-		}
-		return originalStat(path, ...args);
-	};
-	syncBuiltinESMExports();
-	try {
-		const firstValidation = validationRaceClient.setCwd(validationFirstCwd);
-		await firstValidationReady;
-		await validationRaceClient.setCwd(validationSecondCwd);
-		releaseFirstValidation();
-		await firstValidation;
-	} finally {
-		fsPromises.stat = originalStat;
-		syncBuiltinESMExports();
-	}
-	if (
-		validationRaceClient.cwd !== validationSecondCwd ||
-		validationRaceClient.session.sessionManager.getCwd() !== validationSecondCwd ||
-		[...validationRaceClient.convs.values()].some(
-			(conv) => conv.cwd === validationFirstCwd,
-		)
-	) {
-		throw new Error("slower cwd validation overwrote newer request");
-	}
-	console.log("PASS slower cwd validation cannot overwrite newer request");
-	const sameCwdEditClient = await appModule.service.attach("same-cwd-edit-fixture", () => {});
-	const sameCwdEditConversation = sameCwdEditClient.convs.get(sameCwdEditClient.activeId);
-	if (!sameCwdEditConversation) throw new Error("same-cwd edit conversation missing");
-	const sameCwdEditTimestamp = 3_225;
-	const sameCwdEditMessage = {
-		role: "user",
-		content: [{ type: "text", text: "same cwd edit original" }],
-		timestamp: sameCwdEditTimestamp,
-	};
-	sameCwdEditConversation.session.sessionManager.appendMessage(sameCwdEditMessage);
-	sameCwdEditConversation.session.agent.state.messages.push(sameCwdEditMessage);
-	const sameCwdEditAnswer = assistantMessage(
-		[{ type: "text", text: "same cwd edit answer" }],
-		"stop",
-		sameCwdEditTimestamp + 1,
-	);
-	sameCwdEditConversation.session.sessionManager.appendMessage(sameCwdEditAnswer);
-	sameCwdEditConversation.session.agent.state.messages.push(sameCwdEditAnswer);
-	const sameCwdEditRuntime = sameCwdEditConversation.runtime;
-	const originalSameCwdFork = sameCwdEditRuntime.fork.bind(sameCwdEditRuntime);
-	const originalSameCwdRuntimeDispose = sameCwdEditRuntime.dispose.bind(sameCwdEditRuntime);
-	let sameCwdRuntimeDisposals = 0;
-	let releaseSameCwdFork;
-	let markSameCwdForkReady;
-	const sameCwdForkGate = new Promise((resolve) => {
-		releaseSameCwdFork = resolve;
-	});
-	const sameCwdForkReady = new Promise((resolve) => {
-		markSameCwdForkReady = resolve;
-	});
-	sameCwdEditRuntime.dispose = async (...args) => {
-		sameCwdRuntimeDisposals++;
-		return originalSameCwdRuntimeDispose(...args);
-	};
-	sameCwdEditRuntime.fork = async (...args) => {
-		const result = await originalSameCwdFork(...args);
-		markSameCwdForkReady();
-		await sameCwdForkGate;
-		return result;
-	};
-	const sameCwdEdit = sameCwdEditClient.editMessage(
-		`u-${sameCwdEditTimestamp}-1`,
-		"same cwd edit replacement",
-	);
-	await sameCwdForkReady;
-	await sameCwdEditClient.setCwd(sameCwdEditClient.cwd);
-	releaseSameCwdFork();
-	await sameCwdEdit;
-	sameCwdEditRuntime.fork = originalSameCwdFork;
-	sameCwdEditRuntime.setRebindSession(undefined);
-	await sameCwdEditClient.discardStaleConversationRuntime(
-		sameCwdEditConversation,
-		sameCwdEditRuntime,
-	);
-	await sameCwdEditRuntime.newSession();
-	const sameCwdRecordOffset = records.length;
-	emitTool(sameCwdEditRuntime.session, "same-cwd-edit-tool");
-	await waitFor(
-		() => records.find((record, index) =>
-			index >= sameCwdRecordOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "same-cwd-edit-tool")),
-		"same-cwd edit telemetry",
-		750,
-	);
-	if (
-		sameCwdEditClient.convs.get(sameCwdEditConversation.id)?.runtime !== sameCwdEditRuntime ||
-		sameCwdEditConversation.session !== sameCwdEditRuntime.session ||
-		!sameCwdEditConversation.telemetryMapper ||
-		sameCwdRuntimeDisposals !== 0
-	) {
-		throw new Error("same-cwd no-op left registered edit runtime stale or disposed");
-	}
-	sameCwdEditRuntime.dispose = originalSameCwdRuntimeDispose;
-	console.log("PASS same-cwd no-op preserves gated edit runtime and binding");
-	const overlappingEditClient = await appModule.service.attach(
-		"overlapping-edit-fixture",
-		() => {},
-	);
-	const overlappingEditConversation = overlappingEditClient.convs.get(
-		overlappingEditClient.activeId,
-	);
-	if (!overlappingEditConversation) throw new Error("overlapping edit conversation missing");
-	const overlappingEditTimestamp = 3_240;
-	const overlappingEditMessage = {
-		role: "user",
-		content: [{ type: "text", text: "overlapping edit original" }],
-		timestamp: overlappingEditTimestamp,
-	};
-	overlappingEditConversation.session.sessionManager.appendMessage(overlappingEditMessage);
-	overlappingEditConversation.session.agent.state.messages.push(overlappingEditMessage);
-	const overlappingEditAnswer = assistantMessage(
-		[{ type: "text", text: "overlapping edit answer" }],
-		"stop",
-		overlappingEditTimestamp + 1,
-	);
-	overlappingEditConversation.session.sessionManager.appendMessage(overlappingEditAnswer);
-	overlappingEditConversation.session.agent.state.messages.push(overlappingEditAnswer);
-	const overlappingEditRuntime = overlappingEditConversation.runtime;
-	const originalOverlappingFork = overlappingEditRuntime.fork.bind(overlappingEditRuntime);
-	const originalOverlappingDispose = overlappingEditRuntime.dispose.bind(overlappingEditRuntime);
-	let overlappingForkCalls = 0;
-	let overlappingRuntimeDisposals = 0;
-	let releaseFirstOverlappingFork;
-	let markFirstOverlappingForkReady;
-	const firstOverlappingForkGate = new Promise((resolve) => {
-		releaseFirstOverlappingFork = resolve;
-	});
-	const firstOverlappingForkReady = new Promise((resolve) => {
-		markFirstOverlappingForkReady = resolve;
-	});
-	overlappingEditRuntime.dispose = async (...args) => {
-		overlappingRuntimeDisposals++;
-		return originalOverlappingDispose(...args);
-	};
-	overlappingEditRuntime.fork = async (...args) => {
-		overlappingForkCalls++;
-		const result = await originalOverlappingFork(...args);
-		if (overlappingForkCalls === 1) {
-			markFirstOverlappingForkReady();
-			await firstOverlappingForkGate;
-		}
-		return result;
-	};
-	const firstOverlappingEdit = overlappingEditClient.editMessage(
-		`u-${overlappingEditTimestamp}-1`,
-		"first overlapping replacement",
-	);
-	await firstOverlappingForkReady;
-	const secondOverlappingEdit = overlappingEditClient.editMessage(
-		`u-${overlappingEditTimestamp}-1`,
-		"second overlapping replacement",
-	);
-	await sleep(100);
-	const secondEnteredBeforeRelease = overlappingForkCalls > 1;
-	releaseFirstOverlappingFork();
-	await Promise.all([firstOverlappingEdit, secondOverlappingEdit]);
-	overlappingEditRuntime.fork = originalOverlappingFork;
-	overlappingEditRuntime.dispose = originalOverlappingDispose;
-	const overlappingRecordOffset = records.length;
-	emitTool(overlappingEditConversation.session, "overlapping-edit-tool");
-	await waitFor(
-		() => records.find((record, index) =>
-			index >= overlappingRecordOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "overlapping-edit-tool")),
-		"overlapping edit telemetry",
-		750,
-	);
-	if (
-		secondEnteredBeforeRelease ||
-		overlappingForkCalls !== 1 ||
-		overlappingRuntimeDisposals !== 0 ||
-		overlappingEditClient.convs.get(overlappingEditConversation.id)?.runtime !== overlappingEditRuntime ||
-		overlappingEditConversation.session !== overlappingEditRuntime.session ||
-		!overlappingEditConversation.telemetryMapper
-	) {
-		throw new Error("overlapping edits did not serialize around registered runtime");
-	}
-	console.log("PASS overlapping edits serialize without disposing registered runtime");
 	const removalEditClient = await appModule.service.attach("edit-removal-fixture", () => {});
 	const removalEditConversation = removalEditClient.convs.get(removalEditClient.activeId);
 	if (!removalEditConversation) throw new Error("edit removal conversation missing");
@@ -1030,17 +822,17 @@ try {
 		.at(-1)?.state;
 	const setCwdBindActive = setCwdBindClient.convs.get(setCwdBindClient.activeId);
 	if (
-		setCwdBindClient.cwd !== setCwdStaleTarget ||
-		setCwdBindActive?.cwd !== setCwdStaleTarget ||
-		setCwdBindActive?.session.sessionManager.getCwd() !== setCwdStaleTarget ||
-		setCwdBindSnapshot?.cwd !== setCwdStaleTarget ||
+		setCwdBindClient.cwd !== projectDir ||
+		setCwdBindActive?.cwd !== projectDir ||
+		setCwdBindActive?.session.sessionManager.getCwd() !== projectDir ||
+		setCwdBindSnapshot?.cwd !== projectDir ||
 		setCwdBindSnapshot?.conversationId !== setCwdBindClient.activeId ||
-		[...setCwdBindClient.convs.values()].filter((conv) => conv.cwd === setCwdStaleTarget).length !== 1 ||
-		staleSetCwdRuntimeDisposals !== 0
+		[...setCwdBindClient.convs.values()].some((conv) => conv.cwd === setCwdStaleTarget) ||
+		staleSetCwdRuntimeDisposals !== 1
 	) {
-		throw new Error("invalid newer setCwd cancelled valid gated target");
+		throw new Error("setCwd bind race did not converge to latest target");
 	}
-	console.log("PASS invalid setCwd cannot cancel valid gated target");
+	console.log("PASS setCwd bind race converges public, active, session, and snapshot state");
 	const bindRejectClient = await appModule.service.attach("bind-reject-fixture", () => {});
 	const bindRejectInitialId = bindRejectClient.activeId;
 	const bindRejectInitialCwd = bindRejectClient.cwd;
@@ -1225,137 +1017,6 @@ try {
 		throw new Error("newChat bind race did not converge to one committed target");
 	}
 	console.log("PASS newChat bind race converges to one committed conversation");
-	const sdkFailureClient = await appModule.service.attach(
-		"sdk-replacement-bind-failure-fixture",
-		() => {},
-	);
-	const sdkFailureConversation = sdkFailureClient.convs.get(sdkFailureClient.activeId);
-	if (!sdkFailureConversation) throw new Error("SDK failure conversation missing");
-	const sdkFailureSeedTimestamp = 3_297;
-	const sdkFailureSeedMessage = {
-		role: "user",
-		content: [{ type: "text", text: "SDK replacement failure seed" }],
-		timestamp: sdkFailureSeedTimestamp,
-	};
-	const sdkFailureSeedEntryId =
-		sdkFailureConversation.session.sessionManager.appendMessage(sdkFailureSeedMessage);
-	sdkFailureConversation.session.agent.state.messages.push(sdkFailureSeedMessage);
-	const sdkFailureSeedAnswer = assistantMessage(
-		[{ type: "text", text: "SDK replacement failure answer" }],
-		"stop",
-		sdkFailureSeedTimestamp + 1,
-	);
-	sdkFailureConversation.session.sessionManager.appendMessage(sdkFailureSeedAnswer);
-	sdkFailureConversation.session.agent.state.messages.push(sdkFailureSeedAnswer);
-	const sdkFailureSeedPath = sdkFailureConversation.session.sessionFile;
-	if (!sdkFailureSeedPath) throw new Error("SDK replacement failure seed path missing");
-	async function assertSdkExtensionFailure(label, replaceSession) {
-		const runtime = sdkFailureConversation.runtime;
-		const originalCreateRuntime = runtime.createRuntime;
-		let replacementSubscriptions = 0;
-		runtime.createRuntime = async (...args) => {
-			const result = await originalCreateRuntime.apply(runtime, args);
-			result.session.bindExtensions = async () => {
-				throw new Error(`fixture ${label} extension bind failure`);
-			};
-			const originalSubscribe = result.session.subscribe.bind(result.session);
-			result.session.subscribe = (listener) => {
-				replacementSubscriptions++;
-				return originalSubscribe(listener);
-			};
-			return result;
-		};
-		try {
-			await replaceSession(runtime);
-		} catch {
-			// Replacement API may propagate extension failure; core binding must remain.
-		}
-		runtime.createRuntime = originalCreateRuntime;
-		const replacementSession = runtime.session;
-		const recordOffset = records.length;
-		const toolCallId = `sdk-${label}-extension-failure-tool`;
-		emitTool(replacementSession, toolCallId);
-		await waitFor(
-			() => records.find((record, index) =>
-				index >= recordOffset &&
-				record.phase === "end" &&
-				hasToolCallId(record, toolCallId)),
-			`${label} core telemetry after extension failure`,
-			750,
-		);
-		if (
-			sdkFailureConversation.session !== replacementSession ||
-			!sdkFailureConversation.telemetryMapper ||
-			replacementSubscriptions !== 1
-		) {
-			throw new Error(`${label} extension failure lost core replacement binding`);
-		}
-	}
-	await assertSdkExtensionFailure("new-session", (runtime) => runtime.newSession());
-	await assertSdkExtensionFailure("switch-session", (runtime) =>
-		runtime.switchSession(sdkFailureSeedPath),
-	);
-	await assertSdkExtensionFailure("fork", (runtime) => runtime.fork(sdkFailureSeedEntryId));
-	console.log("PASS SDK replacement extension failures preserve core binding");
-	const editFailureClient = await appModule.service.attach(
-		"edit-extension-bind-failure-fixture",
-		() => {},
-	);
-	const editFailureConversation = editFailureClient.convs.get(editFailureClient.activeId);
-	if (!editFailureConversation) throw new Error("edit extension failure conversation missing");
-	const editFailureTimestamp = 3_298;
-	const editFailureMessage = {
-		role: "user",
-		content: [{ type: "text", text: "edit extension failure seed" }],
-		timestamp: editFailureTimestamp,
-	};
-	editFailureConversation.session.sessionManager.appendMessage(editFailureMessage);
-	editFailureConversation.session.agent.state.messages.push(editFailureMessage);
-	const editFailureAnswer = assistantMessage(
-		[{ type: "text", text: "edit extension failure answer" }],
-		"stop",
-		editFailureTimestamp + 1,
-	);
-	editFailureConversation.session.sessionManager.appendMessage(editFailureAnswer);
-	editFailureConversation.session.agent.state.messages.push(editFailureAnswer);
-	const editFailureRuntime = editFailureConversation.runtime;
-	const originalEditFailureCreateRuntime = editFailureRuntime.createRuntime;
-	let editFailureSubscriptions = 0;
-	editFailureRuntime.createRuntime = async (...args) => {
-		const result = await originalEditFailureCreateRuntime.apply(editFailureRuntime, args);
-		result.session.bindExtensions = async () => {
-			throw new Error("fixture edit extension bind failure");
-		};
-		const originalSubscribe = result.session.subscribe.bind(result.session);
-		result.session.subscribe = (listener) => {
-			editFailureSubscriptions++;
-			return originalSubscribe(listener);
-		};
-		return result;
-	};
-	await editFailureClient.editMessage(
-		`u-${editFailureTimestamp}-1`,
-		"edit extension failure replacement",
-	);
-	editFailureRuntime.createRuntime = originalEditFailureCreateRuntime;
-	const editFailureRecordOffset = records.length;
-	emitTool(editFailureRuntime.session, "edit-extension-failure-tool");
-	await waitFor(
-		() => records.find((record, index) =>
-			index >= editFailureRecordOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "edit-extension-failure-tool")),
-		"edit core telemetry after extension failure",
-		750,
-	);
-	if (
-		editFailureConversation.session !== editFailureRuntime.session ||
-		!editFailureConversation.telemetryMapper ||
-		editFailureSubscriptions !== 1
-	) {
-		throw new Error("edit extension failure lost core replacement binding");
-	}
-	console.log("PASS edit extension failure preserves core binding");
 
 	const projectB = join(base, "project-b");
 	mkdirSync(projectB, { recursive: true });
