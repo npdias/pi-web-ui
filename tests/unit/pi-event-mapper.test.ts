@@ -312,13 +312,44 @@ describe("PiEventMapper", () => {
 		const [firstStart] = subject.map({ type: "agent_start" });
 		const [retryEnd] = subject.map(agentEnd("error", true));
 		const [retryStart] = subject.map({ type: "agent_start" });
-		subject.map(agentEnd("stop"));
+		const [finalEnd] = subject.map(agentEnd("stop"));
 		const [nextStart] = subject.map({ type: "agent_start" });
 
 		expect(firstStart.correlation?.trace_id).toBe("conversation-1:run:1");
 		expect(retryEnd.correlation?.trace_id).toBe("conversation-1:run:1");
 		expect(retryStart.correlation?.trace_id).toBe("conversation-1:run:1");
 		expect(nextStart.correlation?.trace_id).toBe("conversation-1:run:2");
+		expect(firstStart.attributes?.lifecycle_attempt_id).toBe(
+			retryEnd.attributes?.lifecycle_attempt_id,
+		);
+		expect(retryStart.attributes?.lifecycle_attempt_id).not.toBe(
+			firstStart.attributes?.lifecycle_attempt_id,
+		);
+		expect(finalEnd.attributes?.lifecycle_attempt_id).toBe(
+			retryStart.attributes?.lifecycle_attempt_id,
+		);
+		expect(nextStart.attributes?.lifecycle_attempt_id).not.toBe(
+			retryStart.attributes?.lifecycle_attempt_id,
+		);
+	});
+
+	it("owns one source attempt ID for each turn start/end pair", () => {
+		const subject = mapper();
+		subject.map({ type: "agent_start" });
+		const [firstStart] = subject.map({ type: "turn_start" });
+		const [firstEnd] = subject.map(turnEnd("stop"));
+		const [secondStart] = subject.map({ type: "turn_start" });
+		const [secondEnd] = subject.map(turnEnd("stop"));
+
+		expect(firstStart.attributes?.lifecycle_attempt_id).toBe(
+			firstEnd.attributes?.lifecycle_attempt_id,
+		);
+		expect(secondStart.attributes?.lifecycle_attempt_id).toBe(
+			secondEnd.attributes?.lifecycle_attempt_id,
+		);
+		expect(secondStart.attributes?.lifecycle_attempt_id).not.toBe(
+			firstStart.attributes?.lifecycle_attempt_id,
+		);
 	});
 
 	it.each(
@@ -928,6 +959,7 @@ describe("PiEventMapper", () => {
 				cause_class: "forced_reset",
 				matched_start: true,
 			});
+			expect(record.attributes?.lifecycle_attempt_id).toEqual(expect.any(String));
 			expect(JSON.stringify(record)).not.toContain("operator reset reason");
 		}
 		const unmatchedEnd = subject.map(toolEnd());

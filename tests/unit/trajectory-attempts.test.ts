@@ -49,6 +49,7 @@ const CASES = [
 		name: "run",
 		kind: "agent.run",
 		correlation: { trace_id: "shared-run" },
+		secondCorrelation: { trace_id: "shared-run-2" },
 		startAttributes: {},
 		endAttributes: { matched_start: true },
 	},
@@ -61,6 +62,12 @@ const CASES = [
 			step_id: "shared-step",
 			request_id: "shared-request",
 		},
+		secondCorrelation: {
+			trace_id: "shared-run",
+			turn_id: "shared-turn-2",
+			step_id: "shared-step-2",
+			request_id: "shared-request-2",
+		},
 		startAttributes: {},
 		endAttributes: { matched_start: true },
 	},
@@ -68,6 +75,13 @@ const CASES = [
 		name: "tool",
 		kind: "tool.execution",
 		correlation: {
+			trace_id: "shared-run",
+			turn_id: "shared-turn",
+			step_id: "shared-step",
+			request_id: "shared-request",
+			tool_call_id: "shared-tool",
+		},
+		secondCorrelation: {
 			trace_id: "shared-run",
 			turn_id: "shared-turn",
 			step_id: "shared-step",
@@ -322,8 +336,11 @@ describe("trajectory lifecycle attempts", () => {
 			durationMs: 7,
 			isOpen: false,
 			identityReuse: false,
+			temporalOrderConflict: true,
 			sourceEventIds: [terminal.event_id, start.event_id],
 		});
+		expect(records[0]?.startedAt).toBeUndefined();
+		expect(records[0]?.endedAt).toBeUndefined();
 	});
 
 	it("disambiguates terminal-start-terminal source ID reuse without cumulative evidence", () => {
@@ -409,6 +426,7 @@ describe("trajectory lifecycle attempts", () => {
 	it.each(CASES)("creates two source-scoped $name attempts for two start/end cycles", ({
 		kind,
 		correlation,
+		secondCorrelation,
 		startAttributes,
 		endAttributes,
 	}) => {
@@ -441,20 +459,22 @@ describe("trajectory lifecycle attempts", () => {
 			event(3, kind, {
 				phase: "start",
 				state: "running",
-				correlation,
+				correlation: secondCorrelation,
 				attributes: secondStartAttributes,
 			}),
 			event(4, kind, {
 				phase: "end",
 				state: "completed",
-				correlation,
+				correlation: secondCorrelation,
 				duration_ms: 20,
 				attributes: secondEndAttributes,
 			}),
 		]).filter((record) => record.eventKind === kind);
 
 		expect(records).toHaveLength(2);
-		expect(records.map((record) => record.attemptOrdinal)).toEqual([1, 2]);
+		expect(records.map((record) => record.attemptOrdinal)).toEqual(
+			kind === "tool.execution" ? [1, 2] : [1, 1],
+		);
 		expect(records.every((record) => record.attemptOrdinalKnown)).toBe(false);
 		expect(records.map((record) => record.durationMs)).toEqual([10, 20]);
 		expect(records.map((record) => record.sourceEventIds)).toEqual([
@@ -639,8 +659,9 @@ describe("trajectory lifecycle attempts", () => {
 		expect(record?.privacyClass).toBeUndefined();
 	});
 
-	it("keeps durable attempt ID stable when older same-key attempt is prepended", () => {
+	it("keeps durable attempt ID stable when an older source attempt is prepended", () => {
 		const correlation = { trace_id: "prepend-run" };
+		const olderCorrelation = { trace_id: "prepend-run-older" };
 		const currentStart = event(3, "agent.run", {
 			phase: "start",
 			state: "running",
@@ -657,12 +678,12 @@ describe("trajectory lifecycle attempts", () => {
 			event(1, "agent.run", {
 				phase: "start",
 				state: "running",
-				correlation,
+				correlation: olderCorrelation,
 			}),
 			event(2, "agent.run", {
 				phase: "end",
 				state: "completed",
-				correlation,
+				correlation: olderCorrelation,
 				attributes: { matched_start: true },
 			}),
 			currentStart,
@@ -670,7 +691,7 @@ describe("trajectory lifecycle attempts", () => {
 		]).find((record) => record.sourceEventIds.includes(currentStart.event_id));
 
 		expect(after?.id).toBe(before?.id);
-		expect(after?.attemptOrdinal).toBe(2);
+		expect(after?.attemptOrdinal).toBe(1);
 		expect(before?.attemptOrdinal).toBe(1);
 	});
 
@@ -752,6 +773,43 @@ describe("trajectory lifecycle attempts", () => {
 		expect(new Set(records.map((record) => record.id)).size).toBe(10_000);
 		expect(referenceCount).toBe(10_000);
 		expect(Math.max(...records.map((record) => record.sourceEnvelopes.length))).toBe(1);
+	});
+
+	it("bounds lifecycle gap evidence while retaining every global gap row", () => {
+		const inputs: TrajectoryProjectionInput[] = [];
+		for (let index = 1; index <= 1_000; index += 1) {
+			inputs.push(event(index, "agent.run", {
+				phase: "start",
+				state: "running",
+				correlation: { trace_id: `gap-load-run-${index}` },
+			}));
+		}
+		for (let index = 1; index <= 1_000; index += 1) {
+			inputs.push({
+				type: "gap",
+				gap: {
+					requested: 1_000 + index - 1,
+					earliest_available: 1_000 + index + 1,
+					resume_after: 1_000 + index,
+				},
+			});
+		}
+
+		const allRecords = flattenTrajectoryRecords(projectTrajectory(inputs));
+		const attempts = allRecords.filter(
+			(record): record is TelemetryTrajectoryRecord => record.kind !== "GAP",
+		);
+		const gapRows = allRecords.filter((record) => record.kind === "GAP");
+		const retainedGapRefs = attempts.reduce(
+			(total, record) => total + record.gapEvidence.length,
+			0,
+		);
+
+		expect(attempts).toHaveLength(1_000);
+		expect(gapRows).toHaveLength(1_000);
+		expect(retainedGapRefs).toBeLessThanOrEqual(16_000);
+		expect(attempts.every((record) => record.gapCount === 1_000)).toBe(true);
+		expect(attempts.every((record) => record.gapEvidenceTruncated === true)).toBe(true);
 	});
 
 	it("keeps 10,000 retry-cycle event references linear", () => {

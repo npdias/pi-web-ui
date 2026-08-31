@@ -37,11 +37,14 @@ interface SpanCorrelation {
 
 interface RunSpan {
 	id: string;
+	attemptId: string;
+	attemptOpen: boolean;
 	startedAt: number;
 }
 
 interface TurnSpan {
 	ids: Required<Pick<SpanCorrelation, "turn_id" | "step_id" | "request_id">>;
+	attemptId: string;
 	startedAt: number;
 }
 
@@ -458,6 +461,8 @@ export class PiEventMapper {
 	private readonly stallThresholdMs: number;
 	private runSequence = 0;
 	private turnSequence = 0;
+	private runAttemptSequence = 0;
+	private turnAttemptSequence = 0;
 	private toolAttemptSequence = 0;
 	private currentRun: RunSpan | null = null;
 	private currentTurn: TurnSpan | null = null;
@@ -489,12 +494,19 @@ export class PiEventMapper {
 		const records: PiTelemetryRecord[] = [];
 		let duplicateStart = false;
 		if (event.type === "agent_start") {
-			duplicateStart = this.currentRun !== null;
 			if (!this.currentRun) {
+				const sequence = ++this.runSequence;
 				this.currentRun = {
-					id: `${this.idNamespace}:run:${++this.runSequence}`,
+					id: `${this.idNamespace}:run:${sequence}`,
+					attemptId: `${this.idNamespace}:run-attempt:${++this.runAttemptSequence}`,
+					attemptOpen: true,
 					startedAt: monotonicTime,
 				};
+			} else if (!this.currentRun.attemptOpen) {
+				this.currentRun.attemptOpen = true;
+				this.currentRun.startedAt = monotonicTime;
+			} else {
+				duplicateStart = true;
 			}
 		} else if (event.type === "turn_start") {
 			duplicateStart = this.currentTurn !== null;
@@ -506,6 +518,7 @@ export class PiEventMapper {
 						step_id: `${this.idNamespace}:step:${sequence}`,
 						request_id: `${this.idNamespace}:request:${sequence}`,
 					},
+					attemptId: `${this.idNamespace}:turn-attempt:${++this.turnAttemptSequence}`,
 					startedAt: monotonicTime,
 				};
 			}
@@ -525,13 +538,19 @@ export class PiEventMapper {
 						severity: "info",
 						wallTime,
 						parentId: this.sessionId,
-						attributes: duplicateStart ? { duplicate_start: true } : {},
+						attributes: {
+							lifecycle_attempt_id: this.currentRun?.attemptId ??
+								`${this.idNamespace}:run-attempt:${++this.runAttemptSequence}`,
+							...(duplicateStart ? { duplicate_start: true } : {}),
+						},
 					}),
 				);
 				break;
 			}
 			case "agent_end": {
-				const matchedRun = this.currentRun;
+				const matchedRun = this.currentRun?.attemptOpen ? this.currentRun : null;
+				const attemptId = this.currentRun?.attemptId ??
+					`${this.idNamespace}:run-attempt:${++this.runAttemptSequence}`;
 				const outcome = event.willRetry
 					? { state: "retrying", severity: "warning" as const }
 					: finalState(lastAssistantStopReason(event.messages));
@@ -546,6 +565,7 @@ export class PiEventMapper {
 							? Math.max(0, monotonicTime - matchedRun.startedAt)
 							: undefined,
 						attributes: {
+							lifecycle_attempt_id: attemptId,
 							matched_start: matchedRun !== null,
 							will_retry: event.willRetry,
 						},
@@ -553,7 +573,13 @@ export class PiEventMapper {
 				);
 				this.currentTurn = null;
 				this.toolStarts.clear();
-				if (!event.willRetry) this.currentRun = null;
+				if (event.willRetry && this.currentRun) {
+					this.currentRun.attemptId =
+						`${this.idNamespace}:run-attempt:${++this.runAttemptSequence}`;
+					this.currentRun.attemptOpen = false;
+				} else {
+					this.currentRun = null;
+				}
 				break;
 			}
 			case "turn_start": {
@@ -566,13 +592,19 @@ export class PiEventMapper {
 						wallTime,
 						parentId: this.currentRun?.id ?? this.sessionId,
 						span: this.currentSpan(),
-						attributes: duplicateStart ? { duplicate_start: true } : {},
+						attributes: {
+							lifecycle_attempt_id: this.currentTurn?.attemptId ??
+								`${this.idNamespace}:turn-attempt:${++this.turnAttemptSequence}`,
+							...(duplicateStart ? { duplicate_start: true } : {}),
+						},
 					}),
 				);
 				break;
 			}
 			case "turn_end": {
 				const matchedTurn = this.currentTurn;
+				const attemptId = matchedTurn?.attemptId ??
+					`${this.idNamespace}:turn-attempt:${++this.turnAttemptSequence}`;
 				const outcome = finalState(assistantStopReason(event.message));
 				records.push(
 					this.record({
@@ -585,7 +617,10 @@ export class PiEventMapper {
 						durationMs: matchedTurn
 							? Math.max(0, monotonicTime - matchedTurn.startedAt)
 							: undefined,
-						attributes: { matched_start: matchedTurn !== null },
+						attributes: {
+							lifecycle_attempt_id: attemptId,
+							matched_start: matchedTurn !== null,
+						},
 					}),
 				);
 				this.currentTurn = null;
@@ -762,6 +797,7 @@ export class PiEventMapper {
 					durationMs: Math.max(0, monotonicTime - this.currentTurn.startedAt),
 					attributes: {
 						cause_class: "forced_reset",
+						lifecycle_attempt_id: this.currentTurn.attemptId,
 						matched_start: true,
 					},
 				}),
@@ -780,6 +816,7 @@ export class PiEventMapper {
 					durationMs: Math.max(0, monotonicTime - this.currentRun.startedAt),
 					attributes: {
 						cause_class: "forced_reset",
+						lifecycle_attempt_id: this.currentRun.attemptId,
 						matched_start: true,
 					},
 				}),

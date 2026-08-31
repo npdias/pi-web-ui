@@ -82,6 +82,11 @@ export interface TelemetryTrajectoryRecord extends TrajectoryRecordBase {
 	/** At least one replay gap intersects the observed lifecycle interval. */
 	readonly gapTainted: boolean;
 	readonly gapEvidence: readonly TelemetryReplayGap[];
+	/** Exact number of gaps intersecting this lifecycle; inline evidence may be bounded. */
+	readonly gapCount?: number;
+	readonly gapEvidenceTruncated?: boolean;
+	/** Conventional start/end timestamps were omitted because source order conflicted. */
+	readonly temporalOrderConflict?: boolean;
 	/** Source reused one lifecycle attempt ID for distinct evidence. */
 	readonly identityReuse: boolean;
 	/** Two or more distinct terminal envelopes exist without an intervening start. */

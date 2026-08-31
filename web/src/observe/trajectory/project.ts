@@ -32,6 +32,9 @@ const SUPPORTED_EVENT_KINDS = new Set([
 	"context.changed",
 ]);
 const MAX_RECORD_SUMMARY_LENGTH = 512;
+const MAX_INLINE_GAP_EVIDENCE = 16;
+const INLINE_GAP_HEAD = 8;
+const INLINE_GAP_TAIL = 8;
 
 interface OrderedEvent {
 	readonly type: "event";
@@ -74,7 +77,14 @@ interface AttemptTracker {
 	hasSettledAttempt: boolean;
 	open?: OpenAttempt;
 	uncertainRecordIndex?: number;
+	uncertainGapStartIndex?: number;
 	pendingTerminalRecordIndex?: number;
+}
+
+interface GapEvidenceSummary {
+	readonly evidence: readonly TelemetryReplayGap[];
+	readonly count: number;
+	readonly truncated: boolean;
 }
 
 function unwrap(input: TrajectoryProjectionInput): OrderedInput {
@@ -146,13 +156,7 @@ function attemptRecordId(
 	const suffix = disambiguate
 		? `|reuse:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}`
 		: "";
-	if (
-		anchor.kind === "tool.execution" &&
-		stringAttribute(anchor.attributes, "lifecycle_attempt_id") !== undefined
-	) {
-		return `attempt:${key}${suffix}`;
-	}
-	return `attempt:${key}|anchor:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}${suffix}`;
+	return `attempt:${key}${suffix}`;
 }
 
 function identityPart(value: string): string {
@@ -184,6 +188,8 @@ function scopedIdentity(
 }
 
 function lifecycleSemanticId(event: TelemetryEvent): string | undefined {
+	const attemptId = stringAttribute(event.attributes, "lifecycle_attempt_id");
+	if (attemptId !== undefined) return attemptId;
 	switch (event.kind) {
 		case "agent.run":
 			return event.correlation?.trace_id;
@@ -194,11 +200,6 @@ function lifecycleSemanticId(event: TelemetryEvent): string | undefined {
 		default:
 			return undefined;
 	}
-}
-
-function reusesSourceAttemptIdentity(event: TelemetryEvent): boolean {
-	return event.kind === "tool.execution" &&
-		stringAttribute(event.attributes, "lifecycle_attempt_id") !== undefined;
 }
 
 function lifecycleKey(event: TelemetryEvent): string | undefined {
@@ -492,7 +493,10 @@ function mergeOpenAttemptEvidence(
 	return {
 		...record,
 		attributes: mergedAttributes(events),
-		diagnostic: diagnosticEvidence(events),
+		diagnostic: diagnosticEvidence(
+			events,
+			record.diagnostic || record.identityReuse || record.terminalConflict,
+		),
 		...attemptEvidenceFields(events),
 	};
 }
@@ -533,11 +537,15 @@ function settleGapTaintedAttempt(
 	event: TelemetryEvent,
 ): TelemetryTrajectoryRecord {
 	const gapEvidence = record.gapEvidence;
+	const gapCount = record.gapCount;
+	const gapEvidenceTruncated = record.gapEvidenceTruncated;
 	return {
 		...settleAttempt(record, event),
 		closureUnknown: false,
 		gapTainted: true,
 		gapEvidence,
+		...(gapCount === undefined ? {} : { gapCount }),
+		...(gapEvidenceTruncated === undefined ? {} : { gapEvidenceTruncated }),
 		diagnostic: true,
 	};
 }
@@ -556,7 +564,10 @@ function reconcileTerminalBeforeStart(
 	const attributes = mergedAttributes(evidence);
 	const normalizedTerminal = { ...terminal, attributes };
 	const toolName = stringAttribute(attributes, "tool_name");
-	return {
+	const startTime = Date.parse(start.observed_at);
+	const terminalTime = Date.parse(terminal.observed_at);
+	const temporalOrderConflict = startTime > terminalTime;
+	const reconciled: TelemetryTrajectoryRecord = {
 		...record,
 		kind: recordKind(normalizedTerminal),
 		...eventSummary(normalizedTerminal),
@@ -573,13 +584,24 @@ function reconcileTerminalBeforeStart(
 		terminalConflict: false,
 		unmatchedTerminal: false,
 		diagnostic: true,
+		...(temporalOrderConflict ? { temporalOrderConflict: true } : {}),
 		...attemptEvidenceFields(evidence),
 		phase: "end",
 		...(terminal.state === undefined ? {} : { state: terminal.state }),
-		startedAt: start.observed_at,
-		endedAt: terminal.observed_at,
+		...(temporalOrderConflict
+			? {}
+			: { startedAt: start.observed_at, endedAt: terminal.observed_at }),
 		...(toolName === undefined ? {} : { toolName }),
 	};
+	if (!temporalOrderConflict) return reconciled;
+	const {
+		startedAt: ignoredStartedAt,
+		endedAt: ignoredEndedAt,
+		...withoutConventionalTiming
+	} = reconciled;
+	void ignoredStartedAt;
+	void ignoredEndedAt;
+	return withoutConventionalTiming;
 }
 
 function terminalOnlyAttempt(
@@ -587,10 +609,10 @@ function terminalOnlyAttempt(
 	key: string,
 	ordinal: number,
 	tracker: AttemptTracker,
-	gapEvidence: readonly TelemetryReplayGap[],
+	gapSummary: GapEvidenceSummary,
 	identityReuse = false,
 ): TelemetryTrajectoryRecord {
-	const closureUnknown = gapEvidence.length > 0;
+	const closureUnknown = gapSummary.count > 0;
 	const terminalConflict = !closureUnknown && (tracker.hasSettledAttempt || identityReuse);
 	const state = closureUnknown
 		? "closure_unknown"
@@ -621,7 +643,9 @@ function terminalOnlyAttempt(
 		attemptOrdinalKnown: false,
 		closureUnknown,
 		gapTainted: closureUnknown,
-		gapEvidence,
+		gapEvidence: gapSummary.evidence,
+		gapCount: gapSummary.count,
+		...(gapSummary.truncated ? { gapEvidenceTruncated: true } : {}),
 		identityReuse,
 		terminalConflict,
 		unmatchedTerminal: true,
@@ -708,20 +732,83 @@ function gapRecord(gap: TelemetryReplayGap): GapTrajectoryRecord {
 	};
 }
 
+function summarizeGapEvidence(
+	gaps: readonly TelemetryReplayGap[],
+	startIndex: number,
+): GapEvidenceSummary {
+	const count = Math.max(0, gaps.length - startIndex);
+	if (count <= MAX_INLINE_GAP_EVIDENCE) {
+		return {
+			evidence: gaps.slice(startIndex),
+			count,
+			truncated: false,
+		};
+	}
+	return {
+		evidence: [
+			...gaps.slice(startIndex, startIndex + INLINE_GAP_HEAD),
+			...gaps.slice(gaps.length - INLINE_GAP_TAIL),
+		],
+		count,
+		truncated: true,
+	};
+}
+
+function withGapEvidence(
+	record: TelemetryTrajectoryRecord,
+	summary: GapEvidenceSummary,
+): TelemetryTrajectoryRecord {
+	return {
+		...record,
+		gapTainted: summary.count > 0,
+		gapEvidence: summary.evidence,
+		gapCount: summary.count,
+		...(summary.truncated ? { gapEvidenceTruncated: true } : {}),
+	};
+}
+
 function markGapBoundary(
 	record: TrajectoryRecord,
-	gap: TelemetryReplayGap,
+	summary: GapEvidenceSummary,
 ): TrajectoryRecord {
 	if (record.kind === "GAP") return record;
 	return {
-		...record,
+		...withGapEvidence(record, summary),
 		isOpen: false,
 		closureUnknown: true,
-		gapTainted: true,
-		gapEvidence: [...record.gapEvidence, gap],
 		state: "closure_unknown",
 		diagnostic: true,
 	};
+}
+
+function disambiguateRecordIds(
+	records: readonly TrajectoryRecord[],
+): TrajectoryRecord[] {
+	const used = new Set<string>();
+	return records.map((record) => {
+		if (!used.has(record.id)) {
+			used.add(record.id);
+			return record;
+		}
+		const evidenceId = record.kind === "GAP"
+			? gapRecordId(record.gap)
+			: record.sourceEventIds[0] ?? `sequence:${record.sequence}`;
+		let id = `${record.id}|collision:${identityPart(evidenceId)}|sequence:${record.sequence}`;
+		let collision = 1;
+		while (used.has(id)) {
+			collision += 1;
+			id = `${record.id}|collision:${identityPart(evidenceId)}|sequence:${record.sequence}|${collision}`;
+		}
+		used.add(id);
+		if (record.kind === "GAP") return { ...record, id };
+		return {
+			...record,
+			id,
+			identityReuse: true,
+			terminalConflict: true,
+			diagnostic: true,
+		};
+	});
 }
 
 function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly TrajectoryRecord[] {
@@ -737,20 +824,19 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 		if (input.type === "gap") {
 			output.push(gapRecord(input.gap));
 			gaps.push(input.gap);
-			for (const tracker of uncertainTrackers) {
-				const recordIndex = tracker.uncertainRecordIndex;
-				if (recordIndex === undefined) continue;
-				const record = output[recordIndex];
-				if (record !== undefined) output[recordIndex] = markGapBoundary(record, input.gap);
-			}
 			for (const tracker of openTrackers) {
 				const open = tracker.open;
 				if (open === undefined) continue;
+				tracker.uncertainGapStartIndex = tracker.lastGapIndexSeen;
+				const gapSummary = summarizeGapEvidence(
+					gaps,
+					tracker.uncertainGapStartIndex,
+				);
 				const record = output[open.recordIndex];
 				if (record !== undefined && record.kind !== "GAP") {
 					output[open.recordIndex] = markGapBoundary(
 						mergeOpenAttemptEvidence(record, open.events),
-						input.gap,
+						gapSummary,
 					);
 				}
 				tracker.uncertainRecordIndex = open.recordIndex;
@@ -800,7 +886,16 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			tracker.uncertainRecordIndex !== undefined
 		) {
 			const recordIndex = tracker.uncertainRecordIndex;
-			const record = output[recordIndex];
+			const current = output[recordIndex];
+			const record = current !== undefined && current.kind !== "GAP"
+				? withGapEvidence(
+					current,
+					summarizeGapEvidence(
+						gaps,
+						tracker.uncertainGapStartIndex ?? tracker.lastGapIndexSeen,
+					),
+				)
+				: current;
 			if (record !== undefined && record.kind !== "GAP") {
 				if (event.phase === "start") {
 					const reopened = mergeOpenAttemptEvidence(
@@ -817,7 +912,6 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 						gapEvidence: record.gapEvidence,
 						phase: "start",
 						state: event.state ?? "running",
-						startedAt: event.observed_at,
 						diagnostic: true,
 					};
 					tracker.lastGapIndexSeen = gaps.length;
@@ -826,13 +920,26 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 				output[recordIndex] = settleGapTaintedAttempt(record, event);
 			}
 			tracker.uncertainRecordIndex = undefined;
+			tracker.uncertainGapStartIndex = undefined;
 			tracker.hasSettledAttempt = true;
 			tracker.lastGapIndexSeen = gaps.length;
 			uncertainTrackers.delete(tracker);
 			continue;
 		}
 		if (tracker.uncertainRecordIndex !== undefined) {
+			const recordIndex = tracker.uncertainRecordIndex;
+			const record = output[recordIndex];
+			if (record !== undefined && record.kind !== "GAP") {
+				output[recordIndex] = withGapEvidence(
+					record,
+					summarizeGapEvidence(
+						gaps,
+						tracker.uncertainGapStartIndex ?? tracker.lastGapIndexSeen,
+					),
+				);
+			}
 			tracker.uncertainRecordIndex = undefined;
+			tracker.uncertainGapStartIndex = undefined;
 			uncertainTrackers.delete(tracker);
 		}
 
@@ -856,7 +963,7 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			const ordinalKey = ordinalLifecycleKey(event) ?? key;
 			const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
 			ordinalCounters.set(ordinalKey, ordinal);
-			const identityReuse = tracker.hasSettledAttempt && reusesSourceAttemptIdentity(event);
+			const identityReuse = tracker.hasSettledAttempt;
 			const recordIndex = output.push(
 				openAttemptRecord(event, key, ordinal, identityReuse),
 			) - 1;
@@ -889,8 +996,8 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 		const ordinalKey = ordinalLifecycleKey(event) ?? key;
 		const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
 		ordinalCounters.set(ordinalKey, ordinal);
-		const relevantGaps = gaps.slice(tracker.lastGapIndexSeen);
-		const identityReuse = tracker.hasSettledAttempt && reusesSourceAttemptIdentity(event);
+		const relevantGaps = summarizeGapEvidence(gaps, tracker.lastGapIndexSeen);
+		const identityReuse = tracker.hasSettledAttempt;
 		const recordIndex = output.push(terminalOnlyAttempt(
 			event,
 			key,
@@ -899,7 +1006,7 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			relevantGaps,
 			identityReuse,
 		)) - 1;
-		if (!identityReuse && relevantGaps.length === 0) {
+		if (!identityReuse && relevantGaps.count === 0) {
 			tracker.pendingTerminalRecordIndex = recordIndex;
 			pendingTerminalTrackers.add(tracker);
 		}
@@ -915,8 +1022,21 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			output[open.recordIndex] = mergeOpenAttemptEvidence(record, open.events);
 		}
 	}
+	for (const tracker of uncertainTrackers) {
+		const recordIndex = tracker.uncertainRecordIndex;
+		if (recordIndex === undefined) continue;
+		const record = output[recordIndex];
+		if (record === undefined || record.kind === "GAP") continue;
+		output[recordIndex] = withGapEvidence(
+			record,
+			summarizeGapEvidence(
+				gaps,
+				tracker.uncertainGapStartIndex ?? tracker.lastGapIndexSeen,
+			),
+		);
+	}
 
-	return output
+	return disambiguateRecordIds(output)
 		.sort((left, right) => {
 			if (left.sequence !== right.sequence) return left.sequence < right.sequence ? -1 : 1;
 			if (left.kind === "GAP" && right.kind !== "GAP") return 1;

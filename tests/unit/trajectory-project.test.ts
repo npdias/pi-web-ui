@@ -447,25 +447,33 @@ describe("projectTrajectory", () => {
 				phase: "start",
 				state: "running",
 				correlation,
+				attributes: { lifecycle_attempt_id: "retry-attempt-1" },
 			}),
 			envelope(2, "agent.run", {
 				phase: "end",
 				state: "retrying",
 				severity: "warning",
 				correlation,
+				attributes: {
+					lifecycle_attempt_id: "retry-attempt-1",
+					matched_start: true,
+				},
 			}),
 			envelope(3, "agent.run", {
 				phase: "start",
 				state: "running",
 				correlation,
-				attributes: { duplicate_start: true },
+				attributes: { lifecycle_attempt_id: "retry-attempt-2" },
 			}),
 			envelope(4, "agent.run", {
 				phase: "end",
 				state: "completed",
 				correlation,
 				duration_ms: 1,
-				attributes: { matched_start: true },
+				attributes: {
+					lifecycle_attempt_id: "retry-attempt-2",
+					matched_start: true,
+				},
 			}),
 		]);
 		const terminals = all.filter(
