@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer as createUnixServer } from "node:net";
@@ -146,6 +146,10 @@ function recordHasTool(record, sourceToolCallId) {
 	return id === sourceToolCallId || id?.endsWith(`:tool:${sourceToolCallId}`);
 }
 
+function sha256Json(value) {
+	return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
 function lifecycleSpanKey(record) {
 	if (record.kind === "tool.execution") return `tool:${record.correlation?.tool_call_id}`;
 	if (record.kind === "agent.turn") return `turn:${record.correlation?.turn_id}`;
@@ -287,6 +291,7 @@ const socketPath = join(fixture.base, "telemetry.sock");
 mkdirSync(projectB, { recursive: true });
 
 const records = [];
+const telemetryLines = [];
 const telemetrySockets = new Set();
 let connectionCount = 0;
 let acknowledgementMode = "valid";
@@ -307,6 +312,7 @@ const telemetryServer = createUnixServer((socket) => {
 			const line = buffered.slice(0, newline);
 			buffered = buffered.slice(newline + 1);
 			if (!line) continue;
+			telemetryLines.push(line);
 			records.push(JSON.parse(line));
 			if (acknowledgementMode === "malformed-once") {
 				acknowledgementMode = "valid";
@@ -417,6 +423,159 @@ try {
 		throw new Error("initial conversation mapper missing");
 	}
 
+	const originalSystemPrompt = client.session.agent.state.systemPrompt;
+	const originalActiveTools = client.session.agent.state.tools;
+	const promptSentinelA = "PRIVATE_CONTEXT_PROMPT_SENTINEL_A";
+	const promptSentinelB = "PRIVATE_CONTEXT_PROMPT_SENTINEL_B";
+	const schemaSentinelA = "PRIVATE_CONTEXT_SCHEMA_SENTINEL_A";
+	const schemaSentinelB = "PRIVATE_CONTEXT_SCHEMA_SENTINEL_B";
+	const alphaToolName = "private_alpha_context_tool";
+	const zetaToolName = "private_zeta_context_tool";
+	const renamedToolName = "private_omega_context_tool";
+	const alphaSchema = { type: "object" };
+	const schemaA = {
+		properties: { marker: { const: schemaSentinelA, type: "string" } },
+		type: "object",
+	};
+	const schemaB = {
+		properties: { marker: { const: schemaSentinelB, type: "string" } },
+		type: "object",
+	};
+	const tool = (name, parameters) => ({
+		name,
+		label: name,
+		description: "context fixture",
+		parameters,
+		execute: async () => ({ content: [], details: {} }),
+	});
+	const alphaTool = tool(alphaToolName, alphaSchema);
+	const zetaTool = tool(zetaToolName, schemaA);
+	const contextFinished = assistantMessage([{ type: "text", text: "context" }], "stop", 999);
+	const contextOffset = records.length;
+	const contextLineOffset = telemetryLines.length;
+	client.session.agent.state.systemPrompt = promptSentinelA;
+	client.session.agent.state.tools = [zetaTool, alphaTool];
+	client.session._emit({ type: "agent_start" });
+	client.session._emit({ type: "turn_start" });
+	client.session._emit({ type: "turn_end", message: contextFinished, toolResults: [] });
+	client.session.agent.state.tools = [alphaTool, zetaTool];
+	client.session._emit({ type: "turn_start" });
+	client.session._emit({ type: "turn_end", message: contextFinished, toolResults: [] });
+	client.session.agent.state.systemPrompt = promptSentinelB;
+	client.session._emit({ type: "turn_start" });
+	client.session._emit({ type: "turn_end", message: contextFinished, toolResults: [] });
+	client.session.agent.state.tools = [tool(renamedToolName, schemaA), alphaTool];
+	client.session._emit({ type: "turn_start" });
+	client.session._emit({ type: "turn_end", message: contextFinished, toolResults: [] });
+	client.session.agent.state.tools = [tool(renamedToolName, schemaB), alphaTool];
+	client.session._emit({ type: "turn_start" });
+	client.session._emit({ type: "turn_end", message: contextFinished, toolResults: [] });
+	client.session._emit({ type: "agent_end", messages: [contextFinished], willRetry: false });
+	client.session.agent.state.systemPrompt = originalSystemPrompt;
+	client.session.agent.state.tools = originalActiveTools;
+	await waitFor(
+		() => records.slice(contextOffset).filter((record) => record.kind === "context.changed").length === 4,
+		"effective context telemetry",
+	);
+	const contextSlice = records.slice(contextOffset);
+	const contextRecords = contextSlice.filter((record) => record.kind === "context.changed");
+	const initialToolHash = sha256Json([
+		{ name: alphaToolName, schema: alphaSchema },
+		{ name: zetaToolName, schema: schemaA },
+	]);
+	const renamedToolHash = sha256Json([
+		{ name: alphaToolName, schema: alphaSchema },
+		{ name: renamedToolName, schema: schemaA },
+	]);
+	const changedSchemaHash = sha256Json([
+		{ name: alphaToolName, schema: alphaSchema },
+		{ name: renamedToolName, schema: schemaB },
+	]);
+	if (
+		contextRecords[0].attributes?.system_prompt_hash !== sha256Json(promptSentinelA) ||
+		contextRecords[0].attributes?.tool_schema_hash !== initialToolHash ||
+		contextRecords[1].attributes?.system_prompt_hash !== sha256Json(promptSentinelB) ||
+		contextRecords[1].attributes?.tool_schema_hash !== initialToolHash ||
+		contextRecords[2].attributes?.tool_schema_hash !== renamedToolHash ||
+		contextRecords[3].attributes?.tool_schema_hash !== changedSchemaHash
+	) {
+		throw new Error("effective prompt/tool context hashes did not change or suppress correctly");
+	}
+	if (
+		!contextRecords[0].correlation?.trace_id ||
+		contextRecords[0].correlation.parent_id !== contextRecords[0].correlation.trace_id ||
+		!contextRecords[1].correlation?.turn_id ||
+		!contextRecords[1].correlation?.step_id ||
+		!contextRecords[1].correlation?.request_id ||
+		contextRecords[1].correlation.parent_id !== contextRecords[1].correlation.request_id
+	) {
+		throw new Error("context telemetry did not use current run/turn/request correlation");
+	}
+	for (const record of contextRecords) {
+		if (
+			!/^sha256:[0-9a-f]{64}$/.test(record.attributes?.system_prompt_hash ?? "") ||
+			!/^sha256:[0-9a-f]{64}$/.test(record.attributes?.tool_schema_hash ?? "")
+		) {
+			throw new Error("context telemetry emitted a non-hash context attribute");
+		}
+		const index = contextSlice.indexOf(record);
+		if (
+			index < 0 ||
+			!contextSlice[index + 1] ||
+			contextSlice[index + 1].phase !== "start" ||
+			(contextSlice[index + 1].kind !== "agent.run" && contextSlice[index + 1].kind !== "agent.turn")
+		) {
+			throw new Error("context telemetry did not precede its lifecycle start");
+		}
+	}
+	const serializedContext = telemetryLines.slice(contextLineOffset).join("\n");
+	for (const rawValue of [
+		promptSentinelA,
+		promptSentinelB,
+		schemaSentinelA,
+		schemaSentinelB,
+		alphaToolName,
+		zetaToolName,
+		renamedToolName,
+	]) {
+		if (serializedContext.includes(rawValue)) {
+			throw new Error("context telemetry exposed raw prompt or tool schema data");
+		}
+	}
+	console.log("PASS effective prompt and sorted active tools emit only changed context hashes");
+
+	const captureFailureOffset = records.length;
+	const captureFailureLineOffset = telemetryLines.length;
+	const captureFailureHealth = appModule.telemetryClient.health();
+	const captureErrorSentinel = "PRIVATE_CONTEXT_CAPTURE_ERROR";
+	Object.defineProperty(client.session, "systemPrompt", {
+		configurable: true,
+		get() {
+			throw new Error(captureErrorSentinel);
+		},
+	});
+	try {
+		client.session._emit({ type: "agent_start" });
+		client.session._emit({ type: "agent_end", messages: [contextFinished], willRetry: false });
+	} finally {
+		delete client.session.systemPrompt;
+	}
+	await waitFor(
+		() => records.slice(captureFailureOffset).some((record) =>
+			record.kind === "agent.run" && record.phase === "end"),
+		"lifecycle telemetry after context capture failure",
+	);
+	const afterCaptureFailure = appModule.telemetryClient.health();
+	if (
+		afterCaptureFailure.errors !== captureFailureHealth.errors + 1 ||
+		afterCaptureFailure.gaps !== captureFailureHealth.gaps ||
+		records.slice(captureFailureOffset).some((record) => record.kind === "context.changed") ||
+		telemetryLines.slice(captureFailureLineOffset).join("\n").includes(captureErrorSentinel)
+	) {
+		throw new Error("context capture failure blocked lifecycle mapping or leaked error text");
+	}
+	console.log("PASS context capture failure preserves content-free lifecycle telemetry");
+
 	const normalOffset = records.length;
 	emitFixture(client.session, "normal-tool");
 	await wire.next("tool_status", (message) => message.toolCallId === "normal-tool");
@@ -428,6 +587,12 @@ try {
 		.slice(normalOffset)
 		.filter((record) => record.kind !== "context.changed")
 		.slice(0, 7);
+	const normalContextRecord = records
+		.slice(normalOffset)
+		.find((record) => record.kind === "context.changed");
+	if (!normalContextRecord) {
+		throw new Error("normal production lifecycle omitted context telemetry");
+	}
 	const order = normalRecords.map((record) => `${record.kind}:${record.phase}`);
 	const expectedOrder = [
 		"agent.run:start",
@@ -632,6 +797,25 @@ try {
 		throw new Error("rejected extension bind retained stale telemetry mapper");
 	}
 	await client.bindSession(firstConversation);
+	const reboundOffset = records.length;
+	firstConversation.session._emit({ type: "agent_start" });
+	firstConversation.session._emit({
+		type: "agent_end",
+		messages: [contextFinished],
+		willRetry: false,
+	});
+	const reboundContext = await waitFor(
+		() => records.slice(reboundOffset).find((record) => record.kind === "context.changed"),
+		"context telemetry after mapper replacement",
+	);
+	if (
+		reboundContext.attributes?.system_prompt_hash !== normalContextRecord.attributes?.system_prompt_hash ||
+		reboundContext.attributes?.tool_schema_hash !== normalContextRecord.attributes?.tool_schema_hash ||
+		reboundContext.correlation?.session_id !== firstConversation.session.sessionId ||
+		reboundContext.correlation?.trace_id === normalContextRecord.correlation?.trace_id
+	) {
+		throw new Error("mapper replacement suppressed context or reused run correlation");
+	}
 	console.log("PASS rejected extension bind disposes stale mapper");
 
 	const telemetryConfig = client.telemetry;
@@ -778,9 +962,13 @@ try {
 		record.correlation?.conversation_id === firstConversationId);
 	const secondRecord = crossRecords.find((record) =>
 		record.correlation?.conversation_id === secondConversation.telemetryConversationId);
+	const secondContextBeforeEdit = records.slice(crossOffset).find((record) =>
+		record.kind === "context.changed" &&
+		record.correlation?.conversation_id === secondConversation.telemetryConversationId);
 	if (
 		!firstRecord ||
 		!secondRecord ||
+		!secondContextBeforeEdit ||
 		firstRecord.attributes?.project_cwd !== fixture.projectDir ||
 		secondRecord.attributes?.project_cwd !== projectB ||
 		firstRecord.correlation.session_id === secondRecord.correlation.session_id
@@ -893,7 +1081,17 @@ try {
 			recordHasTool(record, "cross-conversation-tool")),
 		"post-edit telemetry",
 	);
+	const postEditContext = records
+		.slice(editOffset)
+		.find((record) => record.kind === "context.changed");
 	if (
+		!postEditContext ||
+		postEditContext.attributes?.system_prompt_hash !==
+			secondContextBeforeEdit.attributes?.system_prompt_hash ||
+		postEditContext.attributes?.tool_schema_hash !==
+			secondContextBeforeEdit.attributes?.tool_schema_hash ||
+		postEditContext.correlation?.session_id !== editConversation.session.sessionId ||
+		postEditContext.correlation?.trace_id === secondContextBeforeEdit.correlation?.trace_id ||
 		postEditRecord.correlation.conversation_id !==
 			editConversation.telemetryConversationId ||
 		postEditRecord.correlation.session_id !== editConversation.session.sessionId ||
@@ -903,7 +1101,7 @@ try {
 	) {
 		throw new Error("edit fork reused concrete-session correlation namespace");
 	}
-	console.log("PASS edit fork creates fresh concrete-session namespace");
+	console.log("PASS mapper and concrete-session replacement re-emit hashed context");
 
 	await waitFor(
 		() => appModule.telemetryClient.health().queued === 0,

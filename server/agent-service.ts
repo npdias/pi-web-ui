@@ -102,7 +102,10 @@ import {
 	SYSTEM_PROMPT,
 	transcribeImages,
 } from "./vision-bridge.js";
-import { PiEventMapper } from "./telemetry/pi-event-mapper.js";
+import {
+	PiEventMapper,
+	type PiTelemetryContext,
+} from "./telemetry/pi-event-mapper.js";
 import type {
 	PiTelemetryRecord,
 	PiTelemetrySource,
@@ -119,7 +122,7 @@ export interface AgentServiceTelemetry {
 
 interface ConversationTelemetryMapper {
 	noteActivity?(nowMs?: number): void;
-	map(event: AgentSessionEvent): PiTelemetryRecord[];
+	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[];
 	observeStall?(nowMs: number): PiTelemetryRecord[];
 	forceReset(): PiTelemetryRecord[];
 	dispose(): void;
@@ -1217,12 +1220,30 @@ export class ClientSession {
 		}
 		let records: PiTelemetryRecord[];
 		try {
-			records = mapper.map(event);
+			records = mapper.map(event, this.telemetryContext(conv, event));
 		} catch {
 			this.noteTelemetryFailure("mapping", 1);
 			return;
 		}
 		this.emitTelemetryRecords(conv, records);
+	}
+
+	private telemetryContext(
+		conv: Conversation,
+		event: AgentSessionEvent,
+	): PiTelemetryContext | undefined {
+		if (event.type !== "agent_start" && event.type !== "turn_start") return undefined;
+		try {
+			return {
+				systemPrompt: conv.session.systemPrompt,
+				toolSchemas: conv.session.state.tools
+					.map((tool) => ({ name: tool.name, schema: tool.parameters }))
+					.sort((left, right) => left.name.localeCompare(right.name)),
+			};
+		} catch {
+			this.noteTelemetryFailure("mapping", 0);
+			return undefined;
+		}
 	}
 
 	private emitStallTelemetry(conv: Conversation, nowMs: number): void {
