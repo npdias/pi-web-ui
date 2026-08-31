@@ -44,6 +44,7 @@ import { McpBridge } from "./mcp-bridge.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
 import { TelemetrySocketClient } from "./telemetry/client.js";
 import type { PiTelemetrySource } from "./telemetry/types.js";
+import { createObserveProxyRouter } from "./observe-proxy.js";
 
 const PORT = Number(process.env.PI_WEB_PORT ?? process.env.PORT ?? 8787);
 const CWD = resolve(process.env.PI_WEB_CWD ?? process.cwd());
@@ -134,6 +135,8 @@ if (AUTH_TOKEN) {
 app.get("/api/health", (_req, res) => {
 	res.json({ ok: true, piVersion: VERSION, cwd: CWD, pid: process.pid });
 });
+
+app.use("/api/observe", createObserveProxyRouter());
 
 /**
  * Stream a workspace file over HTTP.
