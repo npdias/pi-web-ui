@@ -1,16 +1,10 @@
 import {
 	createContext,
-	useCallback,
 	useContext,
-	useEffect,
-	useMemo,
-	useState,
 	type ReactNode,
 } from "react";
 
-export type Locale = "zh" | "en";
-
-const STORAGE_KEY = "pi-web-ui:lang";
+export type Locale = "en";
 
 /* ------------------------------------------------------------------ */
 /* zh (default)                                                        */
@@ -1454,56 +1448,24 @@ export type Translate = (
 
 interface I18nContextValue {
 	locale: Locale;
-	setLocale: (locale: Locale) => void;
 	t: Translate;
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null);
 
-function loadLocale(): Locale {
-	try {
-		const saved = localStorage.getItem(STORAGE_KEY);
-		if (saved === "zh" || saved === "en") return saved;
-	} catch {
-		// localStorage unavailable — fall through to the default.
-	}
-	return "zh"; // default: Chinese
-}
-
 export function LanguageProvider({ children }: { children: ReactNode }) {
-	const [locale, setLocaleState] = useState<Locale>(loadLocale);
-
-	const setLocale = useCallback((l: Locale) => {
-		setLocaleState(l);
-		try {
-			localStorage.setItem(STORAGE_KEY, l);
-		} catch {
-			// ignore storage errors
-		}
-	}, []);
-
-	const t = useCallback<Translate>(
-		(key, vars) => {
-			let str: string = en[key];
-			if (locale === "zh") str = zh[key];
-			if (vars) {
-				for (const [k, v] of Object.entries(vars)) {
-					str = str.replaceAll(`{${k}}`, String(v));
-				}
+	const locale: Locale = "en";
+	const t: Translate = (key, vars) => {
+		let str: string = en[key];
+		if (vars) {
+			for (const [k, v] of Object.entries(vars)) {
+				str = str.replaceAll(`{${k}}`, String(v));
 			}
-			return str;
-		},
-		[locale],
-	);
-
-	useEffect(() => {
-		document.documentElement.lang = locale === "zh" ? "zh-CN" : "en";
-	}, [locale]);
-
-	const value = useMemo(
-		() => ({ locale, setLocale, t }),
-		[locale, setLocale, t],
-	);
+		}
+		return str;
+	};
+	document.documentElement.lang = "en";
+	const value = { locale, t };
 
 	return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }

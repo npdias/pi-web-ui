@@ -14,7 +14,6 @@ import { LeftPanel } from "./components/LeftPanel";
 import { RightPanel } from "./components/RightPanel";
 import { MessageList } from "./components/MessageList";
 import { ChatInput } from "./components/ChatInput";
-import { GoalBar } from "./components/GoalBar";
 import { FooterBar } from "./components/FooterBar";
 import { Dialog } from "./components/Dialog";
 // 终端视图懒加载：xterm.js 体积大且只在切到终端时才需要，拆出主包
@@ -343,13 +342,6 @@ export function App() {
 				cmd.startsWith("pi-web-ui uninstall ")
 			) {
 				send({ type: "plugins_reload" });
-			} else if (cmd.startsWith("npm i -g ")) {
-				// A component update ran in the visible terminal (per-row "更新"
-				// or "全部更新" buttons): re-discover extensions + UI plugins and
-				// re-check versions so the dropdown reflects the new state.
-				send({ type: "extensions_reload" });
-				send({ type: "plugins_reload" });
-				send({ type: "check_updates_all", force: true });
 			}
 		}
 	}, [chat.terminals, send]);
@@ -527,8 +519,8 @@ export function App() {
 		[send],
 	);
 
-	// Stable callbacks for memoized panels (LeftPanel/RightPanel/ChatInput/
-	// GoalBar skip re-render while tokens stream in — inline closures here
+	// Stable callbacks for memoized panels (LeftPanel/RightPanel/ChatInput)
+	// skip re-render while tokens stream in — inline closures here
 	// would break their shallow prop comparison every render).
 	const openManageModels = useCallback(() => setManageModelsOpen(true), []);
 	const clearAttachments = useCallback(() => setAttachments([]), []);
@@ -622,7 +614,6 @@ export function App() {
 			<TopBar
 				chat={chat}
 				send={send}
-				terminal={terminal}
 				view={view}
 				plugins={enabledPlugins}
 				onViewChange={(v: ViewName) => {
@@ -704,13 +695,6 @@ export function App() {
 								{chat.ready ? t("loadingSession") : t("connectingServer")}
 							</div>
 						)}
-						<GoalBar
-							send={send}
-							goal={chat.goal}
-							models={chat.models}
-							modelsLoading={chat.modelsLoading}
-							activeConversationId={chat.activeConversationId}
-						/>
 						{/* 扩展问卷：非模态内联面板，插在输入框上方，对话内容保持可见 */}
 						{chat.dialog && <Dialog dialog={chat.dialog} send={send} />}
 						<ChatInput

@@ -112,7 +112,7 @@ try {
 	const mdPrevInfo = themes.themes.find((t) => t.id === "md-preview");
 	check(
 		"theme-name header gives display names",
-		whiteInfo?.name === "白色" && mdPrevInfo?.name === "紫晕",
+		whiteInfo?.name === "White" && mdPrevInfo?.name === "Markdown preview",
 		`white=${whiteInfo?.name} md-preview=${mdPrevInfo?.name}`,
 	);
 	check("white is builtin", whiteInfo?.builtin === true);
@@ -121,7 +121,7 @@ try {
 
 	// 2. Choosing white injects a <link> and applies the palette.
 	await openThemeMenu(page);
-	await page.locator(".dd-item", { hasText: "白色" }).first().click();
+	await page.locator(".dd-item", { hasText: "White" }).first().click();
 	await page.waitForTimeout(1500);
 	const hasLink = await page.evaluate(() =>
 		document.getElementById("theme-stylesheet")?.getAttribute("href"),

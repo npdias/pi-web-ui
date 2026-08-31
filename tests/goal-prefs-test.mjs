@@ -35,6 +35,7 @@ async function startServer(dataDir) {
 		env: {
 			...process.env,
 			PORT: String(PORT),
+			PI_WEB_ENABLE_LEGACY_GOAL_REVIEW: "1",
 			PI_WEB_DATA_DIR: dataDir,
 			PI_WEB_CWD: PROJ,
 		},

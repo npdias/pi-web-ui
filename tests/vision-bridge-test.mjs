@@ -326,6 +326,14 @@ try {
 	await c.waitForState((s) => s.model?.id === "deepseek-main", 15000);
 	console.log("  · main model:", "deepseek-main");
 
+	// Legacy fixture opt-in: production defaults this bridge off.
+	c.send({ type: "set_settings", visionBridgeEnabled: true });
+	await c.waitFor(
+		"settings_state",
+		10000,
+		(m) => m.settings?.visionBridgeEnabled === true,
+	);
+
 	// Send one prompt with a pasted image.
 	c.send({
 		type: "prompt",
@@ -429,6 +437,7 @@ try {
 
 	// -- settings: pick a specific vision model ------------------------------
 	// settings_state must carry the vision-bridge fields + the model picker list
+	c.send({ type: "get_settings" });
 	const ss = await c.waitFor(
 		"settings_state",
 		10000,
