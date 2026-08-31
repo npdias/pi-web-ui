@@ -17,10 +17,17 @@ it("pins DSH trajectory donor commit and MIT license", async () => {
 });
 
 it("includes the third-party notice in the packed npm artifact", async () => {
+	const npmExecPath = process.env.npm_execpath;
+	if (!npmExecPath) {
+		throw new Error("npm_execpath is required for package dry-run test");
+	}
 	const { stdout } = await execFileAsync(
-		"npm",
-		["pack", "--dry-run", "--json", "--ignore-scripts"],
-		{ encoding: "utf8" },
+		process.execPath,
+		[npmExecPath, "pack", "--dry-run", "--json", "--ignore-scripts"],
+		{
+			encoding: "utf8",
+			env: { ...process.env, PATH: "" },
+		},
 	);
 	const packResults = JSON.parse(stdout) as Array<{
 		files: Array<{ path: string }>;
