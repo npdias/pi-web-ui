@@ -126,6 +126,8 @@ const MAX_TEXT_LENGTH = 64 * 1024;
 const MAX_OBJECT_KEYS = 256;
 const MAX_ARRAY_ITEMS = 1_000;
 const MAX_JSON_DEPTH = 12;
+const TRUNCATED_MARKER = "[TRUNCATED]";
+const TRUNCATED_OBJECT_KEY = "__telemetry_truncated__";
 
 export class TelemetryProtocolError extends Error {
 	constructor(message: string) {
@@ -141,11 +143,16 @@ function objectValue(value: unknown, name: string): Record<string, unknown> {
 	return value as Record<string, unknown>;
 }
 
+function truncateDisplayString(value: string, max: number): string {
+	if (value.length <= max) return value;
+	return `${value.slice(0, Math.max(0, max - TRUNCATED_MARKER.length))}${TRUNCATED_MARKER}`;
+}
+
 function boundedString(value: unknown, name: string, max = MAX_TEXT_LENGTH): string {
-	if (typeof value !== "string" || value.length === 0 || value.length > max) {
-		throw new TelemetryProtocolError(`${name} must be a bounded non-empty string`);
+	if (typeof value !== "string" || value.length === 0) {
+		throw new TelemetryProtocolError(`${name} must be a non-empty string`);
 	}
-	return value;
+	return truncateDisplayString(value, max);
 }
 
 function optionalString(
@@ -154,10 +161,10 @@ function optionalString(
 	max = MAX_TEXT_LENGTH,
 ): string | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "string" || value.length > max) {
-		throw new TelemetryProtocolError(`${name} must be a bounded string`);
+	if (typeof value !== "string") {
+		throw new TelemetryProtocolError(`${name} must be a string`);
 	}
-	return value;
+	return truncateDisplayString(value, max);
 }
 
 function safeInteger(value: unknown, name: string, minimum = 0): number {
@@ -233,36 +240,35 @@ function isSecretKey(value: string): boolean {
 
 function sanitizeJson(value: unknown, name: string, depth = 0): TelemetryJson {
 	if (depth > MAX_JSON_DEPTH) {
-		throw new TelemetryProtocolError(`${name} exceeds maximum nesting depth`);
+		return TRUNCATED_MARKER;
 	}
 	if (value === null || typeof value === "boolean") return value;
 	if (typeof value === "number") return finiteNumber(value, name);
 	if (typeof value === "string") {
-		if (value.length > MAX_TEXT_LENGTH) {
-			throw new TelemetryProtocolError(`${name} string is too long`);
-		}
-		return value;
+		return truncateDisplayString(value, MAX_TEXT_LENGTH);
 	}
 	if (Array.isArray(value)) {
-		if (value.length > MAX_ARRAY_ITEMS) {
-			throw new TelemetryProtocolError(`${name} array is too large`);
-		}
-		return value.map((item, index) =>
+		const truncated = value.length > MAX_ARRAY_ITEMS;
+		const kept = truncated ? value.slice(0, MAX_ARRAY_ITEMS - 1) : value;
+		const output = kept.map((item, index) =>
 			sanitizeJson(item, `${name}[${index}]`, depth + 1),
 		);
+		if (truncated) output.push(TRUNCATED_MARKER);
+		return output;
 	}
 	const input = objectValue(value, name);
 	const entries = Object.entries(input);
-	if (entries.length > MAX_OBJECT_KEYS) {
-		throw new TelemetryProtocolError(`${name} object has too many keys`);
-	}
+	const truncated = entries.length > MAX_OBJECT_KEYS;
+	const kept = truncated ? entries.slice(0, MAX_OBJECT_KEYS - 1) : entries;
 	const output: Record<string, TelemetryJson> = {};
-	for (const [key, item] of entries) {
+	for (const [key, item] of kept) {
 		if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
-		output[key] = isSecretKey(key)
+		const displayKey = truncateDisplayString(key, MAX_IDENTIFIER_LENGTH);
+		output[displayKey] = isSecretKey(key)
 			? REDACTED
 			: sanitizeJson(item, `${name}.${key}`, depth + 1);
 	}
+	if (truncated) output[TRUNCATED_OBJECT_KEY] = TRUNCATED_MARKER;
 	return output;
 }
 

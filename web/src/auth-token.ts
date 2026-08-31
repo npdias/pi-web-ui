@@ -8,15 +8,30 @@
  */
 const KEY = "pi-web-ui:token";
 
+interface BrowserAuthGlobals {
+	readonly location?: { readonly href: string };
+	readonly history?: { replaceState(data: unknown, unused: string, url?: string): void };
+	readonly localStorage?: {
+		getItem(key: string): string | null;
+		setItem(key: string, value: string): void;
+	};
+}
+
+function browserGlobals(): BrowserAuthGlobals {
+	return globalThis as unknown as BrowserAuthGlobals;
+}
+
 /** 应用启动时调用一次：吸收 URL 里的 ?token= 并清洗地址栏。 */
 export function initAuthToken(): void {
 	try {
-		const url = new URL(window.location.href);
+		const globals = browserGlobals();
+		if (!globals.location || !globals.history || !globals.localStorage) return;
+		const url = new URL(globals.location.href);
 		const t = url.searchParams.get("token");
 		if (t) {
-			localStorage.setItem(KEY, t.trim());
+			globals.localStorage.setItem(KEY, t.trim());
 			url.searchParams.delete("token");
-			window.history.replaceState(null, "", url.toString());
+			globals.history.replaceState(null, "", url.toString());
 		}
 	} catch {
 		/* ignore */
@@ -26,7 +41,7 @@ export function initAuthToken(): void {
 /** 当前持久化的 token（未设置时为空串）。 */
 export function authToken(): string {
 	try {
-		return localStorage.getItem(KEY) ?? "";
+		return browserGlobals().localStorage?.getItem(KEY) ?? "";
 	} catch {
 		return "";
 	}

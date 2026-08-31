@@ -107,6 +107,9 @@ function validatedQuery(req: Request, allowed: ReadonlySet<string>): URLSearchPa
 	const output = new URLSearchParams();
 	const seen = new Set<string>();
 	for (const [name, value] of input) {
+		// PI_WEB_TOKEN auth middleware consumes this browser-only query value.
+		// Never forward it to telemetry core or reject Vite-relative requests for it.
+		if (name === "token") continue;
 		if (!allowed.has(name)) {
 			throw new ObserveProxyError(400, "unsupported query parameter");
 		}

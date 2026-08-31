@@ -17,3 +17,12 @@
 | `PI_WEB_ALLOW_ORIGINS` | 空 | 逗号分隔的额外 Origin 白名单（如 `http://localhost:5173` dev 代理、反代场景），用于绕过 WS 的 Origin/Host 同权威校验 |
 | `PI_WEB_ALLOW_HOSTS` | 空 | 可选严格模式：设置了才启用，请求 Host 的 hostname 必须在此白名单（逗号分隔） |
 | `PI_WEB_TOKEN` | 空 | **可选共享口令鉴权**：设置后所有 HTTP/WS 请求必须携带（`Authorization: Bearer` / `X-PI-Token` 头、`?token=` 参数或 `pi_web_token` cookie 任一匹配；浏览器首次经 `?token=xxx` 进入后存 localStorage 并下发 HttpOnly cookie）；`/api/health` 保持开放供探针。前端 `web/src/auth-token.ts` 统一注入；回归：`tests/token-auth-test.mjs`（端口 8975） |
+| `UA_TELEMETRY_HTTP` | `http://127.0.0.1:8765` | Observe 只读遥测上游。只接受 loopback `http://` origin；拒绝凭据、路径、query、fragment。配置无效时主 UI 继续启动，`/api/observe/*` 返回 503。 |
+
+## Observe 遥测限制
+
+- `/api/observe/*` 只允许 GET。代理最多并发 16 个上游请求；header 超时 5 秒，JSON body 超时 10 秒，SSE 空闲超时 35 秒。
+- 原始 query 最长 2048 字符。`limit` 范围为 1..1000；筛选值最长 256 字符；`Last-Event-ID` 最长 64 字符。JSON 响应最多 16 MiB。
+- 浏览器首次连接及普通重连通过反向分页加载最新记录。每页最多 1000 个，内存最多保留 10000 条。旧 cursor 高于当前上游 high-water 时，浏览器清除旧投影并从当前 high-water 继续。
+- 原始事件不写入浏览器存储。浏览器只持有内存投影；显示字符串超过 65536 个 UTF-16 code units、标识符超过 256 个 code units、过深或过宽结构时保留前缀并追加 `[TRUNCATED]`。事件 sequence 仍会推进 cursor。
+- `PI_WEB_TOKEN` 通过现有 `withToken` bootstrap 或 HttpOnly cookie 送到 Pi Web 服务。Observe 代理在转发到遥测 core 前移除 token。

@@ -1,4 +1,5 @@
 import { appUrl } from "../base-url.js";
+import { withToken } from "../auth-token.js";
 import {
 	TelemetryProtocolError,
 	parseTelemetryEvent,
@@ -238,6 +239,12 @@ function gapKey(gap: TelemetryReplayGap): string {
 	return `${gap.requested}:${gap.earliest_available ?? "none"}:${gap.resume_after}`;
 }
 
+function pageHighWater(page: TelemetryEventsPage): number {
+	let highWater = page.next_cursor ?? page.gap?.resume_after ?? 0;
+	for (const event of page.events) highWater = Math.max(highWater, event.sequence);
+	return highWater;
+}
+
 function aborted(error: unknown, signal: AbortSignal): boolean {
 	return signal.aborted || (error instanceof DOMException && error.name === "AbortError");
 }
@@ -254,7 +261,6 @@ export class TelemetryStore {
 	private records: TelemetryRecord[] = [];
 	private cursor: number | null;
 	private preferences: TelemetryUiPreferences;
-	private needsHistoryHydration: boolean;
 	private status: StoreStatus = "idle";
 	private generation = 0;
 	private controller: AbortController | undefined;
@@ -268,7 +274,6 @@ export class TelemetryStore {
 		this.sleepImpl = options.sleep ?? defaultSleep;
 		const loadedCursor = loadCursor(this.storage);
 		this.cursor = loadedCursor.cursor;
-		this.needsHistoryHydration = loadedCursor.persisted && loadedCursor.cursor > 0;
 		this.preferences = loadPreferences(this.storage);
 	}
 
@@ -279,11 +284,8 @@ export class TelemetryStore {
 		this.controller = controller;
 		this.setStatus("replaying");
 		try {
-			if (this.needsHistoryHydration && this.records.length === 0) {
-				await this.hydrateHistory(generation, controller.signal);
-				if (!this.isActive(generation, controller.signal)) return;
-				this.needsHistoryHydration = false;
-			}
+			await this.hydrateHistory(generation, controller.signal);
+			if (!this.isActive(generation, controller.signal)) return;
 			await this.replay(generation, controller.signal);
 		} catch (error) {
 			if (!this.isActive(generation, controller.signal)) return;
@@ -340,9 +342,10 @@ export class TelemetryStore {
 		query: TelemetryQuery,
 		signal?: AbortSignal,
 	): Promise<TelemetryEventsPage> {
-		const response = await this.fetchImpl(queryUrl(query), {
+		const response = await this.fetchImpl(withToken(queryUrl(query)), {
 			method: "GET",
 			headers: { Accept: "application/json" },
+			credentials: "same-origin",
 			signal,
 		});
 		if (!response.ok) {
@@ -399,16 +402,23 @@ export class TelemetryStore {
 	}
 
 	private async hydrateHistory(generation: number, signal: AbortSignal): Promise<void> {
-		if (this.cursor === null || this.cursor <= 0) return;
-		let before =
-			this.cursor === Number.MAX_SAFE_INTEGER ? this.cursor : this.cursor + 1;
-		while (this.records.length < this.maxRecords) {
-			const limit = Math.min(REPLAY_PAGE_SIZE, this.maxRecords - this.records.length);
+		let before = Number.MAX_SAFE_INTEGER;
+		let remaining = this.maxRecords;
+		let firstPage = true;
+		while (remaining > 0) {
+			const limit = Math.min(REPLAY_PAGE_SIZE, remaining);
 			const page = await this.fetchPage({ before, limit }, signal);
 			if (!this.isActive(generation, signal)) return;
+			if (firstPage) {
+				const highWater = pageHighWater(page);
+				if (this.cursor !== null && highWater < this.cursor) this.clearRecords();
+				this.replaceCursor(highWater);
+				firstPage = false;
+			}
 			this.addEvents(page.events);
 			if (page.gap) this.addGap(page.gap);
 			this.notify();
+			remaining -= page.events.length;
 			if (page.gap || page.events.length === 0 || page.events.length < limit) return;
 			const oldestSequence = page.events.reduce(
 				(oldest, event) => Math.min(oldest, event.sequence),
@@ -425,8 +435,10 @@ export class TelemetryStore {
 	): Promise<void> {
 		let retry = 0;
 		while (this.isActive(generation, controller.signal)) {
+			let resumeFromGap = false;
 			try {
-				await this.openStream(generation, controller.signal);
+				resumeFromGap =
+					(await this.openStream(generation, controller.signal)) === "gap";
 			} catch (error) {
 				if (!this.isActive(generation, controller.signal)) return;
 				if (aborted(error, controller.signal)) return;
@@ -443,6 +455,10 @@ export class TelemetryStore {
 			if (!this.isActive(generation, controller.signal)) return;
 			this.setStatus("replaying");
 			try {
+				if (!resumeFromGap) {
+					await this.hydrateHistory(generation, controller.signal);
+					if (!this.isActive(generation, controller.signal)) return;
+				}
 				await this.replay(generation, controller.signal);
 			} catch (error) {
 				if (!this.isActive(generation, controller.signal)) return;
@@ -452,16 +468,20 @@ export class TelemetryStore {
 		}
 	}
 
-	private async openStream(generation: number, signal: AbortSignal): Promise<void> {
+	private async openStream(
+		generation: number,
+		signal: AbortSignal,
+	): Promise<"eof" | "gap"> {
 		this.setStatus("connecting");
 		const headers = new Headers({ Accept: "text/event-stream" });
 		if (this.cursor !== null) headers.set("Last-Event-ID", String(this.cursor));
-		const response = await this.fetchImpl(appUrl("/api/observe/stream"), {
+		const response = await this.fetchImpl(withToken(appUrl("/api/observe/stream")), {
 			method: "GET",
 			headers,
+			credentials: "same-origin",
 			signal,
 		});
-		if (!this.isActive(generation, signal)) return;
+		if (!this.isActive(generation, signal)) return "eof";
 		if (!response.ok) {
 			throw new TelemetryProtocolError(
 				`telemetry stream failed with HTTP ${response.status}`,
@@ -479,7 +499,7 @@ export class TelemetryStore {
 		}
 		this.setStatus("connected");
 		for await (const frame of sseFrames(response.body)) {
-			if (!this.isActive(generation, signal)) return;
+			if (!this.isActive(generation, signal)) return "eof";
 			if (frame.event === "telemetry") {
 				const item = parseFrameJson(frame.data, parseTelemetryEvent, "telemetry event");
 				if (frame.id !== undefined) {
@@ -497,9 +517,10 @@ export class TelemetryStore {
 				this.addGap(gap);
 				this.advanceCursor(gap.resume_after);
 				this.notify();
-				return;
+				return "gap";
 			}
 		}
+		return "eof";
 	}
 
 	private isActive(generation: number, signal: AbortSignal): boolean {
@@ -557,12 +578,22 @@ export class TelemetryStore {
 	private advanceCursor(value: number | null | undefined): void {
 		if (value === null || value === undefined) return;
 		if (this.cursor !== null && value <= this.cursor) return;
+		this.replaceCursor(value);
+	}
+
+	private replaceCursor(value: number): void {
 		this.cursor = value;
 		try {
 			this.storage?.setItem(CURSOR_STORAGE_KEY, String(value));
 		} catch {
 			// Cursor remains usable for this page when browser storage is unavailable.
 		}
+	}
+
+	private clearRecords(): void {
+		this.records = [];
+		this.eventSequences.clear();
+		this.gapKeys.clear();
 	}
 
 	private notify(): void {

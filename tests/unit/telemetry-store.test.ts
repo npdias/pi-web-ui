@@ -85,6 +85,34 @@ class MemoryStorage {
 }
 
 describe("TelemetryStore", () => {
+	it("truncates core-valid long display strings without stalling later events", async () => {
+		const storage = new MemoryStorage();
+		const rawSummary = `prefix-${"x".repeat(70 * 1024)}-private-tail`;
+		const store = new TelemetryStore({
+			storage,
+			fetch: async (url, init) =>
+				url.includes("/events")
+					? page(
+							[
+								event(1, { summary: rawSummary }),
+								event(2, { summary: "later-event" }),
+							],
+							null,
+							2,
+						)
+					: pendingResponse(init?.signal),
+		});
+
+		await store.connect();
+
+		expect(store.snapshot().events.map((item) => item.sequence)).toEqual([1, 2]);
+		expect(store.snapshot().cursor).toBe(2);
+		expect(store.snapshot().events[0].summary).toMatch(/\[TRUNCATED\]$/);
+		expect(store.snapshot().events[0].summary?.length).toBeLessThan(rawSummary.length);
+		expect([...storage.values.values()].join("\n")).not.toContain("private-tail");
+		store.disconnect();
+	});
+
 	it("orders by sequence and deduplicates replayed events", async () => {
 		const calls: string[] = [];
 		const store = new TelemetryStore({
@@ -106,26 +134,31 @@ describe("TelemetryStore", () => {
 			),
 		).toEqual([1, 2, 3]);
 		expect(store.snapshot().cursor).toBe(3);
-		expect(calls[0]).toBe("/api/observe/events?after=0&limit=1000");
+		expect(calls[0]).toBe(
+			`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000`,
+		);
 		store.disconnect();
 	});
 
-	it("records an explicit gap and resumes from resume_after without skipping earliest", async () => {
+	it("keeps an explicit gap while reverse hydration advances to newest retained data", async () => {
 		const urls: string[] = [];
 		const storage = new MemoryStorage();
 		const store = new TelemetryStore({
 			storage,
 			fetch: async (url, init) => {
 				urls.push(url);
-				if (url === "/api/observe/events?after=0&limit=1000") {
+				if (
+					url ===
+					`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000`
+				) {
 					return page(
-						[event(1)],
-						{ requested: 1, earliest_available: 3, resume_after: 2 },
-						1,
+						[event(3)],
+						{ requested: 0, earliest_available: 3, resume_after: 2 },
+						3,
 					);
 				}
-				if (url === "/api/observe/events?after=2&limit=1000") {
-					return page([event(3)], null, 3);
+				if (url === "/api/observe/events?after=3&limit=1000") {
+					return page([], null, null);
 				}
 				return pendingResponse(init?.signal);
 			},
@@ -134,14 +167,14 @@ describe("TelemetryStore", () => {
 		await store.connect();
 
 		expect(urls.slice(0, 2)).toEqual([
-			"/api/observe/events?after=0&limit=1000",
-			"/api/observe/events?after=2&limit=1000",
+			`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000`,
+			"/api/observe/events?after=3&limit=1000",
 		]);
 		expect(
 			store.snapshot().records.map((record) =>
 				record.type === "event" ? record.event.sequence : `gap:${record.gap.resume_after}`,
 			),
-		).toEqual([1, "gap:2", 3]);
+		).toEqual(["gap:2", 3]);
 		expect(store.snapshot().cursor).toBe(3);
 		expect([...storage.values.values()]).toContain("3");
 		store.disconnect();
@@ -150,7 +183,6 @@ describe("TelemetryStore", () => {
 	it("reconnects with the latest event sequence after backoff", async () => {
 		const calls: Array<{ url: string; lastEventId?: string }> = [];
 		const delays: number[] = [];
-		let eventQueries = 0;
 		let streams = 0;
 		const store = new TelemetryStore({
 			backoffMs: [1_000, 2_000],
@@ -162,12 +194,12 @@ describe("TelemetryStore", () => {
 					url,
 					lastEventId: new Headers(init?.headers).get("Last-Event-ID") ?? undefined,
 				});
-				if (url.includes("/events")) {
-					eventQueries++;
-					return eventQueries === 1
+				if (url.includes("before=")) {
+					return streams === 0
 						? page([event(2)], null, 2)
-						: page([], null, null);
+						: page([event(2), event(3)], null, 3);
 				}
+				if (url.includes("/events")) return page([], null, null);
 				streams++;
 				if (streams === 1) {
 					return sse(
@@ -316,7 +348,10 @@ describe("TelemetryStore", () => {
 			storage,
 			fetch: async (url, init) => {
 				urls.push(url);
-				if (url === "/api/observe/events?before=4&limit=1000") {
+				if (
+					url ===
+					`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000`
+				) {
 					return page([event(1), event(2), event(3)], null, 3);
 				}
 				if (url === "/api/observe/events?after=3&limit=1000") {
@@ -329,11 +364,117 @@ describe("TelemetryStore", () => {
 		await refreshed.connect();
 
 		expect(urls.slice(0, 2)).toEqual([
-			"/api/observe/events?before=4&limit=1000",
+			`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000`,
 			"/api/observe/events?after=3&limit=1000",
 		]);
 		expect(refreshed.snapshot().events.map((item) => item.sequence)).toEqual([1, 2, 3]);
 		refreshed.disconnect();
+	});
+
+	it("resets a persisted cursor to a restarted core high-water before streaming", async () => {
+		const storage = new MemoryStorage();
+		storage.setItem("pi-web-ui.observe.cursor.v1", "100");
+		const calls: Array<{ url: string; lastEventId?: string }> = [];
+		const store = new TelemetryStore({
+			storage,
+			maxRecords: 3,
+			fetch: async (url, init) => {
+				calls.push({
+					url,
+					lastEventId: new Headers(init?.headers).get("Last-Event-ID") ?? undefined,
+				});
+				if (url.includes("before=")) return page([event(1), event(2), event(3)], null, 3);
+				if (url.includes("after=3")) return page([], null, null);
+				if (url.includes("/stream")) {
+					return sse(`id: 4\nevent: telemetry\ndata: ${JSON.stringify(event(4))}\n\n`);
+				}
+				return page([], null, null);
+			},
+		});
+
+		await store.connect();
+		await waitFor(() => store.snapshot().events.some((item) => item.sequence === 4));
+
+		expect(store.snapshot().cursor).toBe(4);
+		expect(storage.getItem("pi-web-ui.observe.cursor.v1")).toBe("4");
+		expect(calls.find((call) => call.url.includes("/stream"))?.lastEventId).toBe("3");
+		store.disconnect();
+	});
+
+	it("hydrates only the newest retained records before replay", async () => {
+		const urls: string[] = [];
+		let returnedEvents = 0;
+		const allEvents = Array.from({ length: 3_000 }, (_, index) => event(index + 1));
+		const store = new TelemetryStore({
+			maxRecords: 3,
+			fetch: async (url, init) => {
+				urls.push(url);
+				if (url.includes("before=")) {
+					returnedEvents += 3;
+					return page(allEvents.slice(-3), null, 3_000);
+				}
+				if (url.includes("after=3000")) return page([], null, null);
+				if (url.includes("after=0")) {
+					returnedEvents += 1_000;
+					return page(allEvents.slice(0, 1_000), null, 1_000);
+				}
+				if (url.includes("after=1000")) {
+					returnedEvents += 1_000;
+					return page(allEvents.slice(1_000, 2_000), null, 2_000);
+				}
+				if (url.includes("after=2000")) {
+					returnedEvents += 1_000;
+					return page(allEvents.slice(2_000), null, 3_000);
+				}
+				return pendingResponse(init?.signal);
+			},
+		});
+
+		await store.connect();
+
+		expect(store.snapshot().events.map((item) => item.sequence)).toEqual([
+			2_998,
+			2_999,
+			3_000,
+		]);
+		expect(returnedEvents).toBe(3);
+		expect(urls.filter((url) => url.includes("/events"))).toHaveLength(2);
+		store.disconnect();
+	});
+
+	it("authenticates JSON and SSE fetches through Vite-relative paths", async () => {
+		const priorStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+		const authStorage = new MemoryStorage();
+		authStorage.setItem("pi-web-ui:token", "dev secret");
+		Object.defineProperty(globalThis, "localStorage", {
+			configurable: true,
+			value: authStorage,
+		});
+		const calls: Array<{ url: string; credentials?: RequestInit["credentials"] }> = [];
+		const store = new TelemetryStore({
+			storage: new MemoryStorage(),
+			fetch: async (url, init) => {
+				calls.push({ url, credentials: init?.credentials });
+				if (url.includes("/events")) return page([], null, null);
+				return pendingResponse(init?.signal);
+			},
+		});
+
+		try {
+			await store.connect();
+			await waitFor(() => calls.some((call) => call.url.includes("/stream")));
+
+			expect(calls.map((call) => call.url)).toEqual([
+				`/api/observe/events?before=${Number.MAX_SAFE_INTEGER}&limit=1000&token=dev%20secret`,
+				"/api/observe/events?after=0&limit=1000&token=dev%20secret",
+				"/api/observe/stream?token=dev%20secret",
+			]);
+			expect(calls.every((call) => call.credentials === "same-origin")).toBe(true);
+		} finally {
+			store.disconnect();
+			if (priorStorage) Object.defineProperty(globalThis, "localStorage", priorStorage);
+			else delete (globalThis as { localStorage?: unknown }).localStorage;
+		}
 	});
 
 	it("redacts secret-key attributes at the browser boundary", async () => {

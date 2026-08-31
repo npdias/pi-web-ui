@@ -9,6 +9,7 @@ const UI_PORT = 8968;
 const UPSTREAM_PORT = 8969;
 const UI_ORIGIN = `http://127.0.0.1:${UI_PORT}`;
 const UPSTREAM_ORIGIN = `http://127.0.0.1:${UPSTREAM_PORT}`;
+const UI_TOKEN = "vite-dev-token";
 
 const tempDir = mkdtempSync(join(tmpdir(), "pi-observe-proxy-test-"));
 const seen = [];
@@ -140,6 +141,12 @@ async function waitForUi() {
 	throw new Error("pi-web-ui did not become ready");
 }
 
+function authenticatedUiUrl(path) {
+	const url = new URL(path, UI_ORIGIN);
+	url.searchParams.set("token", UI_TOKEN);
+	return url;
+}
+
 function assertNoBrowserHeaders(headers) {
 	for (const name of [
 		"authorization",
@@ -196,7 +203,7 @@ async function abortHeldStream() {
 		heldStreamClosedResolve = resolve;
 	});
 	await new Promise((resolve, reject) => {
-		const req = httpRequest(`${UI_ORIGIN}/api/observe/stream`, (res) => {
+		const req = httpRequest(authenticatedUiUrl("/api/observe/stream"), (res) => {
 			res.once("data", () => {
 				res.destroy();
 				resolve();
@@ -249,6 +256,7 @@ try {
 				PI_WEB_DATA_DIR: tempDir,
 				PI_WEB_CWD: process.cwd(),
 				PI_CODING_AGENT_DIR: join(tempDir, "agent"),
+				PI_WEB_TOKEN: UI_TOKEN,
 				UA_TELEMETRY_HTTP: UPSTREAM_ORIGIN,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
@@ -263,7 +271,7 @@ try {
 
 	const eventQuery =
 		"after=7&limit=100&source=pi&kind=tool.execution&severity=warning&trace_id=trace_1";
-	const eventsResponse = await fetch(`${UI_ORIGIN}/api/observe/events?${eventQuery}`, {
+	const eventsResponse = await fetch(authenticatedUiUrl(`/api/observe/events?${eventQuery}`), {
 		headers: {
 			Authorization: "Bearer browser-secret",
 			Cookie: "pi_web_token=browser-secret",
@@ -291,7 +299,7 @@ try {
 		["/api/observe/sources", "sources"],
 		["/api/observe/events/tel_8", "event"],
 	]) {
-		const response = await fetch(UI_ORIGIN + path);
+		const response = await fetch(authenticatedUiUrl(path));
 		assert.equal(response.status, 200, path);
 		const body = await response.json();
 		assert.ok(expected in body || body.status === expected, path);
@@ -310,17 +318,17 @@ try {
 		`/api/observe/events/${"x".repeat(257)}`,
 	]) {
 		const before = seen.length;
-		const response = await fetch(UI_ORIGIN + path);
+		const response = await fetch(authenticatedUiUrl(path));
 		assert.equal(response.status, 400, path);
 		assert.equal(seen.length, before, `${path} reached upstream`);
 	}
 
-	const oversized = await fetch(`${UI_ORIGIN}/api/observe/events?kind=oversize`);
+	const oversized = await fetch(authenticatedUiUrl("/api/observe/events?kind=oversize"));
 	assert.equal(oversized.status, 413);
 
 	holdHealth = true;
 	const occupied = Array.from({ length: 16 }, () =>
-		fetch(`${UI_ORIGIN}/api/observe/health`),
+		fetch(authenticatedUiUrl("/api/observe/health")),
 	);
 	await waitFor(
 		() => heldHealthResponses.length === 16,
@@ -328,7 +336,7 @@ try {
 	);
 	const beforeOverflow = seen.length;
 	const overflow = await Promise.race([
-		fetch(`${UI_ORIGIN}/api/observe/health`),
+		fetch(authenticatedUiUrl("/api/observe/health")),
 		new Promise((resolve) => setTimeout(() => resolve({ status: "timeout" }), 1_000)),
 	]);
 	assert.equal(overflow.status, 503);
@@ -348,13 +356,13 @@ try {
 
 	for (const method of ["POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]) {
 		const before = seen.length;
-		const response = await fetch(`${UI_ORIGIN}/api/observe/events`, { method });
+		const response = await fetch(authenticatedUiUrl("/api/observe/events"), { method });
 		assert.equal(response.status, 405, method);
 		assert.equal(response.headers.get("allow"), "GET", method);
 		assert.equal(seen.length, before, `${method} reached upstream`);
 	}
 
-	const streamResponse = await fetch(`${UI_ORIGIN}/api/observe/stream?source=pi`, {
+	const streamResponse = await fetch(authenticatedUiUrl("/api/observe/stream?source=pi"), {
 		headers: {
 			"Last-Event-ID": "7",
 			Authorization: "Bearer browser-secret",
@@ -374,14 +382,14 @@ try {
 
 	for (const header of ["-1", "1.5", "x".repeat(65)]) {
 		const before = seen.length;
-		const response = await fetch(`${UI_ORIGIN}/api/observe/stream`, {
+		const response = await fetch(authenticatedUiUrl("/api/observe/stream"), {
 			headers: { "Last-Event-ID": header },
 		});
 		assert.equal(response.status, 400, header);
 		assert.equal(seen.length, before, `${header} reached upstream`);
 	}
 	const conflictingCursorCount = seen.length;
-	const conflictingCursor = await fetch(`${UI_ORIGIN}/api/observe/stream?after=1`, {
+	const conflictingCursor = await fetch(authenticatedUiUrl("/api/observe/stream?after=1"), {
 		headers: { "Last-Event-ID": "1" },
 	});
 	assert.equal(conflictingCursor.status, 400);
