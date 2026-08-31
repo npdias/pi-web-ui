@@ -22,8 +22,6 @@ export interface PiEventMapperOptions {
 	source: PiTelemetrySource;
 	sessionId: string;
 	conversationId: string;
-	/** Optional unique namespace for span/tool IDs when conversation ID stays stable. */
-	idNamespace?: string;
 	wallNow?: () => number;
 	monotonicNow?: () => number;
 }
@@ -449,7 +447,6 @@ export class PiEventMapper {
 	private readonly source: PiTelemetrySource;
 	private readonly sessionId: string;
 	private readonly conversationId: string;
-	private readonly idNamespace: string;
 	private readonly wallNow: () => number;
 	private readonly monotonicNow: () => number;
 	private runSequence = 0;
@@ -464,7 +461,6 @@ export class PiEventMapper {
 		this.source = { ...options.source };
 		this.sessionId = options.sessionId;
 		this.conversationId = options.conversationId;
-		this.idNamespace = options.idNamespace ?? options.conversationId;
 		this.wallNow = options.wallNow ?? Date.now;
 		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
 	}
@@ -482,7 +478,7 @@ export class PiEventMapper {
 			duplicateStart = this.currentRun !== null;
 			if (!this.currentRun) {
 				this.currentRun = {
-					id: `${this.idNamespace}:run:${++this.runSequence}`,
+					id: `${this.conversationId}:run:${++this.runSequence}`,
 					startedAt: monotonicTime,
 				};
 			}
@@ -492,9 +488,9 @@ export class PiEventMapper {
 				const sequence = ++this.turnSequence;
 				this.currentTurn = {
 					ids: {
-						turn_id: `${this.idNamespace}:turn:${sequence}`,
-						step_id: `${this.idNamespace}:step:${sequence}`,
-						request_id: `${this.idNamespace}:request:${sequence}`,
+						turn_id: `${this.conversationId}:turn:${sequence}`,
+						step_id: `${this.conversationId}:step:${sequence}`,
+						request_id: `${this.conversationId}:request:${sequence}`,
 					},
 					startedAt: monotonicTime,
 				};
@@ -597,7 +593,7 @@ export class PiEventMapper {
 						wallTime,
 						parentId: span.correlation.request_id ?? span.correlation.trace_id ?? this.sessionId,
 						span: span.correlation,
-						toolCallId: this.telemetryToolCallId(event.toolCallId),
+						toolCallId: event.toolCallId,
 						attributes: {
 							tool_name: event.toolName,
 							...(existing ? { duplicate_start: true } : {}),
@@ -619,7 +615,7 @@ export class PiEventMapper {
 						wallTime,
 						parentId: span.request_id ?? span.trace_id ?? this.sessionId,
 						span,
-						toolCallId: this.telemetryToolCallId(event.toolCallId),
+						toolCallId: event.toolCallId,
 						durationMs: started
 							? Math.max(0, monotonicTime - started.startedAt)
 							: undefined,
@@ -721,12 +717,6 @@ export class PiEventMapper {
 			...(this.currentRun ? { trace_id: this.currentRun.id } : {}),
 			...(this.currentTurn?.ids ?? {}),
 		};
-	}
-
-	private telemetryToolCallId(toolCallId: string): string {
-		return this.idNamespace === this.conversationId
-			? toolCallId
-			: `${this.idNamespace}:tool:${toolCallId}`;
 	}
 
 	private record(input: {

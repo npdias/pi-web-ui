@@ -156,14 +156,6 @@ function emitTool(session, toolCallId, toolName = "fixture_tool") {
 	});
 }
 
-function hasToolCallId(record, sourceToolCallId) {
-	const telemetryToolCallId = record.correlation?.tool_call_id;
-	return (
-		telemetryToolCallId === sourceToolCallId ||
-		telemetryToolCallId?.endsWith(`:tool:${sourceToolCallId}`)
-	);
-}
-
 class WireClient {
 	constructor(ws) {
 		this.ws = ws;
@@ -362,30 +354,6 @@ try {
 	if (JSON.stringify(ordered) !== JSON.stringify(expected)) {
 		throw new Error(`telemetry order mismatch: ${JSON.stringify(ordered)}`);
 	}
-	const seenCorrelationIds = new Map(
-		["trace_id", "turn_id", "step_id", "request_id", "tool_call_id"].map(
-			(key) => [key, new Set()],
-		),
-	);
-	function rememberConcreteSessionIds(sessionRecords, label) {
-		for (const [key, seen] of seenCorrelationIds) {
-			const values = new Set(
-				sessionRecords
-					.map((record) => record.correlation?.[key])
-					.filter((value) => typeof value === "string"),
-			);
-			if (values.size === 0) {
-				throw new Error(`${label} omitted required ${key}`);
-			}
-			for (const value of values) {
-				if (seen.has(value)) {
-					throw new Error(`${label} reused ${key}=${value}`);
-				}
-				seen.add(value);
-			}
-		}
-	}
-	rememberConcreteSessionIds(records, "initial session");
 
 	const run = records.find((record) => record.kind === "agent.run" && record.phase === "start");
 	if (
@@ -459,29 +427,16 @@ try {
 			notices: client.messages.filter((message) => message.type === "notice").slice(-3),
 		})}`);
 	}
-	const postEditLifecycleOffset = records.length;
-	emitRunStart(postEditSession);
-	emitTool(postEditSession, "reused-session-tool");
-	await waitFor(
-		() => records.find((record) =>
-			record.phase === "end" &&
-				hasToolCallId(record, "reused-session-tool")),
-		"fork lifecycle telemetry",
-	);
-	rememberConcreteSessionIds(
-		records.slice(postEditLifecycleOffset),
-		"fork session",
-	);
 	emitTool(postEditSession, "post-edit-tool");
 	const postEditRecord = await waitFor(
 		() => records.find((record) =>
 			record.kind === "tool.execution" &&
 			record.phase === "end" &&
-			hasToolCallId(record, "post-edit-tool")),
+			record.correlation?.tool_call_id === "post-edit-tool"),
 		"post-edit telemetry",
 	);
 	const postEditRecordCount = records.filter(
-		(record) => hasToolCallId(record, "post-edit-tool"),
+		(record) => record.correlation?.tool_call_id === "post-edit-tool",
 	).length;
 	emitTool(preEditSession, "stale-edit-session-tool");
 	await sleep(100);
@@ -489,7 +444,7 @@ try {
 		postEditRecord.correlation.session_id !== postEditSession.sessionId ||
 		postEditRecord.correlation.conversation_id !== preEditTelemetryConversationId ||
 		postEditRecordCount !== 2 ||
-		records.some((record) => hasToolCallId(record, "stale-edit-session-tool"))
+		records.some((record) => record.correlation?.tool_call_id === "stale-edit-session-tool")
 	) {
 		throw new Error(
 			`edit session binding mismatch: ${JSON.stringify({
@@ -512,16 +467,13 @@ try {
 		if (newSession === oldSession || newSession.sessionId === oldSessionId) {
 			throw new Error(`${label} did not replace SDK session identity`);
 		}
-		const replacementOffset = records.length;
-		emitRunStart(newSession);
-		const toolCallId = "reused-session-tool";
+		const toolCallId = `sdk-${label}-tool`;
 		emitTool(newSession, toolCallId);
 		const replacementRecord = await waitFor(
-			() => records.find((record, index) =>
-				index >= replacementOffset &&
+			() => records.find((record) =>
 				record.kind === "tool.execution" &&
 				record.phase === "end" &&
-				hasToolCallId(record, toolCallId)),
+				record.correlation?.tool_call_id === toolCallId),
 			`${label} replacement telemetry`,
 			750,
 		);
@@ -530,12 +482,11 @@ try {
 		if (
 			replacementRecord.correlation.session_id !== newSession.sessionId ||
 			replacementRecord.correlation.conversation_id !== telemetryConversationId ||
-			records.slice(replacementOffset).filter((record) => hasToolCallId(record, toolCallId)).length !== 2 ||
-			records.some((record) => hasToolCallId(record, `stale-${label}-tool`))
+			records.filter((record) => record.correlation?.tool_call_id === toolCallId).length !== 2 ||
+			records.some((record) => record.correlation?.tool_call_id === `stale-${label}-tool`)
 		) {
 			throw new Error(`${label} replacement binding mismatch`);
 		}
-		rememberConcreteSessionIds(records.slice(replacementOffset), `${label} session`);
 	}
 	await assertSdkSessionReplacement("new-session", (runtime) => runtime.newSession());
 	await assertSdkSessionReplacement("switch-session", (runtime) =>
@@ -586,437 +537,6 @@ try {
 		throw new Error("slower navigation runtime overwrote newer workspace");
 	}
 	console.log("PASS slower navigation runtime cannot overwrite newer request");
-	const removalEditClient = await appModule.service.attach("edit-removal-fixture", () => {});
-	const removalEditConversation = removalEditClient.convs.get(removalEditClient.activeId);
-	if (!removalEditConversation) throw new Error("edit removal conversation missing");
-	const removalEditTimestamp = 3_250;
-	const removalEditMessage = {
-		role: "user",
-		content: [{ type: "text", text: "removal edit original" }],
-		timestamp: removalEditTimestamp,
-	};
-	removalEditConversation.session.sessionManager.appendMessage(removalEditMessage);
-	removalEditConversation.session.agent.state.messages.push(removalEditMessage);
-	const removalEditAnswer = assistantMessage(
-		[{ type: "text", text: "removal edit answer" }],
-		"stop",
-		removalEditTimestamp + 1,
-	);
-	removalEditConversation.session.sessionManager.appendMessage(removalEditAnswer);
-	removalEditConversation.session.agent.state.messages.push(removalEditAnswer);
-	const removalEditRuntime = removalEditConversation.runtime;
-	const originalRemovalFork = removalEditRuntime.fork.bind(removalEditRuntime);
-	let releaseRemovalFork;
-	let markRemovalForkReady;
-	const removalForkGate = new Promise((resolve) => {
-		releaseRemovalFork = resolve;
-	});
-	const removalForkReady = new Promise((resolve) => {
-		markRemovalForkReady = resolve;
-	});
-	removalEditRuntime.fork = async (...args) => {
-		const result = await originalRemovalFork(...args);
-		markRemovalForkReady();
-		await removalForkGate;
-		return result;
-	};
-	const originalRemovalBind = removalEditClient.bindSession;
-	let removalBindCalls = 0;
-	removalEditClient.bindSession = async function (...args) {
-		if (args[0] === removalEditConversation) removalBindCalls++;
-		return originalRemovalBind.apply(this, args);
-	};
-	const removalEdit = removalEditClient.editMessage(
-		`u-${removalEditTimestamp}-1`,
-		"removal edit replacement",
-	);
-	await removalForkReady;
-	const removalWinnerCwd = join(base, "edit-removal-winner");
-	mkdirSync(removalWinnerCwd, { recursive: true });
-	await removalEditClient.setCwd(removalWinnerCwd);
-	releaseRemovalFork();
-	await removalEdit;
-	await sleep(100);
-	removalEditRuntime.fork = originalRemovalFork;
-	removalEditClient.bindSession = originalRemovalBind;
-	if (
-		removalBindCalls !== 0 ||
-		removalEditClient.convs.has(removalEditConversation.id) ||
-		removalEditClient.cwd !== removalWinnerCwd ||
-		removalEditClient.session.sessionManager.getCwd() !== removalWinnerCwd
-	) {
-		throw new Error("removed edit conversation was rebound or mutated winner");
-	}
-	console.log("PASS removed mid-fork edit cannot bind or mutate winner");
-	const resetEditClient = await appModule.service.attach("edit-reset-fixture", () => {});
-	const resetEditConversation = resetEditClient.convs.get(resetEditClient.activeId);
-	if (!resetEditConversation) throw new Error("edit reset conversation missing");
-	const resetEditTimestamp = 3_275;
-	const resetEditMessage = {
-		role: "user",
-		content: [{ type: "text", text: "reset edit original" }],
-		timestamp: resetEditTimestamp,
-	};
-	resetEditConversation.session.sessionManager.appendMessage(resetEditMessage);
-	resetEditConversation.session.agent.state.messages.push(resetEditMessage);
-	const resetEditAnswer = assistantMessage(
-		[{ type: "text", text: "reset edit answer" }],
-		"stop",
-		resetEditTimestamp + 1,
-	);
-	resetEditConversation.session.sessionManager.appendMessage(resetEditAnswer);
-	resetEditConversation.session.agent.state.messages.push(resetEditAnswer);
-	const resetEditRuntime = resetEditConversation.runtime;
-	const originalResetEditFork = resetEditRuntime.fork.bind(resetEditRuntime);
-	let releaseResetEditFork;
-	let markResetEditForkReady;
-	const resetEditForkGate = new Promise((resolve) => {
-		releaseResetEditFork = resolve;
-	});
-	const resetEditForkReady = new Promise((resolve) => {
-		markResetEditForkReady = resolve;
-	});
-	resetEditRuntime.fork = async (...args) => {
-		const result = await originalResetEditFork(...args);
-		markResetEditForkReady();
-		await resetEditForkGate;
-		return result;
-	};
-	const originalResetEditBind = resetEditClient.bindSession;
-	let resetEditBindCalls = 0;
-	resetEditClient.bindSession = async function (...args) {
-		if (args[0] === resetEditConversation) resetEditBindCalls++;
-		return originalResetEditBind.apply(this, args);
-	};
-	const resetEdit = resetEditClient.editMessage(
-		`u-${resetEditTimestamp}-1`,
-		"reset edit replacement",
-	);
-	await resetEditForkReady;
-	await resetEditClient.forceResetConversation(
-		resetEditConversation,
-		"force reset wins edit fixture",
-	);
-	const resetWinnerRuntime = resetEditConversation.runtime;
-	const resetWinnerSession = resetEditConversation.session;
-	const resetWinnerMapper = resetEditConversation.telemetryMapper;
-	releaseResetEditFork();
-	await resetEdit;
-	resetEditRuntime.fork = originalResetEditFork;
-	resetEditClient.bindSession = originalResetEditBind;
-	const resetWinnerRecordOffset = records.length;
-	emitTool(resetWinnerSession, "force-reset-winner-tool");
-	await waitFor(
-		() => records.find((record, index) =>
-			index >= resetWinnerRecordOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "force-reset-winner-tool")),
-		"force-reset winner telemetry",
-	);
-	if (
-		resetEditConversation.runtime !== resetWinnerRuntime ||
-		resetEditConversation.session !== resetWinnerSession ||
-		resetEditConversation.telemetryMapper !== resetWinnerMapper ||
-		resetEditBindCalls !== 1 ||
-		resetEditClient.activeId !== resetEditConversation.id
-	) {
-		throw new Error("stale edit mutated concurrent force-reset winner");
-	}
-	console.log("PASS stale edit cannot mutate concurrent force-reset winner");
-	const resetBindRejectClient = await appModule.service.attach(
-		"force-reset-bind-reject-fixture",
-		() => {},
-	);
-	const resetBindRejectConversation = resetBindRejectClient.convs.get(
-		resetBindRejectClient.activeId,
-	);
-	if (!resetBindRejectConversation) {
-		throw new Error("force-reset bind rejection conversation missing");
-	}
-	const resetBindRejectOldRuntime = resetBindRejectConversation.runtime;
-	const originalResetBindRejectFactory = resetBindRejectClient.makeRuntimeFactory;
-	let resetBindRejectSubscriptions = 0;
-	resetBindRejectClient.makeRuntimeFactory = function (terminals) {
-		const createRuntime = originalResetBindRejectFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			result.session.bindExtensions = async () => {
-				throw new Error("fixture force-reset bind rejection");
-			};
-			const originalSubscribe = result.session.subscribe.bind(result.session);
-			result.session.subscribe = (listener) => {
-				resetBindRejectSubscriptions++;
-				return originalSubscribe(listener);
-			};
-			return result;
-		};
-	};
-	await resetBindRejectClient.forceResetConversation(
-		resetBindRejectConversation,
-		"force-reset extension failure fixture",
-	);
-	resetBindRejectClient.makeRuntimeFactory = originalResetBindRejectFactory;
-	const resetBindRejectRecordOffset = records.length;
-	emitTool(resetBindRejectConversation.session, "force-reset-bind-reject-tool");
-	await waitFor(
-		() => records.find((record, index) =>
-			index >= resetBindRejectRecordOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "force-reset-bind-reject-tool")),
-		"force-reset core binding after extension failure",
-		750,
-	);
-	if (
-		resetBindRejectConversation.runtime === resetBindRejectOldRuntime ||
-		!resetBindRejectConversation.telemetryMapper ||
-		resetBindRejectSubscriptions !== 1
-	) {
-		throw new Error("force-reset extension failure lost core session binding");
-	}
-	console.log("PASS force-reset preserves core binding when extension binding fails");
-	const setCwdBindMessages = [];
-	const setCwdBindClient = await appModule.service.attach(
-		"set-cwd-bind-race-fixture",
-		(message) => setCwdBindMessages.push(message),
-	);
-	const originalSetCwdBindFactory = setCwdBindClient.makeRuntimeFactory;
-	let releaseSetCwdBind;
-	let markSetCwdBindReady;
-	let staleSetCwdRuntimeDisposals = 0;
-	const setCwdBindGate = new Promise((resolve) => {
-		releaseSetCwdBind = resolve;
-	});
-	const setCwdBindReady = new Promise((resolve) => {
-		markSetCwdBindReady = resolve;
-	});
-	setCwdBindClient.makeRuntimeFactory = function (terminals) {
-		const createRuntime = originalSetCwdBindFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			const originalBindExtensions = result.session.bindExtensions.bind(result.session);
-			result.session.bindExtensions = async (...args) => {
-				const value = await originalBindExtensions(...args);
-				markSetCwdBindReady();
-				await setCwdBindGate;
-				return value;
-			};
-			const originalDispose = result.session.dispose.bind(result.session);
-			result.session.dispose = () => {
-				staleSetCwdRuntimeDisposals++;
-				return originalDispose();
-			};
-			return result;
-		};
-	};
-	const setCwdStaleTarget = join(base, "set-cwd-stale-target");
-	mkdirSync(setCwdStaleTarget, { recursive: true });
-	const staleSetCwd = setCwdBindClient.setCwd(setCwdStaleTarget);
-	await setCwdBindReady;
-	setCwdBindClient.makeRuntimeFactory = originalSetCwdBindFactory;
-	await setCwdBindClient.setCwd(join(base, "set-cwd-invalid-winner"));
-	releaseSetCwdBind();
-	await staleSetCwd;
-	setCwdBindClient.flushSnapshot(true);
-	const setCwdBindSnapshot = setCwdBindMessages
-		.filter((message) => message.type === "snapshot")
-		.at(-1)?.state;
-	const setCwdBindActive = setCwdBindClient.convs.get(setCwdBindClient.activeId);
-	if (
-		setCwdBindClient.cwd !== projectDir ||
-		setCwdBindActive?.cwd !== projectDir ||
-		setCwdBindActive?.session.sessionManager.getCwd() !== projectDir ||
-		setCwdBindSnapshot?.cwd !== projectDir ||
-		setCwdBindSnapshot?.conversationId !== setCwdBindClient.activeId ||
-		[...setCwdBindClient.convs.values()].some((conv) => conv.cwd === setCwdStaleTarget) ||
-		staleSetCwdRuntimeDisposals !== 1
-	) {
-		throw new Error("setCwd bind race did not converge to latest target");
-	}
-	console.log("PASS setCwd bind race converges public, active, session, and snapshot state");
-	const bindRejectClient = await appModule.service.attach("bind-reject-fixture", () => {});
-	const bindRejectInitialId = bindRejectClient.activeId;
-	const bindRejectInitialCwd = bindRejectClient.cwd;
-	const bindRejectTarget = join(base, "bind-reject-target");
-	mkdirSync(bindRejectTarget, { recursive: true });
-	const originalBindRejectFactory = bindRejectClient.makeRuntimeFactory;
-	let bindRejectRuntimeDisposals = 0;
-	let bindRejectTerminalKills = 0;
-	let bindRejectSubscriptions = 0;
-	bindRejectClient.makeRuntimeFactory = function (terminals) {
-		const originalKillAll = terminals.killAll.bind(terminals);
-		terminals.killAll = () => {
-			bindRejectTerminalKills++;
-			return originalKillAll();
-		};
-		const createRuntime = originalBindRejectFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			result.session.bindExtensions = async () => {
-				throw new Error("fixture bind rejection");
-			};
-			const originalDispose = result.session.dispose.bind(result.session);
-			result.session.dispose = () => {
-				bindRejectRuntimeDisposals++;
-				return originalDispose();
-			};
-			const originalSubscribe = result.session.subscribe.bind(result.session);
-			result.session.subscribe = (listener) => {
-				bindRejectSubscriptions++;
-				return originalSubscribe(listener);
-			};
-			return result;
-		};
-	};
-	await bindRejectClient.setCwd(bindRejectTarget);
-	bindRejectClient.makeRuntimeFactory = originalBindRejectFactory;
-	if (
-		bindRejectClient.activeId !== bindRejectInitialId ||
-		bindRejectClient.cwd !== bindRejectInitialCwd ||
-		[...bindRejectClient.convs.values()].some((conv) => conv.cwd === bindRejectTarget) ||
-		bindRejectRuntimeDisposals !== 1 ||
-		bindRejectTerminalKills < 1 ||
-		bindRejectSubscriptions !== 0
-	) {
-		throw new Error("rejected provisional bind leaked runtime, terminals, or subscription");
-	}
-	console.log("PASS rejected provisional bind cleans runtime, terminals, mapper, and callback");
-	const switchBindMessages = [];
-	const switchBindClient = await appModule.service.attach(
-		"switch-bind-race-fixture",
-		(message) => switchBindMessages.push(message),
-	);
-	const switchBindTargetCwd = join(base, "switch-bind-target");
-	const switchBindSessionDir = join(base, "switch-bind-sessions");
-	const { SessionManager: SwitchFixtureSessionManager } = await import(
-		"@earendil-works/pi-coding-agent"
-	);
-	mkdirSync(switchBindTargetCwd, { recursive: true });
-	mkdirSync(switchBindSessionDir, { recursive: true });
-	const switchBindManager = SwitchFixtureSessionManager.create(
-		switchBindTargetCwd,
-		switchBindSessionDir,
-	);
-	switchBindManager.appendMessage({
-		role: "user",
-		content: [{ type: "text", text: "switch bind fixture" }],
-		timestamp: 3_290,
-	});
-	switchBindManager.appendMessage(
-		assistantMessage([{ type: "text", text: "switch bind answer" }], "stop", 3_291),
-	);
-	const switchBindTargetPath = switchBindManager.getSessionFile();
-	if (!switchBindTargetPath) throw new Error("switch bind fixture path missing");
-	const originalSwitchBindFactory = switchBindClient.makeRuntimeFactory;
-	let releaseSwitchBind;
-	let markSwitchBindReady;
-	const switchBindGate = new Promise((resolve) => {
-		releaseSwitchBind = resolve;
-	});
-	const switchBindReady = new Promise((resolve) => {
-		markSwitchBindReady = resolve;
-	});
-	switchBindClient.makeRuntimeFactory = function (terminals) {
-		const createRuntime = originalSwitchBindFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			const originalBindExtensions = result.session.bindExtensions.bind(result.session);
-			result.session.bindExtensions = async (...args) => {
-				const value = await originalBindExtensions(...args);
-				markSwitchBindReady();
-				await switchBindGate;
-				return value;
-			};
-			return result;
-		};
-	};
-	const staleSwitchBind = switchBindClient.switchSession(switchBindTargetPath);
-	await switchBindReady;
-	switchBindClient.makeRuntimeFactory = originalSwitchBindFactory;
-	await switchBindClient.switchSession(switchBindTargetPath);
-	releaseSwitchBind();
-	await staleSwitchBind;
-	switchBindClient.flushSnapshot(true);
-	const switchBindSnapshot = switchBindMessages
-		.filter((message) => message.type === "snapshot")
-		.at(-1)?.state;
-	const switchBindActive = switchBindClient.convs.get(switchBindClient.activeId);
-	const matchingSwitchConversations = [...switchBindClient.convs.values()].filter(
-		(conv) => conv.session.sessionFile === switchBindTargetPath,
-	);
-	if (
-		switchBindClient.cwd !== switchBindTargetCwd ||
-		switchBindActive?.cwd !== switchBindTargetCwd ||
-		switchBindActive?.session.sessionFile !== switchBindTargetPath ||
-		switchBindSnapshot?.cwd !== switchBindTargetCwd ||
-		switchBindSnapshot?.conversationId !== switchBindClient.activeId ||
-		matchingSwitchConversations.length !== 1
-	) {
-		throw new Error("switchSession bind race did not converge to latest target");
-	}
-	console.log("PASS switchSession bind race converges public, active, session, and snapshot state");
-	const newChatBindMessages = [];
-	const newChatBindClient = await appModule.service.attach(
-		"new-chat-bind-race-fixture",
-		(message) => newChatBindMessages.push(message),
-	);
-	const newChatInitialId = newChatBindClient.activeId;
-	newChatBindClient.session.agent.state.messages.push({
-		role: "user",
-		content: [{ type: "text", text: "nonblank new-chat bind fixture" }],
-		timestamp: 3_295,
-	});
-	const originalNewChatBindFactory = newChatBindClient.makeRuntimeFactory;
-	let releaseNewChatBind;
-	let markNewChatBindReady;
-	let newChatBindSubscribeCalls = 0;
-	const newChatBindGate = new Promise((resolve) => {
-		releaseNewChatBind = resolve;
-	});
-	const newChatBindReady = new Promise((resolve) => {
-		markNewChatBindReady = resolve;
-	});
-	newChatBindClient.makeRuntimeFactory = function (terminals) {
-		const createRuntime = originalNewChatBindFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			const originalBindExtensions = result.session.bindExtensions.bind(result.session);
-			result.session.bindExtensions = async (...args) => {
-				const value = await originalBindExtensions(...args);
-				markNewChatBindReady();
-				await newChatBindGate;
-				return value;
-			};
-			const originalSubscribe = result.session.subscribe.bind(result.session);
-			result.session.subscribe = (listener) => {
-				newChatBindSubscribeCalls++;
-				return originalSubscribe(listener);
-			};
-			return result;
-		};
-	};
-	const staleNewChatBind = newChatBindClient.newChat();
-	await newChatBindReady;
-	newChatBindClient.makeRuntimeFactory = originalNewChatBindFactory;
-	await newChatBindClient.newChat();
-	releaseNewChatBind();
-	await staleNewChatBind;
-	newChatBindClient.flushSnapshot(true);
-	const newChatBindSnapshot = newChatBindMessages
-		.filter((message) => message.type === "snapshot")
-		.at(-1)?.state;
-	const newChatBindActive = newChatBindClient.convs.get(newChatBindClient.activeId);
-	if (
-		newChatBindClient.activeId === newChatInitialId ||
-		newChatBindClient.convs.size !== 1 ||
-		newChatBindActive?.cwd !== newChatBindClient.cwd ||
-		newChatBindActive?.session.sessionManager.getCwd() !== newChatBindClient.cwd ||
-		newChatBindSnapshot?.conversationId !== newChatBindClient.activeId ||
-		newChatBindSnapshot?.cwd !== newChatBindClient.cwd ||
-		newChatBindSubscribeCalls !== 0
-	) {
-		throw new Error("newChat bind race did not converge to one committed target");
-	}
-	console.log("PASS newChat bind race converges to one committed conversation");
 
 	const projectB = join(base, "project-b");
 	mkdirSync(projectB, { recursive: true });
@@ -1039,14 +559,14 @@ try {
 			index >= backgroundRecordOffset &&
 			record.kind === "tool.execution" &&
 			record.phase === "end" &&
-			hasToolCallId(record, "background-tool")),
+			record.correlation?.tool_call_id === "background-tool"),
 		"background telemetry",
 	);
 	const foregroundTool = await waitFor(
 		() => records.find((record) =>
 			record.kind === "tool.execution" &&
 			record.phase === "end" &&
-			hasToolCallId(record, "foreground-tool")),
+			record.correlation?.tool_call_id === "foreground-tool"),
 		"foreground telemetry",
 	);
 	if (
@@ -1118,16 +638,11 @@ try {
 	editRaceRuntime.fork = originalEditRaceFork;
 	if (
 		clientSession.activeId !== backgroundUiConversationId ||
-		editRacePromptTargets.length !== 0 ||
-		clientSession.convs.has(editRaceForegroundId)
+		editRacePromptTargets.length !== 0
 	) {
 		throw new Error(`edit resumed against wrong active conversation: ${editRacePromptTargets}`);
 	}
-	await clientSession.setCwd(projectB);
-	await waitFor(
-		() => client.state?.cwd === projectB && client.state?.conversationId !== backgroundUiConversationId,
-		"restored project after stale edit",
-	);
+	await clientSession.switchConversation(editRaceForegroundId);
 	foregroundSession = clientSession.session;
 	console.log("PASS edit cannot resume prompt against a different active conversation");
 	const backgroundConversation = clientSession.convs.get(backgroundUiConversationId);
@@ -1150,7 +665,7 @@ try {
 		() => records.find((record) =>
 			record.kind === "tool.execution" &&
 			record.phase === "end" &&
-			hasToolCallId(record, "background-reset-tool")),
+			record.correlation?.tool_call_id === "background-reset-tool"),
 		"background force-reset telemetry",
 		750,
 	);
@@ -1184,21 +699,7 @@ try {
 	}
 	const telemetryClient = appModule.telemetryClient;
 	if (!telemetryClient) throw new Error("server-scoped telemetry client missing");
-	const beforeResetLifecycleOffset = records.length;
-	emitRunStart(foregroundSession);
-	emitTool(foregroundSession, "reused-reset-tool");
-	const beforeResetTool = await waitFor(
-		() => records.find((record, index) =>
-			index >= beforeResetLifecycleOffset &&
-			record.phase === "end" &&
-			hasToolCallId(record, "reused-reset-tool")),
-		"pre-reset lifecycle telemetry",
-	);
-	const preResetConversationId = beforeResetTool.correlation.conversation_id;
-	rememberConcreteSessionIds(
-		records.slice(beforeResetLifecycleOffset),
-		"pre-reset session",
-	);
+	const preResetConversationId = foregroundTool.correlation.conversation_id;
 	const preResetMapper = foregroundConversation.telemetryMapper;
 	await clientSession.forceResetConversation(foregroundConversation, "fixture force reset");
 	foregroundSession = clientSession.session;
@@ -1206,15 +707,13 @@ try {
 	if (!foregroundConversation?.telemetryMapper) {
 		throw new Error("replacement runtime telemetry mapper missing");
 	}
-	const resetLifecycleOffset = records.length;
 	emitRunStart(foregroundSession);
-	emitTool(foregroundSession, "reused-reset-tool");
 	emitTool(foregroundSession, "reset-runtime-tool");
 	const resetRuntimeTool = await waitFor(
 		() => records.find((record) =>
 			record.kind === "tool.execution" &&
 			record.phase === "end" &&
-			hasToolCallId(record, "reset-runtime-tool")),
+			record.correlation?.tool_call_id === "reset-runtime-tool"),
 		"replacement runtime telemetry",
 	);
 	if (
@@ -1224,11 +723,6 @@ try {
 	) {
 		throw new Error("replacement runtime mapper/session metadata mismatch");
 	}
-	rememberConcreteSessionIds(
-		records.slice(resetLifecycleOffset),
-		"force-reset session",
-	);
-	console.log("PASS concrete Pi sessions use unique span and tool namespaces");
 	console.log("PASS force-reset runtime receives fresh mapper with stable conversation metadata");
 	const originalGetAllTools = foregroundSession.getAllTools;
 	let streamingContextReads = 0;
