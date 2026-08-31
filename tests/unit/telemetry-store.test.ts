@@ -6,6 +6,7 @@ import type {
 } from "../../web/src/observe/telemetry-types.js";
 import {
 	parseTelemetryEvent,
+	parseTelemetryEventResponse,
 	parseTelemetryHealth,
 	parseTelemetrySourcesResponse,
 } from "../../web/src/observe/telemetry-types.js";
@@ -111,6 +112,93 @@ describe("TelemetryStore", () => {
 		expect(store.snapshot().events[0].summary?.length).toBeLessThan(rawSummary.length);
 		expect([...storage.values.values()].join("\n")).not.toContain("private-tail");
 		store.disconnect();
+	});
+
+	it("preserves distinct long opaque identifiers without persisting them", async () => {
+		const shared = "i".repeat(300);
+		const traceShared = "t".repeat(300);
+		const firstId = `${shared}A`;
+		const secondId = `${shared}B`;
+		const firstTrace = `${traceShared}A`;
+		const secondTrace = `${traceShared}B`;
+		const source = {
+			robot_id: `${"r".repeat(300)}A`,
+			host_id: `${"h".repeat(300)}A`,
+			component: `${"c".repeat(300)}A`,
+			instance_id: `${"n".repeat(300)}A`,
+			version: `${"v".repeat(300)}A`,
+		};
+		const storage = new MemoryStorage();
+		const store = new TelemetryStore({
+			storage,
+			fetch: async (url, init) =>
+				url.includes("/events")
+					? page(
+							[
+								event(1, {
+									event_id: firstId,
+									kind: `${shared}kind-A`,
+									source,
+									correlation: { trace_id: firstTrace },
+									payload_ref: `${shared}payload-A`,
+								}),
+								event(2, {
+									event_id: secondId,
+									kind: `${shared}kind-B`,
+									source,
+									correlation: { trace_id: secondTrace },
+									payload_ref: `${shared}payload-B`,
+								}),
+							],
+							null,
+							2,
+						)
+					: pendingResponse(init?.signal),
+		});
+
+		await store.connect();
+
+		const [first, second] = store.snapshot().events;
+		expect(firstId).toHaveLength(301);
+		expect(firstTrace).toHaveLength(301);
+		expect(first.event_id).toBe(firstId);
+		expect(second.event_id).toBe(secondId);
+		expect(first.event_id).not.toBe(second.event_id);
+		expect(parseTelemetryEventResponse({ event: first }).event_id).toBe(firstId);
+		expect(parseTelemetryEventResponse({ event: second }).event_id).toBe(secondId);
+		expect(first.correlation?.trace_id).toBe(firstTrace);
+		expect(second.correlation?.trace_id).toBe(secondTrace);
+		expect(first.kind).toBe(`${shared}kind-A`);
+		expect(first.source).toEqual(source);
+		expect(first.payload_ref).toBe(`${shared}payload-A`);
+		const persisted = [...storage.values.values()].join("\n");
+		expect(persisted).not.toContain(firstId);
+		expect(persisted).not.toContain(firstTrace);
+		store.disconnect();
+	});
+
+	it("keeps long source, kind, and trace filters distinct in query URLs", async () => {
+		const shared = "f".repeat(300);
+		const queries: URLSearchParams[] = [];
+		const store = new TelemetryStore({
+			fetch: async (url) => {
+				queries.push(new URL(url, "http://vite.local").searchParams);
+				return page([], null, null);
+			},
+		});
+
+		await store.query({
+			source: `${shared}A`,
+			kind: `${shared}B`,
+			traceId: `${shared}C`,
+		});
+		await store.query({ traceId: `${shared}D` });
+
+		expect(queries[0].get("source")).toBe(`${shared}A`);
+		expect(queries[0].get("kind")).toBe(`${shared}B`);
+		expect(queries[0].get("trace_id")).toBe(`${shared}C`);
+		expect(queries[1].get("trace_id")).toBe(`${shared}D`);
+		expect(queries[0].get("trace_id")).not.toBe(queries[1].get("trace_id"));
 	});
 
 	it("orders by sequence and deduplicates replayed events", async () => {

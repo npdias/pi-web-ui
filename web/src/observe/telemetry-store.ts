@@ -197,7 +197,7 @@ function queryInteger(value: number | undefined, name: string): string | undefin
 
 function queryFilter(value: string | undefined, name: string): string | undefined {
 	if (value === undefined) return undefined;
-	if (value.length === 0 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) {
+	if (value.length === 0) {
 		throw new Error(`${name} is invalid`);
 	}
 	return value;

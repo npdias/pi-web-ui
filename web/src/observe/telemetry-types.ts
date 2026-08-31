@@ -121,7 +121,7 @@ const HEALTH_COUNTER_KEYS = [
 	"retention_failures",
 ] as const;
 const REDACTED = "[REDACTED]";
-const MAX_IDENTIFIER_LENGTH = 256;
+const MAX_DISPLAY_KEY_LENGTH = 256;
 const MAX_TEXT_LENGTH = 64 * 1024;
 const MAX_OBJECT_KEYS = 256;
 const MAX_ARRAY_ITEMS = 1_000;
@@ -148,23 +148,29 @@ function truncateDisplayString(value: string, max: number): string {
 	return `${value.slice(0, Math.max(0, max - TRUNCATED_MARKER.length))}${TRUNCATED_MARKER}`;
 }
 
-function boundedString(value: unknown, name: string, max = MAX_TEXT_LENGTH): string {
-	if (typeof value !== "string" || value.length === 0) {
+function requiredString(value: unknown, name: string): string {
+	if (typeof value !== "string" || value.trim().length === 0) {
 		throw new TelemetryProtocolError(`${name} must be a non-empty string`);
 	}
-	return truncateDisplayString(value, max);
+	return value;
 }
 
 function optionalString(
 	value: unknown,
 	name: string,
-	max = MAX_TEXT_LENGTH,
 ): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") {
 		throw new TelemetryProtocolError(`${name} must be a string`);
 	}
-	return truncateDisplayString(value, max);
+	return value;
+}
+
+function optionalDisplayString(value: unknown, name: string): string | undefined {
+	const parsed = optionalString(value, name);
+	return parsed === undefined
+		? undefined
+		: truncateDisplayString(parsed, MAX_TEXT_LENGTH);
 }
 
 function safeInteger(value: unknown, name: string, minimum = 0): number {
@@ -196,7 +202,7 @@ function nonNegativeInteger(value: unknown, name: string): number {
 }
 
 function timestamp(value: unknown, name: string): string {
-	const text = boundedString(value, name, MAX_IDENTIFIER_LENGTH);
+	const text = requiredString(value, name);
 	if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(text) || !Number.isFinite(Date.parse(text))) {
 		throw new TelemetryProtocolError(`${name} must be an ISO timestamp with timezone`);
 	}
@@ -263,7 +269,7 @@ function sanitizeJson(value: unknown, name: string, depth = 0): TelemetryJson {
 	const output: Record<string, TelemetryJson> = {};
 	for (const [key, item] of kept) {
 		if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
-		const displayKey = truncateDisplayString(key, MAX_IDENTIFIER_LENGTH);
+		const displayKey = truncateDisplayString(key, MAX_DISPLAY_KEY_LENGTH);
 		output[displayKey] = isSecretKey(key)
 			? REDACTED
 			: sanitizeJson(item, `${name}.${key}`, depth + 1);
@@ -289,15 +295,11 @@ function structuredRecord(
 function parseSource(value: unknown): TelemetrySource {
 	const source = objectValue(value, "source");
 	return {
-		robot_id: boundedString(source.robot_id, "source.robot_id", MAX_IDENTIFIER_LENGTH),
-		host_id: boundedString(source.host_id, "source.host_id", MAX_IDENTIFIER_LENGTH),
-		component: boundedString(source.component, "source.component", MAX_IDENTIFIER_LENGTH),
-		instance_id: optionalString(
-			source.instance_id,
-			"source.instance_id",
-			MAX_IDENTIFIER_LENGTH,
-		),
-		version: optionalString(source.version, "source.version", MAX_IDENTIFIER_LENGTH),
+		robot_id: requiredString(source.robot_id, "source.robot_id"),
+		host_id: requiredString(source.host_id, "source.host_id"),
+		component: requiredString(source.component, "source.component"),
+		instance_id: optionalString(source.instance_id, "source.instance_id"),
+		version: optionalString(source.version, "source.version"),
 	};
 }
 
@@ -305,7 +307,7 @@ function parseCorrelation(value: unknown): TelemetryCorrelation {
 	const input = objectValue(value, "correlation");
 	const output: Record<string, string> = {};
 	for (const key of CORRELATION_KEYS) {
-		const parsed = optionalString(input[key], `correlation.${key}`, MAX_IDENTIFIER_LENGTH);
+		const parsed = optionalString(input[key], `correlation.${key}`);
 		if (parsed !== undefined) output[key] = parsed;
 	}
 	return output;
@@ -316,11 +318,7 @@ export function parseTelemetryEvent(value: unknown): TelemetryEvent {
 	if (input.schema_version !== 1) {
 		throw new TelemetryProtocolError("event.schema_version must be 1");
 	}
-	const severity = boundedString(
-		input.severity,
-		"event.severity",
-		MAX_IDENTIFIER_LENGTH,
-	) as TelemetrySeverity;
+	const severity = requiredString(input.severity, "event.severity") as TelemetrySeverity;
 	if (!SEVERITIES.has(severity)) {
 		throw new TelemetryProtocolError("event.severity is invalid");
 	}
@@ -336,24 +334,20 @@ export function parseTelemetryEvent(value: unknown): TelemetryEvent {
 			: structuredRecord(input.redaction, "event.redaction");
 	return {
 		schema_version: 1,
-		event_id: boundedString(input.event_id, "event.event_id", MAX_IDENTIFIER_LENGTH),
+		event_id: requiredString(input.event_id, "event.event_id"),
 		sequence: safeInteger(input.sequence, "event.sequence", 1),
 		observed_at: timestamp(input.observed_at, "event.observed_at"),
 		monotonic_ns: nonNegativeInteger(input.monotonic_ns, "event.monotonic_ns"),
-		kind: boundedString(input.kind, "event.kind", MAX_IDENTIFIER_LENGTH),
+		kind: requiredString(input.kind, "event.kind"),
 		severity,
 		source: parseSource(input.source),
 		attributes: structuredRecord(input.attributes ?? {}, "event.attributes"),
-		phase: optionalString(input.phase, "event.phase", MAX_IDENTIFIER_LENGTH),
-		state: optionalString(input.state, "event.state", MAX_IDENTIFIER_LENGTH),
-		summary: optionalString(input.summary, "event.summary"),
+		phase: optionalString(input.phase, "event.phase"),
+		state: optionalString(input.state, "event.state"),
+		summary: optionalDisplayString(input.summary, "event.summary"),
 		correlation,
 		duration_ms: duration,
-		privacy_class: optionalString(
-			input.privacy_class,
-			"event.privacy_class",
-			MAX_IDENTIFIER_LENGTH,
-		),
+		privacy_class: optionalString(input.privacy_class, "event.privacy_class"),
 		payload_ref: optionalString(input.payload_ref, "event.payload_ref"),
 		redaction,
 	};

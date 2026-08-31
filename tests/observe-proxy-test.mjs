@@ -10,6 +10,11 @@ const UPSTREAM_PORT = 8969;
 const UI_ORIGIN = `http://127.0.0.1:${UI_PORT}`;
 const UPSTREAM_ORIGIN = `http://127.0.0.1:${UPSTREAM_PORT}`;
 const UI_TOKEN = "vite-dev-token";
+const LONG_EVENT_IDS = [
+	`${"e".repeat(292)}A / exact`,
+	`${"e".repeat(292)}B / exact`,
+];
+const LONG_TRACE_ID = `${"t".repeat(300)}A`;
 
 const tempDir = mkdtempSync(join(tmpdir(), "pi-observe-proxy-test-"));
 const seen = [];
@@ -68,8 +73,9 @@ const upstream = createServer((req, res) => {
 		);
 		return;
 	}
-	if (url.pathname === "/telemetry/events/tel_8") {
-		res.end(JSON.stringify({ event: telemetryEvent }));
+	if (url.pathname.startsWith("/telemetry/events/")) {
+		const eventId = decodeURIComponent(url.pathname.slice("/telemetry/events/".length));
+		res.end(JSON.stringify({ event: { ...telemetryEvent, event_id: eventId } }));
 		return;
 	}
 	if (url.pathname === "/telemetry/sources") {
@@ -305,6 +311,29 @@ try {
 		assert.ok(expected in body || body.status === expected, path);
 	}
 
+	for (const eventId of LONG_EVENT_IDS) {
+		assert.equal(eventId.length, 301);
+		const longEventResponse = await fetch(
+			authenticatedUiUrl(`/api/observe/events/${encodeURIComponent(eventId)}`),
+		);
+		assert.equal(longEventResponse.status, 200);
+		assert.equal((await longEventResponse.json()).event.event_id, eventId);
+		assert.equal(
+			seen.at(-1).url,
+			`/telemetry/events/${encodeURIComponent(eventId)}`,
+		);
+	}
+	assert.notEqual(LONG_EVENT_IDS[0], LONG_EVENT_IDS[1]);
+
+	const longFilterResponse = await fetch(
+		authenticatedUiUrl(`/api/observe/events?trace_id=${encodeURIComponent(LONG_TRACE_ID)}`),
+	);
+	assert.equal(longFilterResponse.status, 200);
+	assert.equal(
+		new URL(seen.at(-1).url, UPSTREAM_ORIGIN).searchParams.get("trace_id"),
+		LONG_TRACE_ID,
+	);
+
 	for (const path of [
 		"/api/observe/events?target=http://attacker.invalid",
 		"/api/observe/events?after=1&after=2",
@@ -313,9 +342,9 @@ try {
 		"/api/observe/events?limit=0",
 		"/api/observe/events?limit=1001",
 		"/api/observe/events?severity=fatal",
-		`/api/observe/events?source=${"x".repeat(257)}`,
+		"/api/observe/events?source=",
 		"/api/observe/health?after=1",
-		`/api/observe/events/${"x".repeat(257)}`,
+		"/api/observe/events/%20",
 	]) {
 		const before = seen.length;
 		const response = await fetch(authenticatedUiUrl(path));

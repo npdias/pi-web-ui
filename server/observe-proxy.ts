@@ -4,7 +4,6 @@ import express from "express";
 
 const DEFAULT_OBSERVE_UPSTREAM = "http://127.0.0.1:8765";
 const QUERY_LENGTH_LIMIT = 2_048;
-const FILTER_LENGTH_LIMIT = 256;
 const LAST_EVENT_ID_LENGTH_LIMIT = 64;
 const JSON_RESPONSE_BYTE_LIMIT = 16 * 1024 * 1024;
 const MAX_CONCURRENT_UPSTREAM_REQUESTS = 16;
@@ -131,11 +130,7 @@ function validatedQuery(req: Request, allowed: ReadonlySet<string>): URLSearchPa
 				}
 			}
 		} else if (FILTER_QUERY_KEYS.has(name)) {
-			if (
-				value.length === 0 ||
-				value.length > FILTER_LENGTH_LIMIT ||
-				/[\u0000-\u001f\u007f]/.test(value)
-			) {
+			if (value.length === 0) {
 				throw new ObserveProxyError(400, `${name} is invalid`);
 			}
 			if (name === "severity" && !SEVERITIES.has(value)) {
@@ -168,7 +163,7 @@ function validatedLastEventId(req: Request, query: URLSearchParams): string | un
 }
 
 function validatedEventId(value: string): string {
-	if (!/^[A-Za-z0-9._:-]{1,256}$/.test(value)) {
+	if (value.trim().length === 0) {
 		throw new ObserveProxyError(400, "event id is invalid");
 	}
 	return value;
