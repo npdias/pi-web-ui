@@ -28,8 +28,11 @@ function parseAcknowledgement(line: string): TelemetryAcknowledgement | null {
 		if (
 			typeof acknowledgement.event_id !== "string" ||
 			acknowledgement.event_id.trim() === "" ||
-			!Number.isInteger(acknowledgement.sequence) ||
-			(acknowledgement.error !== null && acknowledgement.error !== undefined)
+			typeof acknowledgement.sequence !== "number" ||
+			!Number.isSafeInteger(acknowledgement.sequence) ||
+			acknowledgement.sequence <= 0 ||
+			!Object.hasOwn(acknowledgement, "error") ||
+			acknowledgement.error !== null
 		) {
 			return null;
 		}
