@@ -4,6 +4,11 @@ import type { ClientMessage, ModelInfo, SlashCommandInfo, UiMessage, UiState } f
 import { useT } from "../i18n";
 import { isRasterImage } from "../image-paste";
 import { recordModelUsage } from "../model-usage";
+import {
+	applySkillCompletion,
+	getSkillCompletions,
+	type SkillCompletionItem,
+} from "../skill-completion";
 
 import { ModelThinking } from "./ModelThinking";
 import { useTemplates } from "./PromptTemplates";
@@ -86,6 +91,9 @@ export const ChatInput = memo(function ChatInput({
 	const [completions, setCompletions] = useState<SlashCommandInfo[] | null>(
 		null,
 	);
+	const [skillCompletions, setSkillCompletions] = useState<
+		SkillCompletionItem[] | null
+	>(null);
 	const [completionIndex, setCompletionIndex] = useState(0);
 	/** /help modal — shows the full command catalog. */
 	const [showHelp, setShowHelp] = useState(false);
@@ -105,7 +113,7 @@ export const ChatInput = memo(function ChatInput({
 	};
 
 	/** Recompute the command picker from the current input text. */
-	const updateCompletions = (value: string) => {
+	const updateCompletions = (value: string, cursor = value.length) => {
 		// Match the RAW value (no trim): a trailing space must close the picker
 		// so Enter right after it submits instead of completing the command.
 		const m = value.match(/^\/([^\s]*)$/);
@@ -115,9 +123,15 @@ export const ChatInput = memo(function ChatInput({
 				c.name.toLowerCase().startsWith(prefix),
 			);
 			setCompletions(matches.length > 0 ? matches : null);
+			setSkillCompletions(null);
 			setCompletionIndex(0);
 		} else {
 			setCompletions(null);
+			const skills = ready
+				? getSkillCompletions(value, cursor, slashCommands)
+				: null;
+			setSkillCompletions(skills?.items ?? null);
+			setCompletionIndex(0);
 		}
 	};
 
@@ -127,7 +141,7 @@ export const ChatInput = memo(function ChatInput({
 	useEffect(() => {
 		const el = menuRef.current?.querySelector(".slash-item.active");
 		el?.scrollIntoView({ block: "nearest" });
-	}, [completionIndex, completions]);
+	}, [completionIndex, completions, skillCompletions]);
 
 	/** Insert the highlighted command into the input (" /cmd " + rest). */
 	const acceptCompletion = (cmd?: SlashCommandInfo) => {
@@ -145,6 +159,23 @@ export const ChatInput = memo(function ChatInput({
 		setText(`/${pick.name} ${rest}`);
 		setCompletions(null);
 		taRef.current?.focus();
+	};
+
+	const acceptSkillCompletion = (skill?: SkillCompletionItem) => {
+		const list = skillCompletions ?? [];
+		const pick = skill ?? list[completionIndex % Math.max(list.length, 1)];
+		if (!pick) {
+			setSkillCompletions(null);
+			return;
+		}
+		const cursor = taRef.current?.selectionStart ?? text.length;
+		const completed = applySkillCompletion(text, cursor, pick.name);
+		setText(completed.text);
+		setSkillCompletions(null);
+		requestAnimationFrame(() => {
+			taRef.current?.focus();
+			taRef.current?.setSelectionRange(completed.cursor, completed.cursor);
+		});
 	};
 
 	const copyLastAssistant = async () => {
@@ -311,6 +342,29 @@ export const ChatInput = memo(function ChatInput({
 
 	const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
 		if (e.nativeEvent.isComposing) return;
+		if (skillCompletions && skillCompletions.length > 0) {
+			switch (e.key) {
+				case "ArrowDown":
+					e.preventDefault();
+					setCompletionIndex((i) => (i + 1) % skillCompletions.length);
+					return;
+				case "ArrowUp":
+					e.preventDefault();
+					setCompletionIndex(
+						(i) => (i - 1 + skillCompletions.length) % skillCompletions.length,
+					);
+					return;
+				case "Tab":
+				case "Enter":
+					e.preventDefault();
+					acceptSkillCompletion();
+					return;
+				case "Escape":
+					e.preventDefault();
+					setSkillCompletions(null);
+					return;
+			}
+		}
 		// Slash-command picker navigation.
 		if (completions && completions.length > 0) {
 			switch (e.key) {
@@ -492,6 +546,31 @@ export const ChatInput = memo(function ChatInput({
 					))}
 				</div>
 			)}
+			{skillCompletions && skillCompletions.length > 0 && (
+				<div className="slash-menu" role="listbox" ref={menuRef} aria-label="Skills">
+					<div className="slash-menu-hint">
+						<span>↑↓ select · Enter/Tab insert skill</span>
+						<span className="slash-menu-close" onClick={() => setSkillCompletions(null)}>
+							Esc
+						</span>
+					</div>
+					{skillCompletions.map((skill, i) => (
+						<button
+							type="button"
+							key={skill.name}
+							className={`slash-item${i === completionIndex ? " active" : ""}`}
+							onMouseEnter={() => setCompletionIndex(i)}
+							onClick={() => acceptSkillCompletion(skill)}
+						>
+							<span className="slash-name">${skill.name}</span>
+							<span className="slash-source skill">{t("slashSkill")}</span>
+							<span className="slash-desc">
+								{skill.descriptionEn ?? skill.description ?? ""}
+							</span>
+						</button>
+					))}
+				</div>
+			)}
 			{showHelp && (
 				<div className="modal-backdrop" onClick={() => setShowHelp(false)}>
 					<div
@@ -557,7 +636,7 @@ export const ChatInput = memo(function ChatInput({
 					disabled={!connected}
 					onChange={(e) => {
 						setText(e.target.value);
-						updateCompletions(e.target.value);
+						updateCompletions(e.target.value, e.target.selectionStart);
 					}}
 					onKeyDown={onKeyDown}
 					onPaste={onPaste}
