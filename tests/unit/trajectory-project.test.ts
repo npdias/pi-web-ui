@@ -139,7 +139,6 @@ describe("projectTrajectory", () => {
 		const request = all.find(
 			(record) =>
 				record.eventKind === "agent.turn" &&
-				record.phase === "start" &&
 				record.turnId === "normal:turn:1",
 		);
 
@@ -201,8 +200,8 @@ describe("projectTrajectory", () => {
 			isOpen: false,
 		});
 		expect(cancelled.map((record) => record.eventKind)).toEqual([
-			"agent.turn",
 			"agent.run",
+			"agent.turn",
 		]);
 		expect(cancelled.every((record) => record.isOpen === false)).toBe(true);
 	});
@@ -398,24 +397,33 @@ describe("projectTrajectory", () => {
 				attributes: { tool_name: "read", matched_start: false },
 			}),
 		]);
-		const runStarts = all.filter(
-			(record) => record.eventKind === "agent.run" && record.phase === "start",
+		const runs = all.filter(
+			(record) => record.eventKind === "agent.run",
 		);
 		const tools = all.filter((record) => record.eventKind === "tool.execution");
 
-		expect(runStarts.map((record) => record.isOpen)).toEqual([false, true]);
-		expect(tools).toHaveLength(1);
+		expect(runs.map((record) => [record.attemptOrdinal, record.state, record.isOpen])).toEqual([
+			[1, "retrying", false],
+			[2, "running", true],
+		]);
+		expect(tools).toHaveLength(2);
 		expect(tools[0]).toMatchObject({
 			isOpen: false,
-			durationMs: null,
-			state: "conflict",
-			terminalConflict: true,
+			durationMs: 2,
+			state: "completed",
+			terminalConflict: false,
 			sourceEventIds: [
 				"synthetic:event:4",
 				"synthetic:event:5",
 				"synthetic:event:6",
-				"synthetic:event:7",
 			],
+		});
+		expect(tools[1]).toMatchObject({
+			attemptOrdinal: 2,
+			state: "conflict",
+			terminalConflict: true,
+			unmatchedTerminal: true,
+			sourceEventIds: ["synthetic:event:7"],
 		});
 	});
 
@@ -494,21 +502,25 @@ describe("projectTrajectory", () => {
 			(record) => record.eventKind === "tool.execution",
 		);
 
-		expect(conflicted).toHaveLength(1);
+		expect(conflicted).toHaveLength(2);
 		expect(conflicted[0]).toMatchObject({
 			id: settledId,
+			attemptOrdinal: 1,
+			kind: "TOOL",
+			state: "completed",
+			sourceEventIds: ["synthetic:event:1", "synthetic:event:2"],
+		});
+		expect(conflicted[1]).toMatchObject({
+			attemptOrdinal: 2,
 			kind: "ERROR",
 			severity: "error",
 			state: "conflict",
 			isError: true,
 			isOpen: false,
-			durationMs: null,
+			durationMs: 11,
 			terminalConflict: true,
-			sourceEventIds: [
-				"synthetic:event:1",
-				"synthetic:event:2",
-				"synthetic:event:3",
-			],
+			unmatchedTerminal: true,
+			sourceEventIds: ["synthetic:event:3"],
 		});
 	});
 
@@ -552,9 +564,6 @@ describe("projectTrajectory", () => {
 			duration_ms: 11,
 			attributes: { is_error: true, matched_start: false },
 		});
-		const ordinaryTerminalId = records([start, failed]).find(
-			(record) => record.sourceEventIds.includes(failed.event_id),
-		)?.id;
 		const all = records([start, completed, failed, failed]);
 		const conflict = all.find(
 			(record) =>
@@ -562,22 +571,19 @@ describe("projectTrajectory", () => {
 				(record as { terminalConflict?: boolean }).terminalConflict === true,
 		);
 
-		expect(all.filter((record) => record.eventKind === kind)).toHaveLength(3);
+		expect(all.filter((record) => record.eventKind === kind)).toHaveLength(2);
 		expect(conflict).toMatchObject({
-			id: ordinaryTerminalId,
+			attemptOrdinal: 2,
 			sequence: 3,
 			kind: "ERROR",
 			severity: "error",
 			state: "conflict",
 			isError: true,
 			isOpen: false,
-			durationMs: null,
+			durationMs: 11,
 			terminalConflict: true,
-			sourceEventIds: [
-				"synthetic:event:1",
-				"synthetic:event:2",
-				"synthetic:event:3",
-			],
+			unmatchedTerminal: true,
+			sourceEventIds: ["synthetic:event:3"],
 		});
 	});
 
@@ -653,7 +659,7 @@ describe("projectTrajectory", () => {
 		]);
 	});
 
-	it("keeps tool identity stable when its start enters or leaves the loaded window", () => {
+	it("anchors tool identity in local durable start or terminal evidence", () => {
 		const correlation = {
 			trace_id: "window-trace",
 			turn_id: "window-turn",
@@ -680,7 +686,7 @@ describe("projectTrajectory", () => {
 		const endOnlyId = records([end])[0]?.id;
 
 		expect(openId).toBe(pairedId);
-		expect(pairedId).toBe(endOnlyId);
+		expect(endOnlyId).not.toBe(pairedId);
 	});
 
 	it("caps ledger summaries without changing normalized source envelopes", () => {
@@ -759,7 +765,7 @@ describe("projectTrajectory", () => {
 		});
 	});
 
-	it("uses earliest duplicate start when terminal row retains crossed-gap evidence", () => {
+	it("treats post-gap duplicate start as a new untainted attempt", () => {
 		const correlation = {
 			trace_id: "duplicate-gap-run",
 			turn_id: "duplicate-gap-turn",
@@ -788,16 +794,26 @@ describe("projectTrajectory", () => {
 			correlation,
 			attributes: { matched_start: true },
 		});
-		const terminal = records([
+		const attempts = records([
 			{ type: "event", event: start },
 			{ type: "gap", gap },
 			{ type: "event", event: duplicate },
 			{ type: "event", event: end },
-		]).find((record) => record.sourceEventIds.includes(end.event_id));
+		]).filter((record) => record.eventKind === "agent.turn");
 
-		expect(terminal).toMatchObject({
-			gapTainted: true,
+		expect(attempts).toHaveLength(2);
+		expect(attempts[0]).toMatchObject({
+			attemptOrdinal: 1,
+			closureUnknown: true,
 			gapEvidence: [gap],
+		});
+		expect(attempts[1]).toMatchObject({
+			attemptOrdinal: 2,
+			attemptOrdinalKnown: false,
+			state: "completed",
+			gapTainted: false,
+			gapEvidence: [],
+			sourceEventIds: [duplicate.event_id, end.event_id],
 		});
 	});
 
@@ -865,20 +881,22 @@ describe("projectTrajectory", () => {
 			{ type: "event", event: end },
 		]);
 		const span = all.find((record) => record.sourceEventIds.includes(start.event_id));
-		const terminal = kind === "tool.execution"
-			? span
-			: all.find((record) => record.sourceEventIds.includes(end.event_id));
+		const terminal = all.find((record) => record.sourceEventIds.includes(end.event_id));
 
 		expect(span).toMatchObject({
 			isOpen: false,
-			closureUnknown: false,
+			closureUnknown: true,
 			gapTainted: true,
 			gapEvidence: [gap],
 		});
 		expect(terminal).toMatchObject({
-			closureUnknown: false,
+			attemptOrdinal: 2,
+			attemptOrdinalKnown: false,
+			closureUnknown: true,
 			gapTainted: true,
 			gapEvidence: [gap],
+			unmatchedTerminal: true,
+			sourceEventIds: [end.event_id],
 		});
 	});
 
@@ -976,7 +994,7 @@ describe("projectTrajectory", () => {
 		).toEqual([start, duplicate]);
 	});
 
-	it("retains every conflicting terminal envelope in conservative metadata aggregates", () => {
+	it("keeps conflicting terminal metadata local to terminal-only attempt", () => {
 		const correlation = {
 			trace_id: "metadata-conflict-run",
 			turn_id: "metadata-conflict-turn",
@@ -1020,11 +1038,12 @@ describe("projectTrajectory", () => {
 
 		expect(conflict).toMatchObject({
 			privacyClass: "secret",
-			payloadRefs: ["payloads/start", "payloads/completed", "payloads/failed"],
-			redaction: { applied: true, fields: ["a", "b", "c"] },
+			payloadRefs: ["payloads/failed"],
+			redaction: { applied: true, fields: ["a", "c"] },
+			sourceEventIds: [failed.event_id],
 		});
 		expect(
 			(conflict as unknown as { sourceEnvelopes: readonly TelemetryEvent[] }).sourceEnvelopes,
-		).toEqual([start, completed, failed]);
+		).toEqual([failed]);
 	});
 });

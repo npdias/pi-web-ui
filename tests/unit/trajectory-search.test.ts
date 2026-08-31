@@ -8,7 +8,10 @@
 import { describe, expect, it } from "vitest";
 import { projectTrajectory } from "../../web/src/observe/trajectory/project.js";
 import { TrajectorySearchIndex } from "../../web/src/observe/trajectory/search-index.js";
-import type { TelemetryEvent } from "../../web/src/observe/telemetry-types.js";
+import type {
+	TelemetryEvent,
+	TelemetryReplayGap,
+} from "../../web/src/observe/telemetry-types.js";
 import { parseTelemetryEvent } from "../../web/src/observe/telemetry-types.js";
 
 function event(
@@ -142,5 +145,73 @@ describe("TrajectorySearchIndex", () => {
 
 		expect(index.search("deploy")).not.toBe(first);
 		expect(index.cachedQueryCount).toBeLessThanOrEqual(32);
+	});
+
+	it("indexes top-level attempt diagnostics without indexing payload refs", () => {
+		const scope = {
+			trace_id: "diagnostic-run",
+			turn_id: "diagnostic-turn",
+			step_id: "diagnostic-step",
+			request_id: "diagnostic-request",
+		};
+		const gap: TelemetryReplayGap = {
+			requested: 2,
+			earliest_available: 4,
+			resume_after: 3,
+		};
+		const index = new TrajectorySearchIndex();
+		index.update(projectTrajectory([
+			event(1, "tool.execution", {
+				phase: "start",
+				state: "running",
+				correlation: { ...scope, tool_call_id: "gap-call" },
+				attributes: { tool_name: "read" },
+				payload_ref: "payloads/never-search-gap",
+			}),
+			event(2, "tool.execution", {
+				phase: "start",
+				state: "running",
+				correlation: { ...scope, tool_call_id: "gap-call" },
+				attributes: { tool_name: "read", duplicate_start: true },
+			}),
+			{ type: "gap", gap },
+			event(4, "tool.execution", {
+				phase: "end",
+				state: "completed",
+				correlation: { ...scope, tool_call_id: "gap-call" },
+				attributes: { tool_name: "read", matched_start: false },
+			}),
+			event(5, "tool.execution", {
+				phase: "start",
+				state: "running",
+				correlation: { ...scope, tool_call_id: "privacy-call" },
+				attributes: { tool_name: "write" },
+				privacy_class: undefined,
+			}),
+			event(6, "tool.execution", {
+				phase: "end",
+				state: "completed",
+				correlation: { ...scope, tool_call_id: "privacy-call" },
+				attributes: { tool_name: "write", matched_start: true },
+			}),
+			event(7, "tool.execution", {
+				phase: "end",
+				state: "error",
+				severity: "error",
+				correlation: { ...scope, tool_call_id: "privacy-call" },
+				attributes: { tool_name: "write", is_error: true, matched_start: false },
+				payload_ref: "payloads/never-search-conflict",
+			}),
+		]));
+
+		expect(index.search("diagnostic")?.size).toBeGreaterThan(0);
+		expect(index.search("duplicate start")?.size).toBe(1);
+		expect(index.search("gap tainted")?.size).toBeGreaterThan(0);
+		expect(index.search("closure unknown")?.size).toBeGreaterThan(0);
+		expect(index.search("unmatched terminal")?.size).toBeGreaterThan(0);
+		expect(index.search("terminal conflict")?.size).toBe(1);
+		expect(index.search("privacy incomplete")?.size).toBe(1);
+		expect(index.search("never-search-gap")).toEqual(new Set());
+		expect(index.search("never-search-conflict")).toEqual(new Set());
 	});
 });

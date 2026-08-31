@@ -37,6 +37,8 @@ interface TrajectoryRecordBase {
 	readonly kind: TrajectoryRecordKind;
 	/** First source sequence represented by this row. */
 	readonly sequence: number;
+	/** Source-scoped lifecycle attempt ordinal. Absent for gaps/non-lifecycle events. */
+	readonly attemptOrdinal?: number;
 	readonly summary: string;
 	readonly summaryTruncated?: boolean;
 	/** Recorded duration only. `null` means unknown, never zero-filled. */
@@ -73,6 +75,8 @@ export interface TelemetryTrajectoryRecord extends TrajectoryRecordBase {
 	readonly source: TelemetrySource;
 	readonly correlation?: TelemetryCorrelation;
 	readonly attributes: Readonly<Record<string, TelemetryJson>>;
+	/** False until an upstream complete-history boundary makes global count provable. */
+	readonly attemptOrdinalKnown: boolean;
 	/** A replay gap may contain the missing terminal, so active/closed state is unknown. */
 	readonly closureUnknown: boolean;
 	/** At least one replay gap intersects the observed lifecycle interval. */
@@ -80,9 +84,12 @@ export interface TelemetryTrajectoryRecord extends TrajectoryRecordBase {
 	readonly gapEvidence: readonly TelemetryReplayGap[];
 	/** Two or more distinct terminal envelopes exist without an intervening start. */
 	readonly terminalConflict: boolean;
+	readonly unmatchedTerminal: boolean;
+	readonly diagnostic: boolean;
 	/** Normalized source envelopes retained in server sequence order; payloads stay references. */
 	readonly sourceEnvelopes: readonly TelemetryEvent[];
 	readonly privacyClass?: string;
+	readonly privacyIncomplete: boolean;
 	readonly payloadRefs: readonly string[];
 	readonly redaction?: Readonly<Record<string, TelemetryJson>>;
 }
