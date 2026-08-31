@@ -80,38 +80,191 @@ const CASES = [
 ] as const;
 
 describe("trajectory lifecycle attempts", () => {
+	it("uses source-owned tool attempt ID across open, paired, and hydrated windows", () => {
+		const correlation = {
+			trace_id: "source-id-run",
+			turn_id: "source-id-turn",
+			step_id: "source-id-step",
+			request_id: "source-id-request",
+			tool_call_id: "reused-tool-call",
+		};
+		const start = event(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: {
+				tool_name: "read",
+				lifecycle_attempt_id: "source-tool-attempt-1",
+			},
+		});
+		const end = event(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: {
+				tool_name: "read",
+				matched_start: true,
+				lifecycle_attempt_id: "source-tool-attempt-1",
+			},
+		});
+		const openId = telemetryRecords([start])[0]?.id;
+		const pairedId = telemetryRecords([start, end])[0]?.id;
+		const endOnlyId = telemetryRecords([end])[0]?.id;
+		const hydrated = telemetryRecords([end, start]);
+		const second = event(3, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: {
+				tool_name: "read",
+				lifecycle_attempt_id: "source-tool-attempt-2",
+			},
+		});
+
+		expect(openId).toBe(pairedId);
+		expect(pairedId).toBe(endOnlyId);
+		expect(hydrated).toHaveLength(1);
+		expect(hydrated[0]?.sourceEventIds).toEqual([start.event_id, end.event_id]);
+		expect(telemetryRecords([start, end, second])).toHaveLength(2);
+		expect(telemetryRecords([start, end, second])[1]?.id).not.toBe(pairedId);
+	});
+
+	it("keeps legacy tool start/end without source attempt IDs separate", () => {
+		const correlation = {
+			trace_id: "legacy-run",
+			turn_id: "legacy-turn",
+			step_id: "legacy-step",
+			request_id: "legacy-request",
+			tool_call_id: "legacy-call",
+		};
+		const start = event(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: { tool_name: "read" },
+		});
+		const end = event(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			attributes: { tool_name: "read", matched_start: true },
+		});
+		const records = telemetryRecords([start, end]);
+
+		expect(records).toHaveLength(2);
+		expect(records.map((record) => record.sourceEventIds)).toEqual([
+			[start.event_id],
+			[end.event_id],
+		]);
+		expect(new Set(records.map((record) => record.id)).size).toBe(2);
+		expect(records[0]).toMatchObject({
+			state: "unmatched_start",
+			closureUnknown: true,
+			diagnostic: true,
+			unmatchedTerminal: false,
+		});
+		expect(records[1]).toMatchObject({
+			state: "unmatched_terminal",
+			diagnostic: true,
+			unmatchedTerminal: true,
+		});
+	});
+
+	it("reconnects exact source-owned tool attempt across gap without losing evidence", () => {
+		const correlation = {
+			trace_id: "exact-gap-run",
+			turn_id: "exact-gap-turn",
+			step_id: "exact-gap-step",
+			request_id: "exact-gap-request",
+			tool_call_id: "exact-gap-call",
+		};
+		const gap: TelemetryReplayGap = {
+			requested: 1,
+			earliest_available: 3,
+			resume_after: 2,
+		};
+		const start = event(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation,
+			attributes: {
+				tool_name: "read",
+				lifecycle_attempt_id: "exact-gap-attempt",
+			},
+		});
+		const end = event(3, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation,
+			duration_ms: 2,
+			attributes: {
+				tool_name: "read",
+				matched_start: true,
+				lifecycle_attempt_id: "exact-gap-attempt",
+			},
+		});
+		const records = telemetryRecords([
+			{ type: "event", event: start },
+			{ type: "gap", gap },
+			{ type: "event", event: end },
+		]);
+
+		expect(records).toHaveLength(1);
+		expect(records[0]).toMatchObject({
+			state: "completed",
+			durationMs: 2,
+			isOpen: false,
+			closureUnknown: false,
+			gapTainted: true,
+			gapEvidence: [gap],
+			sourceEventIds: [start.event_id, end.event_id],
+		});
+	});
+
 	it.each(CASES)("creates two source-scoped $name attempts for two start/end cycles", ({
 		kind,
 		correlation,
 		startAttributes,
 		endAttributes,
 	}) => {
+		const firstStartAttributes = kind === "tool.execution"
+			? { ...startAttributes, lifecycle_attempt_id: "case-tool-attempt-1" }
+			: startAttributes;
+		const firstEndAttributes = kind === "tool.execution"
+			? { ...endAttributes, lifecycle_attempt_id: "case-tool-attempt-1" }
+			: endAttributes;
+		const secondStartAttributes = kind === "tool.execution"
+			? { ...startAttributes, lifecycle_attempt_id: "case-tool-attempt-2" }
+			: startAttributes;
+		const secondEndAttributes = kind === "tool.execution"
+			? { ...endAttributes, lifecycle_attempt_id: "case-tool-attempt-2" }
+			: endAttributes;
 		const records = telemetryRecords([
 			event(1, kind, {
 				phase: "start",
 				state: "running",
 				correlation,
-				attributes: startAttributes,
+				attributes: firstStartAttributes,
 			}),
 			event(2, kind, {
 				phase: "end",
 				state: "completed",
 				correlation,
 				duration_ms: 10,
-				attributes: endAttributes,
+				attributes: firstEndAttributes,
 			}),
 			event(3, kind, {
 				phase: "start",
 				state: "running",
 				correlation,
-				attributes: startAttributes,
+				attributes: secondStartAttributes,
 			}),
 			event(4, kind, {
 				phase: "end",
 				state: "completed",
 				correlation,
 				duration_ms: 20,
-				attributes: endAttributes,
+				attributes: secondEndAttributes,
 			}),
 		]).filter((record) => record.eventKind === kind);
 
@@ -141,13 +294,20 @@ describe("trajectory lifecycle attempts", () => {
 				phase: "start",
 				state: "running",
 				correlation,
-				attributes: { tool_name: "read" },
+				attributes: {
+					tool_name: "read",
+					lifecycle_attempt_id: "duplicate-source-attempt",
+				},
 			}),
 			event(2, "tool.execution", {
 				phase: "start",
 				state: "running",
 				correlation,
-				attributes: { tool_name: "read", duplicate_start: true },
+				attributes: {
+					tool_name: "read",
+					duplicate_start: true,
+					lifecycle_attempt_id: "duplicate-source-attempt",
+				},
 			}),
 		]);
 
@@ -173,14 +333,23 @@ describe("trajectory lifecycle attempts", () => {
 			phase: "end",
 			state: "completed",
 			correlation,
-			attributes: { tool_name: "read", matched_start: false },
+			attributes: {
+				tool_name: "read",
+				matched_start: false,
+				lifecycle_attempt_id: "terminal-source-attempt-1",
+			},
 		});
 		const failed = event(3, "tool.execution", {
 			phase: "end",
 			state: "error",
 			severity: "error",
 			correlation,
-			attributes: { tool_name: "read", is_error: true, matched_start: false },
+			attributes: {
+				tool_name: "read",
+				is_error: true,
+				matched_start: false,
+				lifecycle_attempt_id: "terminal-source-attempt-2",
+			},
 		});
 		const records = telemetryRecords([completed, failed]);
 
@@ -194,7 +363,7 @@ describe("trajectory lifecycle attempts", () => {
 		expect(records[1]).toMatchObject({
 			kind: "ERROR",
 			unmatchedTerminal: true,
-			terminalConflict: true,
+			terminalConflict: false,
 			sourceEventIds: [failed.event_id],
 		});
 	});
@@ -262,14 +431,21 @@ describe("trajectory lifecycle attempts", () => {
 			phase: "start",
 			state: "running",
 			correlation,
-			attributes: { tool_name: "read" },
+			attributes: {
+				tool_name: "read",
+				lifecycle_attempt_id: "privacy-source-attempt",
+			},
 			privacy_class: "restricted",
 		});
 		const end = event(2, "tool.execution", {
 			phase: "end",
 			state: "completed",
 			correlation,
-			attributes: { tool_name: "read", matched_start: true },
+			attributes: {
+				tool_name: "read",
+				matched_start: true,
+				lifecycle_attempt_id: "privacy-source-attempt",
+			},
 			privacy_class: undefined,
 		});
 		const [record] = telemetryRecords([start, end]);
@@ -377,6 +553,7 @@ describe("trajectory lifecycle attempts", () => {
 					tool_name: "read",
 					is_error: index % 2 === 1,
 					matched_start: false,
+					lifecycle_attempt_id: `bounded-source-attempt-${index + 1}`,
 				},
 			}),
 		);

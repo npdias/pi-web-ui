@@ -70,7 +70,6 @@ interface OpenAttempt {
 }
 
 interface AttemptTracker {
-	nextOrdinal: number;
 	lastGapIndexSeen: number;
 	hasSettledAttempt: boolean;
 	open?: OpenAttempt;
@@ -139,6 +138,12 @@ function eventRecordId(event: TelemetryEvent): string {
 }
 
 function attemptRecordId(key: string, anchor: TelemetryEvent): string {
+	if (
+		anchor.kind === "tool.execution" &&
+		stringAttribute(anchor.attributes, "lifecycle_attempt_id") !== undefined
+	) {
+		return `attempt:${key}`;
+	}
 	return `attempt:${key}|anchor:${identityPart(anchor.event_id)}|sequence:${anchor.sequence}`;
 }
 
@@ -177,7 +182,7 @@ function lifecycleSemanticId(event: TelemetryEvent): string | undefined {
 		case "agent.turn":
 			return event.correlation?.turn_id;
 		case "tool.execution":
-			return event.correlation?.tool_call_id;
+			return stringAttribute(event.attributes, "lifecycle_attempt_id");
 		default:
 			return undefined;
 	}
@@ -185,6 +190,15 @@ function lifecycleSemanticId(event: TelemetryEvent): string | undefined {
 
 function lifecycleKey(event: TelemetryEvent): string | undefined {
 	const semanticId = lifecycleSemanticId(event);
+	return semanticId === undefined
+		? undefined
+		: `${event.kind}|${scopedIdentity(event.source, event.correlation, semanticId)}`;
+}
+
+function ordinalLifecycleKey(event: TelemetryEvent): string | undefined {
+	const semanticId = event.kind === "tool.execution"
+		? event.correlation?.tool_call_id
+		: lifecycleSemanticId(event);
 	return semanticId === undefined
 		? undefined
 		: `${event.kind}|${scopedIdentity(event.source, event.correlation, semanticId)}`;
@@ -499,6 +513,20 @@ function settleAttempt(
 	};
 }
 
+function settleGapTaintedAttempt(
+	record: TelemetryTrajectoryRecord,
+	event: TelemetryEvent,
+): TelemetryTrajectoryRecord {
+	const gapEvidence = record.gapEvidence;
+	return {
+		...settleAttempt(record, event),
+		closureUnknown: false,
+		gapTainted: true,
+		gapEvidence,
+		diagnostic: true,
+	};
+}
+
 function terminalOnlyAttempt(
 	event: TelemetryEvent,
 	key: string,
@@ -586,6 +614,24 @@ function standaloneEventRecord(event: TelemetryEvent): TelemetryTrajectoryRecord
 	};
 }
 
+function unidentifiedLifecycleRecord(event: TelemetryEvent): TelemetryTrajectoryRecord {
+	const record = standaloneEventRecord(event);
+	if (event.phase === "start") {
+		return {
+			...record,
+			state: "unmatched_start",
+			closureUnknown: true,
+			diagnostic: true,
+		};
+	}
+	return {
+		...record,
+		state: "unmatched_terminal",
+		unmatchedTerminal: true,
+		diagnostic: true,
+	};
+}
+
 function gapRecord(gap: TelemetryReplayGap): GapTrajectoryRecord {
 	return {
 		id: gapRecordId(gap),
@@ -623,6 +669,7 @@ function markGapBoundary(
 function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly TrajectoryRecord[] {
 	const output: TrajectoryRecord[] = [];
 	const trackers = new Map<string, AttemptTracker>();
+	const ordinalCounters = new Map<string, number>();
 	const openTrackers = new Set<AttemptTracker>();
 	const uncertainTrackers = new Set<AttemptTracker>();
 	const gaps: TelemetryReplayGap[] = [];
@@ -659,7 +706,20 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 		const event = input.event;
 		if (!SUPPORTED_EVENT_KINDS.has(event.kind)) continue;
 		const key = lifecycleKey(event);
-		if (key === undefined || (event.phase !== "start" && event.phase !== "end")) {
+		if (key === undefined) {
+			if (
+				(event.kind === "agent.run" ||
+					event.kind === "agent.turn" ||
+					event.kind === "tool.execution") &&
+				(event.phase === "start" || event.phase === "end")
+			) {
+				output.push(unidentifiedLifecycleRecord(event));
+			} else {
+				output.push(standaloneEventRecord(event));
+			}
+			continue;
+		}
+		if (event.phase !== "start" && event.phase !== "end") {
 			output.push(standaloneEventRecord(event));
 			continue;
 		}
@@ -667,11 +727,36 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 		let tracker = trackers.get(key);
 		if (tracker === undefined) {
 			tracker = {
-				nextOrdinal: 0,
 				lastGapIndexSeen: 0,
 				hasSettledAttempt: false,
 			};
 			trackers.set(key, tracker);
+		}
+		if (
+			event.kind === "tool.execution" &&
+			tracker.uncertainRecordIndex !== undefined
+		) {
+			const recordIndex = tracker.uncertainRecordIndex;
+			const record = output[recordIndex];
+			if (record !== undefined && record.kind !== "GAP") {
+				if (event.phase === "start") {
+					output[recordIndex] = {
+						...mergeOpenAttemptEvidence(
+							record,
+							[...record.sourceEnvelopes, event],
+						),
+						diagnostic: true,
+					};
+					tracker.lastGapIndexSeen = gaps.length;
+					continue;
+				}
+				output[recordIndex] = settleGapTaintedAttempt(record, event);
+			}
+			tracker.uncertainRecordIndex = undefined;
+			tracker.hasSettledAttempt = true;
+			tracker.lastGapIndexSeen = gaps.length;
+			uncertainTrackers.delete(tracker);
+			continue;
 		}
 		if (tracker.uncertainRecordIndex !== undefined) {
 			tracker.uncertainRecordIndex = undefined;
@@ -683,7 +768,9 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 				tracker.open.events.push(event);
 				continue;
 			}
-			const ordinal = ++tracker.nextOrdinal;
+			const ordinalKey = ordinalLifecycleKey(event) ?? key;
+			const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
+			ordinalCounters.set(ordinalKey, ordinal);
 			const recordIndex = output.push(
 				openAttemptRecord(event, key, ordinal),
 			) - 1;
@@ -708,7 +795,9 @@ function projectAttemptRecords(inputs: readonly OrderedInput[]): readonly Trajec
 			continue;
 		}
 
-		const ordinal = ++tracker.nextOrdinal;
+		const ordinalKey = ordinalLifecycleKey(event) ?? key;
+		const ordinal = (ordinalCounters.get(ordinalKey) ?? 0) + 1;
+		ordinalCounters.set(ordinalKey, ordinal);
 		const relevantGaps = gaps.slice(tracker.lastGapIndexSeen);
 		output.push(terminalOnlyAttempt(
 			event,

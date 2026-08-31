@@ -72,6 +72,7 @@ const EXPECTATION_STATES = new Set([
 ]);
 const EXPECTATION_ATTRIBUTES = new Set([
 	"is_error",
+	"lifecycle_attempt_id",
 	"matched_start",
 	"silence_ms",
 	"threshold_ms",
@@ -196,7 +197,7 @@ function validateExpectation(expectation, location) {
 		assert.ok(isRecord(expectation.attributes), `${location}.attributes must be an object`);
 		for (const [key, value] of Object.entries(expectation.attributes)) {
 			assert.ok(EXPECTATION_ATTRIBUTES.has(key), `${location} contains unknown attribute ${key}`);
-			if (key === "tool_name") {
+			if (key === "tool_name" || key === "lifecycle_attempt_id") {
 				assert.equal(typeof value, "string", `${location}.attributes.${key} is invalid`);
 			} else if (key.endsWith("_ms")) {
 				assert.equal(typeof value, "number", `${location}.attributes.${key} is invalid`);

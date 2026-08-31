@@ -46,6 +46,7 @@ interface TurnSpan {
 }
 
 interface ToolSpan {
+	attemptId: string;
 	correlation: SpanCorrelation;
 	startedAt: number;
 	toolName: string;
@@ -457,6 +458,7 @@ export class PiEventMapper {
 	private readonly stallThresholdMs: number;
 	private runSequence = 0;
 	private turnSequence = 0;
+	private toolAttemptSequence = 0;
 	private currentRun: RunSpan | null = null;
 	private currentTurn: TurnSpan | null = null;
 	private readonly toolStarts = new Map<string, ToolSpan>();
@@ -592,6 +594,7 @@ export class PiEventMapper {
 			case "tool_execution_start": {
 				const existing = this.toolStarts.get(event.toolCallId);
 				const span: ToolSpan = existing ?? {
+					attemptId: `${this.idNamespace}:tool-attempt:${++this.toolAttemptSequence}`,
 					correlation: this.currentSpan(),
 					startedAt: monotonicTime,
 					toolName: event.toolName,
@@ -608,6 +611,7 @@ export class PiEventMapper {
 						span: span.correlation,
 						toolCallId: event.toolCallId,
 						attributes: {
+							lifecycle_attempt_id: span.attemptId,
 							tool_name: event.toolName,
 							...(existing ? { duplicate_start: true } : {}),
 						},
@@ -619,6 +623,8 @@ export class PiEventMapper {
 				const started = this.toolStarts.get(event.toolCallId);
 				if (started) this.toolStarts.delete(event.toolCallId);
 				const span = started?.correlation ?? this.currentSpan();
+				const attemptId = started?.attemptId ??
+					`${this.idNamespace}:tool-attempt:${++this.toolAttemptSequence}`;
 				records.push(
 					this.record({
 						kind: "tool.execution",
@@ -633,6 +639,7 @@ export class PiEventMapper {
 							? Math.max(0, monotonicTime - started.startedAt)
 							: undefined,
 						attributes: {
+							lifecycle_attempt_id: attemptId,
 							tool_name: event.toolName,
 							is_error: event.isError,
 							matched_start: started !== undefined,
@@ -734,6 +741,7 @@ export class PiEventMapper {
 					durationMs: Math.max(0, monotonicTime - tool.startedAt),
 					attributes: {
 						cause_class: "forced_reset",
+						lifecycle_attempt_id: tool.attemptId,
 						matched_start: true,
 						tool_name: tool.toolName,
 					},

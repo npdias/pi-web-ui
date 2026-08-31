@@ -378,6 +378,61 @@ describe("PiEventMapper", () => {
 		expect(duplicateEnd.attributes).toMatchObject({ matched_start: false });
 	});
 
+	it("owns stable tool attempt IDs across duplicate start and matched end", () => {
+		const subject = mapper();
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		const start = {
+			type: "tool_execution_start",
+			toolCallId: "reused-call",
+			toolName: "read",
+			args: { private_argument: "DO_NOT_SERIALIZE" },
+		} satisfies AgentSessionEvent;
+
+		const [firstStart] = subject.map(start);
+		const [duplicateStart] = subject.map(start);
+		const [firstEnd] = subject.map(toolEnd("reused-call"));
+		const [secondStart] = subject.map(start);
+		const [secondEnd] = subject.map(toolEnd("reused-call"));
+
+		expect(firstStart.attributes?.lifecycle_attempt_id).toBe(
+			"conversation-1:tool-attempt:1",
+		);
+		expect(duplicateStart.attributes?.lifecycle_attempt_id).toBe(
+			firstStart.attributes?.lifecycle_attempt_id,
+		);
+		expect(firstEnd.attributes?.lifecycle_attempt_id).toBe(
+			firstStart.attributes?.lifecycle_attempt_id,
+		);
+		expect(secondStart.attributes?.lifecycle_attempt_id).toBe(
+			"conversation-1:tool-attempt:2",
+		);
+		expect(secondEnd.attributes?.lifecycle_attempt_id).toBe(
+			secondStart.attributes?.lifecycle_attempt_id,
+		);
+		expect(JSON.stringify([firstStart, duplicateStart, firstEnd])).not.toContain(
+			"DO_NOT_SERIALIZE",
+		);
+	});
+
+	it("allocates local attempt IDs for unmatched tool terminals", () => {
+		const subject = mapper();
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+
+		const [first] = subject.map(toolEnd("missing"));
+		const [second] = subject.map(toolEnd("missing"));
+
+		expect(first.attributes).toMatchObject({
+			matched_start: false,
+			lifecycle_attempt_id: "conversation-1:tool-attempt:1",
+		});
+		expect(second.attributes).toMatchObject({
+			matched_start: false,
+			lifecycle_attempt_id: "conversation-1:tool-attempt:2",
+		});
+	});
+
 	it("reuses correlation for duplicate run and turn starts", () => {
 		const subject = mapper();
 		const [runStart] = subject.map({ type: "agent_start" });
@@ -836,13 +891,13 @@ describe("PiEventMapper", () => {
 		const subject = mapper(clock);
 		subject.map({ type: "agent_start" });
 		subject.map({ type: "turn_start" });
-		subject.map({
+		const [firstToolStart] = subject.map({
 			type: "tool_execution_start",
 			toolCallId: "call-1",
 			toolName: "read",
 			args: {},
 		});
-		subject.map({
+		const [secondToolStart] = subject.map({
 			type: "tool_execution_start",
 			toolCallId: "call-2",
 			toolName: "bash",
@@ -862,6 +917,10 @@ describe("PiEventMapper", () => {
 		expect(records.map((record) => record.correlation?.tool_call_id).filter(Boolean)).toEqual([
 			"call-1",
 			"call-2",
+		]);
+		expect(records.slice(0, 2).map((record) => record.attributes?.lifecycle_attempt_id)).toEqual([
+			firstToolStart.attributes?.lifecycle_attempt_id,
+			secondToolStart.attributes?.lifecycle_attempt_id,
 		]);
 		for (const record of records) {
 			expect(record.duration_ms).toBe(250);

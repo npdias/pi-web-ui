@@ -19,6 +19,15 @@ function event(
 	kind: string,
 	overrides: Partial<TelemetryEvent> = {},
 ): TelemetryEvent {
+	const correlation = overrides.correlation;
+	const attributes = { ...(overrides.attributes ?? {}) };
+	if (
+		kind === "tool.execution" &&
+		correlation?.tool_call_id !== undefined &&
+		attributes.lifecycle_attempt_id === undefined
+	) {
+		attributes.lifecycle_attempt_id = `search-attempt:${correlation.tool_call_id}`;
+	}
 	return parseTelemetryEvent({
 		schema_version: 1,
 		event_id: `search:event:${sequence}`,
@@ -34,9 +43,9 @@ function event(
 			instance_id: "search-session",
 			version: "0.84.4",
 		},
-		attributes: {},
 		privacy_class: "operator",
 		...overrides,
+		attributes,
 	});
 }
 
@@ -179,7 +188,11 @@ describe("TrajectorySearchIndex", () => {
 				phase: "end",
 				state: "completed",
 				correlation: { ...scope, tool_call_id: "gap-call" },
-				attributes: { tool_name: "read", matched_start: false },
+				attributes: {
+					tool_name: "read",
+					matched_start: false,
+					lifecycle_attempt_id: "search-attempt:gap-call:unmatched",
+				},
 			}),
 			event(5, "tool.execution", {
 				phase: "start",
@@ -199,8 +212,25 @@ describe("TrajectorySearchIndex", () => {
 				state: "error",
 				severity: "error",
 				correlation: { ...scope, tool_call_id: "privacy-call" },
-				attributes: { tool_name: "write", is_error: true, matched_start: false },
+				attributes: {
+					tool_name: "write",
+					is_error: true,
+					matched_start: false,
+					lifecycle_attempt_id: "search-attempt:privacy-call:unmatched",
+				},
 				payload_ref: "payloads/never-search-conflict",
+			}),
+			event(8, "tool.execution", {
+				phase: "end",
+				state: "error",
+				severity: "error",
+				correlation: { ...scope, tool_call_id: "privacy-call" },
+				attributes: {
+					tool_name: "write",
+					is_error: true,
+					matched_start: false,
+					lifecycle_attempt_id: "search-attempt:privacy-call:unmatched",
+				},
 			}),
 		]));
 

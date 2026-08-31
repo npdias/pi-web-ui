@@ -106,6 +106,15 @@ function envelope(
 	kind: string,
 	overrides: Partial<TelemetryEvent> = {},
 ): TelemetryEvent {
+	const correlation = overrides.correlation;
+	const attributes = { ...(overrides.attributes ?? {}) };
+	if (
+		kind === "tool.execution" &&
+		correlation?.tool_call_id !== undefined &&
+		attributes.lifecycle_attempt_id === undefined
+	) {
+		attributes.lifecycle_attempt_id = `synthetic-attempt:${correlation.tool_call_id}`;
+	}
 	return parseTelemetryEvent({
 		schema_version: 1,
 		event_id: `synthetic:event:${sequence}`,
@@ -120,9 +129,9 @@ function envelope(
 			component: "pi",
 			instance_id: "pi-session-01",
 		},
-		attributes: {},
 		privacy_class: "operator",
 		...overrides,
+		attributes,
 	});
 }
 
@@ -394,7 +403,11 @@ describe("projectTrajectory", () => {
 				phase: "end",
 				state: "completed",
 				correlation: tool,
-				attributes: { tool_name: "read", matched_start: false },
+				attributes: {
+					tool_name: "read",
+					matched_start: false,
+					lifecycle_attempt_id: "retry-call-unmatched-attempt",
+				},
 			}),
 		]);
 		const runs = all.filter(
@@ -420,8 +433,8 @@ describe("projectTrajectory", () => {
 		});
 		expect(tools[1]).toMatchObject({
 			attemptOrdinal: 2,
-			state: "conflict",
-			terminalConflict: true,
+			state: "unmatched_terminal",
+			terminalConflict: false,
 			unmatchedTerminal: true,
 			sourceEventIds: ["synthetic:event:7"],
 		});
@@ -495,7 +508,12 @@ describe("projectTrajectory", () => {
 			severity: "error",
 			correlation,
 			duration_ms: 11,
-			attributes: { tool_name: "read", is_error: true, matched_start: false },
+			attributes: {
+				tool_name: "read",
+				is_error: true,
+				matched_start: false,
+				lifecycle_attempt_id: "conflict-tool-unmatched-attempt",
+			},
 		});
 		const settledId = records([start, completed])[0]?.id;
 		const conflicted = records([start, completed, failed, failed]).filter(
@@ -514,11 +532,11 @@ describe("projectTrajectory", () => {
 			attemptOrdinal: 2,
 			kind: "ERROR",
 			severity: "error",
-			state: "conflict",
+			state: "unmatched_terminal",
 			isError: true,
 			isOpen: false,
 			durationMs: 11,
-			terminalConflict: true,
+			terminalConflict: false,
 			unmatchedTerminal: true,
 			sourceEventIds: ["synthetic:event:3"],
 		});
@@ -659,7 +677,7 @@ describe("projectTrajectory", () => {
 		]);
 	});
 
-	it("anchors tool identity in local durable start or terminal evidence", () => {
+	it("uses source-owned tool identity across open, paired, and end-only windows", () => {
 		const correlation = {
 			trace_id: "window-trace",
 			turn_id: "window-turn",
@@ -686,7 +704,7 @@ describe("projectTrajectory", () => {
 		const endOnlyId = records([end])[0]?.id;
 
 		expect(openId).toBe(pairedId);
-		expect(endOnlyId).not.toBe(pairedId);
+		expect(endOnlyId).toBe(pairedId);
 	});
 
 	it("caps ledger summaries without changing normalized source envelopes", () => {
@@ -871,7 +889,11 @@ describe("projectTrajectory", () => {
 			duration_ms: 3,
 			attributes:
 				kind === "tool.execution"
-					? { tool_name: "read", matched_start: true }
+					? {
+						tool_name: "read",
+						matched_start: true,
+						lifecycle_attempt_id: "gap-tool-terminal-attempt",
+					}
 					: { matched_start: true },
 		});
 		const all = records([
@@ -1025,7 +1047,12 @@ describe("projectTrajectory", () => {
 			state: "error",
 			severity: "error",
 			correlation,
-			attributes: { tool_name: "read", is_error: true, matched_start: false },
+			attributes: {
+				tool_name: "read",
+				is_error: true,
+				matched_start: false,
+				lifecycle_attempt_id: "metadata-conflict-terminal-attempt",
+			},
 			privacy_class: "secret",
 			payload_ref: "payloads/failed",
 			redaction: { applied: true, fields: ["c", "a"] },
@@ -1033,7 +1060,7 @@ describe("projectTrajectory", () => {
 		const conflict = records([start, completed, failed]).find(
 			(record) =>
 				record.eventKind === "tool.execution" &&
-				(record as { terminalConflict?: boolean }).terminalConflict === true,
+				record.sourceEventIds.includes(failed.event_id),
 		);
 
 		expect(conflict).toMatchObject({
@@ -1041,6 +1068,8 @@ describe("projectTrajectory", () => {
 			payloadRefs: ["payloads/failed"],
 			redaction: { applied: true, fields: ["a", "c"] },
 			sourceEventIds: [failed.event_id],
+			unmatchedTerminal: true,
+			terminalConflict: false,
 		});
 		expect(
 			(conflict as unknown as { sourceEnvelopes: readonly TelemetryEvent[] }).sourceEnvelopes,
