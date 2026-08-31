@@ -466,11 +466,74 @@ describe("PiEventMapper", () => {
 		["agent_end messages", { type: "agent_end", messages: null, willRetry: false }],
 		["agent_end message entry", { type: "agent_end", messages: [null], willRetry: false }],
 		["agent_end message object", { type: "agent_end", messages: [{}], willRetry: false }],
+		[
+			"agent_end assistant image content",
+			{
+				type: "agent_end",
+				messages: [
+					{
+						...assistant("stop"),
+						content: [{ type: "image", data: "base64", mimeType: "image/png" }],
+					},
+				],
+				willRetry: false,
+			},
+		],
+		[
+			"agent_end user thinking content",
+			{
+				type: "agent_end",
+				messages: [
+					{
+						role: "user",
+						content: [{ type: "thinking", thinking: "not valid user content" }],
+						timestamp: 1_000,
+					},
+				],
+				willRetry: false,
+			},
+		],
 		["turn_end message", { type: "turn_end", message: null, toolResults: [] }],
 		["turn_end message object", { type: "turn_end", message: {}, toolResults: [] }],
 		[
 			"turn_end tool result",
 			{ type: "turn_end", message: assistant("stop"), toolResults: [null] },
+		],
+		[
+			"turn_end tool result thinking content",
+			{
+				type: "turn_end",
+				message: assistant("stop"),
+				toolResults: [
+					{
+						role: "toolResult",
+						toolCallId: "call-1",
+						toolName: "bash",
+						content: [{ type: "thinking", thinking: "not valid tool content" }],
+						isError: false,
+						timestamp: 1_000,
+					},
+				],
+			},
+		],
+		[
+			"turn_end tool result toolCall content",
+			{
+				type: "turn_end",
+				message: assistant("stop"),
+				toolResults: [
+					{
+						role: "toolResult",
+						toolCallId: "call-1",
+						toolName: "bash",
+						content: [
+							{ type: "toolCall", id: "nested", name: "read", arguments: {} },
+						],
+						isError: false,
+						timestamp: 1_000,
+					},
+				],
+			},
 		],
 		["tool start identity", { type: "tool_execution_start", toolCallId: 7, toolName: "bash", args: {} }],
 		["tool end error flag", { type: "tool_execution_end", toolCallId: "call-1", toolName: "bash", result: {}, isError: "false" }],

@@ -73,24 +73,39 @@ function isDenseArrayOf(value: unknown, predicate: (item: unknown) => boolean): 
 	return true;
 }
 
-function isContentBlock(value: unknown): boolean {
-	if (!isRecord(value)) return false;
-	switch (value.type) {
-		case "text":
-			return typeof value.text === "string";
-		case "thinking":
-			return typeof value.thinking === "string";
-		case "image":
-			return typeof value.data === "string" && typeof value.mimeType === "string";
-		case "toolCall":
-			return (
-				typeof value.id === "string" &&
-				typeof value.name === "string" &&
-				isRecord(value.arguments)
-			);
-		default:
-			return false;
-	}
+function isTextBlock(value: unknown): boolean {
+	return isRecord(value) && value.type === "text" && typeof value.text === "string";
+}
+
+function isImageBlock(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		value.type === "image" &&
+		typeof value.data === "string" &&
+		typeof value.mimeType === "string"
+	);
+}
+
+function isThinkingBlock(value: unknown): boolean {
+	return isRecord(value) && value.type === "thinking" && typeof value.thinking === "string";
+}
+
+function isToolCallBlock(value: unknown): boolean {
+	return (
+		isRecord(value) &&
+		value.type === "toolCall" &&
+		typeof value.id === "string" &&
+		typeof value.name === "string" &&
+		isRecord(value.arguments)
+	);
+}
+
+function isAssistantContentBlock(value: unknown): boolean {
+	return isTextBlock(value) || isThinkingBlock(value) || isToolCallBlock(value);
+}
+
+function isInputContentBlock(value: unknown): boolean {
+	return isTextBlock(value) || isImageBlock(value);
 }
 
 function isUsage(value: unknown): boolean {
@@ -125,7 +140,7 @@ function isAssistantMessage(value: unknown): boolean {
 	return (
 		isRecord(value) &&
 		value.role === "assistant" &&
-		isDenseArrayOf(value.content, isContentBlock) &&
+		isDenseArrayOf(value.content, isAssistantContentBlock) &&
 		typeof value.api === "string" &&
 		typeof value.provider === "string" &&
 		typeof value.model === "string" &&
@@ -141,7 +156,7 @@ function isToolResultMessage(value: unknown): boolean {
 		value.role === "toolResult" &&
 		typeof value.toolCallId === "string" &&
 		typeof value.toolName === "string" &&
-		isDenseArrayOf(value.content, isContentBlock) &&
+		isDenseArrayOf(value.content, isInputContentBlock) &&
 		typeof value.isError === "boolean" &&
 		isFiniteNumber(value.timestamp)
 	);
@@ -154,7 +169,8 @@ function isAgentMessage(value: unknown): boolean {
 			return isAssistantMessage(value);
 		case "user":
 			return (
-				(typeof value.content === "string" || isDenseArrayOf(value.content, isContentBlock)) &&
+				(typeof value.content === "string" ||
+					isDenseArrayOf(value.content, isInputContentBlock)) &&
 				isFiniteNumber(value.timestamp)
 			);
 		case "toolResult":
@@ -171,7 +187,8 @@ function isAgentMessage(value: unknown): boolean {
 		case "custom":
 			return (
 				typeof value.customType === "string" &&
-				(typeof value.content === "string" || isDenseArrayOf(value.content, isContentBlock)) &&
+				(typeof value.content === "string" ||
+					isDenseArrayOf(value.content, isInputContentBlock)) &&
 				typeof value.display === "boolean" &&
 				isFiniteNumber(value.timestamp)
 			);
@@ -212,9 +229,7 @@ function isAssistantMessageEvent(value: unknown): boolean {
 		case "toolcall_end":
 			return (
 				isContentIndex(value.contentIndex) &&
-				isRecord(value.toolCall) &&
-				value.toolCall.type === "toolCall" &&
-				isContentBlock(value.toolCall) &&
+				isToolCallBlock(value.toolCall) &&
 				hasPartial
 			);
 		case "done":
