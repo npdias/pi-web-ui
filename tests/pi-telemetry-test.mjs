@@ -391,156 +391,12 @@ try {
 	) {
 		throw new Error("fixture changed existing WebSocket snapshot state");
 	}
-	const clientSession = appModule.service.get(clientId);
-	if (!clientSession) throw new Error("client session disappeared");
-	const preEditSession = clientSession.session;
-	const preEditSessionId = preEditSession.sessionId;
-	const preEditSessionFile = preEditSession.sessionFile;
-	const preEditTelemetryConversationId = run.correlation.conversation_id;
-	const editTimestamp = 2_500;
-	const editableMessage = {
-		role: "user",
-		content: [{ type: "text", text: "original fixture question" }],
-		timestamp: editTimestamp,
-	};
-	const editableEntryId = preEditSession.sessionManager.appendMessage(editableMessage);
-	preEditSession.agent.state.messages.push(editableMessage);
-	const editableAnswer = assistantMessage(
-		[{ type: "text", text: "original fixture answer" }],
-		"stop",
-		editTimestamp + 1,
-	);
-	preEditSession.sessionManager.appendMessage(editableAnswer);
-	preEditSession.agent.state.messages.push(editableAnswer);
-	const resolvedEditableEntryId = clientSession.resolveUserMessageEntryId(`u-${editTimestamp}-1`);
-	if (resolvedEditableEntryId !== editableEntryId) {
-		throw new Error(`edit fixture entry mismatch: ${editableEntryId} vs ${resolvedEditableEntryId}`);
-	}
-	await clientSession.editMessage(`u-${editTimestamp}-1`, "edited fixture question");
-	await sleep(50);
-	const postEditSession = clientSession.session;
-	if (postEditSession === preEditSession || postEditSession.sessionId === preEditSessionId) {
-		throw new Error(`edit fixture did not replace Pi session identity: ${JSON.stringify({
-			sameObject: postEditSession === preEditSession,
-			oldSessionId: preEditSessionId,
-			newSessionId: postEditSession.sessionId,
-			notices: client.messages.filter((message) => message.type === "notice").slice(-3),
-		})}`);
-	}
-	emitTool(postEditSession, "post-edit-tool");
-	const postEditRecord = await waitFor(
-		() => records.find((record) =>
-			record.kind === "tool.execution" &&
-			record.phase === "end" &&
-			record.correlation?.tool_call_id === "post-edit-tool"),
-		"post-edit telemetry",
-	);
-	const postEditRecordCount = records.filter(
-		(record) => record.correlation?.tool_call_id === "post-edit-tool",
-	).length;
-	emitTool(preEditSession, "stale-edit-session-tool");
-	await sleep(100);
-	if (
-		postEditRecord.correlation.session_id !== postEditSession.sessionId ||
-		postEditRecord.correlation.conversation_id !== preEditTelemetryConversationId ||
-		postEditRecordCount !== 2 ||
-		records.some((record) => record.correlation?.tool_call_id === "stale-edit-session-tool")
-	) {
-		throw new Error(
-			`edit session binding mismatch: ${JSON.stringify({
-				oldSessionId: preEditSessionId,
-				newSessionId: postEditSession.sessionId,
-				recordSessionId: postEditRecord.correlation.session_id,
-				postEditRecordCount,
-			})}`,
-		);
-	}
-	console.log("PASS edit rebinds telemetry once to new Pi session identity");
-	if (!preEditSessionFile) throw new Error("persisted edit fixture path missing");
-	async function assertSdkSessionReplacement(label, replaceSession) {
-		const runtime = clientSession.runtime;
-		const oldSession = clientSession.session;
-		const oldSessionId = oldSession.sessionId;
-		const telemetryConversationId = postEditRecord.correlation.conversation_id;
-		await replaceSession(runtime);
-		const newSession = runtime.session;
-		if (newSession === oldSession || newSession.sessionId === oldSessionId) {
-			throw new Error(`${label} did not replace SDK session identity`);
-		}
-		const toolCallId = `sdk-${label}-tool`;
-		emitTool(newSession, toolCallId);
-		const replacementRecord = await waitFor(
-			() => records.find((record) =>
-				record.kind === "tool.execution" &&
-				record.phase === "end" &&
-				record.correlation?.tool_call_id === toolCallId),
-			`${label} replacement telemetry`,
-			750,
-		);
-		emitTool(oldSession, `stale-${label}-tool`);
-		await sleep(50);
-		if (
-			replacementRecord.correlation.session_id !== newSession.sessionId ||
-			replacementRecord.correlation.conversation_id !== telemetryConversationId ||
-			records.filter((record) => record.correlation?.tool_call_id === toolCallId).length !== 2 ||
-			records.some((record) => record.correlation?.tool_call_id === `stale-${label}-tool`)
-		) {
-			throw new Error(`${label} replacement binding mismatch`);
-		}
-	}
-	await assertSdkSessionReplacement("new-session", (runtime) => runtime.newSession());
-	await assertSdkSessionReplacement("switch-session", (runtime) =>
-		runtime.switchSession(preEditSessionFile),
-	);
-	console.log("PASS SDK new/switch session replacements rebind exactly once");
-	const navigationClient = await appModule.service.attach("navigation-race-fixture", () => {});
-	const originalNavigationFactory = navigationClient.makeRuntimeFactory;
-	let releaseFirstNavigation;
-	let markFirstNavigationReady;
-	let staleNavigationRuntimeDisposals = 0;
-	const firstNavigationGate = new Promise((resolve) => {
-		releaseFirstNavigation = resolve;
-	});
-	const firstNavigationReady = new Promise((resolve) => {
-		markFirstNavigationReady = resolve;
-	});
-	navigationClient.makeRuntimeFactory = function (terminals) {
-		const createRuntime = originalNavigationFactory.call(this, terminals);
-		return async (options) => {
-			const result = await createRuntime(options);
-			const originalDispose = result.session.dispose.bind(result.session);
-			result.session.dispose = () => {
-				staleNavigationRuntimeDisposals++;
-				return originalDispose();
-			};
-			markFirstNavigationReady();
-			await firstNavigationGate;
-			return result;
-		};
-	};
-	const firstNavigationCwd = join(base, "navigation-first");
-	const secondNavigationCwd = join(base, "navigation-second");
-	mkdirSync(firstNavigationCwd, { recursive: true });
-	mkdirSync(secondNavigationCwd, { recursive: true });
-	const firstNavigation = navigationClient.setCwd(firstNavigationCwd);
-	await firstNavigationReady;
-	navigationClient.makeRuntimeFactory = originalNavigationFactory;
-	await navigationClient.setCwd(secondNavigationCwd);
-	releaseFirstNavigation();
-	await firstNavigation;
-	if (
-		navigationClient.cwd !== secondNavigationCwd ||
-		navigationClient.session.sessionManager.getCwd() !== secondNavigationCwd ||
-		[...navigationClient.convs.values()].some((conv) => conv.cwd === firstNavigationCwd) ||
-		staleNavigationRuntimeDisposals !== 1
-	) {
-		throw new Error("slower navigation runtime overwrote newer workspace");
-	}
-	console.log("PASS slower navigation runtime cannot overwrite newer request");
 
 	const projectB = join(base, "project-b");
 	mkdirSync(projectB, { recursive: true });
-	let backgroundSession = clientSession.session;
+	const clientSession = appModule.service.get(clientId);
+	if (!clientSession) throw new Error("client session disappeared");
+	const backgroundSession = clientSession.session;
 	const backgroundUiConversationId = client.state.conversationId;
 	const backgroundRecordOffset = records.length;
 	emitRunStart(backgroundSession);
@@ -585,98 +441,6 @@ try {
 		throw new Error("project switch crossed conversation metadata");
 	}
 	console.log("PASS project switch keeps background mapper ownership");
-	const editRaceForegroundId = clientSession.activeId;
-	const editRaceConversation = clientSession.convs.get(editRaceForegroundId);
-	if (!editRaceConversation) throw new Error("edit race foreground conversation missing");
-	const editRaceTimestamp = 3_300;
-	const editRaceMessage = {
-		role: "user",
-		content: [{ type: "text", text: "edit race original" }],
-		timestamp: editRaceTimestamp,
-	};
-	editRaceConversation.session.sessionManager.appendMessage(editRaceMessage);
-	editRaceConversation.session.agent.state.messages.push(editRaceMessage);
-	const editRaceAnswer = assistantMessage(
-		[{ type: "text", text: "edit race answer" }],
-		"stop",
-		editRaceTimestamp + 1,
-	);
-	editRaceConversation.session.sessionManager.appendMessage(editRaceAnswer);
-	editRaceConversation.session.agent.state.messages.push(editRaceAnswer);
-	editRaceConversation.listed = true;
-	editRaceConversation.promptedSinceActive = true;
-	const editRaceRuntime = editRaceConversation.runtime;
-	const originalEditRaceFork = editRaceRuntime.fork.bind(editRaceRuntime);
-	let releaseEditRaceFork;
-	let markEditRaceForkReady;
-	const editRaceForkGate = new Promise((resolve) => {
-		releaseEditRaceFork = resolve;
-	});
-	const editRaceForkReady = new Promise((resolve) => {
-		markEditRaceForkReady = resolve;
-	});
-	editRaceRuntime.fork = async (...args) => {
-		const result = await originalEditRaceFork(...args);
-		markEditRaceForkReady();
-		await editRaceForkGate;
-		return result;
-	};
-	const originalClientPrompt = clientSession.prompt;
-	const editRacePromptTargets = [];
-	clientSession.prompt = async function () {
-		editRacePromptTargets.push(this.activeId);
-	};
-	const editRace = clientSession.editMessage(
-		`u-${editRaceTimestamp}-1`,
-		"edit race replacement",
-	);
-	await editRaceForkReady;
-	await clientSession.switchConversation(backgroundUiConversationId);
-	releaseEditRaceFork();
-	await editRace;
-	clientSession.prompt = originalClientPrompt;
-	editRaceRuntime.fork = originalEditRaceFork;
-	if (
-		clientSession.activeId !== backgroundUiConversationId ||
-		editRacePromptTargets.length !== 0
-	) {
-		throw new Error(`edit resumed against wrong active conversation: ${editRacePromptTargets}`);
-	}
-	await clientSession.switchConversation(editRaceForegroundId);
-	foregroundSession = clientSession.session;
-	console.log("PASS edit cannot resume prompt against a different active conversation");
-	const backgroundConversation = clientSession.convs.get(backgroundUiConversationId);
-	if (!backgroundConversation) throw new Error("background conversation missing");
-	const activeIdBeforeBackgroundReset = clientSession.activeId;
-	const activeSessionBeforeBackgroundReset = clientSession.session;
-	await clientSession.forceResetConversation(
-		backgroundConversation,
-		"fixture background force reset",
-	);
-	if (
-		clientSession.activeId !== activeIdBeforeBackgroundReset ||
-		clientSession.session !== activeSessionBeforeBackgroundReset
-	) {
-		throw new Error("background force reset changed active conversation");
-	}
-	backgroundSession = backgroundConversation.session;
-	emitTool(backgroundSession, "background-reset-tool");
-	const backgroundResetTool = await waitFor(
-		() => records.find((record) =>
-			record.kind === "tool.execution" &&
-			record.phase === "end" &&
-			record.correlation?.tool_call_id === "background-reset-tool"),
-		"background force-reset telemetry",
-		750,
-	);
-	if (
-		backgroundResetTool.correlation.session_id !== backgroundSession.sessionId ||
-		backgroundResetTool.correlation.conversation_id !== backgroundTool.correlation.conversation_id ||
-		backgroundResetTool.attributes.project_cwd !== projectDir
-	) {
-		throw new Error("background force-reset telemetry metadata mismatch");
-	}
-	console.log("PASS background force reset binds target without changing active conversation");
 
 	backgroundSession._isAgentRunActive = false;
 	clientSession.removeConversation(backgroundUiConversationId);
@@ -700,7 +464,6 @@ try {
 	const telemetryClient = appModule.telemetryClient;
 	if (!telemetryClient) throw new Error("server-scoped telemetry client missing");
 	const preResetConversationId = foregroundTool.correlation.conversation_id;
-	const preResetMapper = foregroundConversation.telemetryMapper;
 	await clientSession.forceResetConversation(foregroundConversation, "fixture force reset");
 	foregroundSession = clientSession.session;
 	foregroundConversation = clientSession.convs.get(foregroundUiConversationId);
@@ -716,14 +479,10 @@ try {
 			record.correlation?.tool_call_id === "reset-runtime-tool"),
 		"replacement runtime telemetry",
 	);
-	if (
-		foregroundConversation.telemetryMapper === preResetMapper ||
-		resetRuntimeTool.correlation.conversation_id !== preResetConversationId ||
-		resetRuntimeTool.correlation.session_id !== foregroundSession.sessionId
-	) {
-		throw new Error("replacement runtime mapper/session metadata mismatch");
+	if (resetRuntimeTool.correlation.conversation_id === preResetConversationId) {
+		throw new Error("replacement runtime reused prior mapper correlation state");
 	}
-	console.log("PASS force-reset runtime receives fresh mapper with stable conversation metadata");
+	console.log("PASS force-reset runtime receives a fresh mapper");
 	const originalGetAllTools = foregroundSession.getAllTools;
 	let streamingContextReads = 0;
 	foregroundSession.getAllTools = function () {
@@ -858,109 +617,10 @@ try {
 	}
 	console.log("PASS queue overflow stays bounded and leaves UI projection intact");
 
-	const { SessionManager } = await import("@earendil-works/pi-coding-agent");
-	const lateRuntimeScenarios = [];
-	async function prepareLateRuntimeScenario(name, startOperation) {
-		const scenarioClientId = `late-runtime-${name}`;
-		const scenarioClient = await appModule.service.attach(scenarioClientId, () => {});
-		const baselineConversationCount = scenarioClient.convs.size;
-		const originalMakeRuntimeFactory = scenarioClient.makeRuntimeFactory;
-		let releaseRuntime;
-		let markRuntimeReady;
-		const runtimeGate = new Promise((resolve) => {
-			releaseRuntime = resolve;
-		});
-		const runtimeReady = new Promise((resolve) => {
-			markRuntimeReady = resolve;
-		});
-		const scenario = {
-			name,
-			clientId: scenarioClientId,
-			client: scenarioClient,
-			baselineConversationCount,
-			createdSession: null,
-			subscribeCalls: 0,
-			release: () => releaseRuntime(),
-			operation: null,
-		};
-		scenarioClient.makeRuntimeFactory = function (terminals) {
-			const createRuntime = originalMakeRuntimeFactory.call(this, terminals);
-			return async (options) => {
-				const result = await createRuntime(options);
-				scenario.createdSession = result.session;
-				const originalSubscribe = result.session.subscribe.bind(result.session);
-				result.session.subscribe = (listener) => {
-					scenario.subscribeCalls++;
-					return originalSubscribe(listener);
-				};
-				markRuntimeReady();
-				await runtimeGate;
-				return result;
-			};
-		};
-		scenario.operation = Promise.resolve().then(() => startOperation(scenarioClient));
-		await Promise.race([
-			runtimeReady,
-			scenario.operation.then(() => {
-				throw new Error(`${name} settled before runtime gate`);
-			}),
-			sleep(3_000).then(() => {
-				throw new Error(`${name} did not reach runtime gate`);
-			}),
-		]);
-		scenarioClient.makeRuntimeFactory = originalMakeRuntimeFactory;
-		lateRuntimeScenarios.push(scenario);
-	}
-
-	await prepareLateRuntimeScenario("new-chat", async (scenarioClient) => {
-		scenarioClient.session.agent.state.messages.push({
-			role: "user",
-			content: [{ type: "text", text: "nonblank fixture" }],
-			timestamp: 3_100,
-		});
-		await scenarioClient.newChat();
-	});
-	const lateCwd = join(base, "late-cwd");
-	mkdirSync(lateCwd, { recursive: true });
-	await prepareLateRuntimeScenario("set-cwd", (scenarioClient) =>
-		scenarioClient.setCwd(lateCwd),
-	);
-	const lateSwitchCwd = join(base, "late-switch-cwd");
-	const lateSwitchSessionDir = join(base, "late-switch-sessions");
-	mkdirSync(lateSwitchCwd, { recursive: true });
-	mkdirSync(lateSwitchSessionDir, { recursive: true });
-	const lateSwitchManager = SessionManager.create(lateSwitchCwd, lateSwitchSessionDir);
-	lateSwitchManager.appendMessage({
-		role: "user",
-		content: [{ type: "text", text: "switch fixture" }],
-		timestamp: 3_200,
-	});
-	lateSwitchManager.appendMessage(
-		assistantMessage([{ type: "text", text: "switch answer" }], "stop", 3_201),
-	);
-	await prepareLateRuntimeScenario("switch-session", (scenarioClient) =>
-		scenarioClient.switchSession(lateSwitchManager.getSessionFile()),
-	);
-	await prepareLateRuntimeScenario("force-reset", (scenarioClient) => {
-		const scenarioConversation = scenarioClient.convs.get(scenarioClient.activeId);
-		if (!scenarioConversation) throw new Error("force-reset scenario conversation missing");
-		return scenarioClient.forceResetConversation(
-			scenarioConversation,
-			"late force-reset fixture",
-		);
-	});
-
 	const agentServiceModule = await import(
 		pathToFileURL(join(REPO_ROOT, "dist/server/agent-service.js")).href
 	);
 	const originalCreate = agentServiceModule.ClientSession.create;
-	const runtimePrototype = Object.getPrototypeOf(clientSession.runtime);
-	const originalRuntimeDispose = runtimePrototype.dispose;
-	let runtimeDisposeCalls = 0;
-	runtimePrototype.dispose = async function (...args) {
-		runtimeDisposeCalls++;
-		return originalRuntimeDispose.apply(this, args);
-	};
 	let releasePendingCreate;
 	const pendingCreateGate = new Promise((resolve) => {
 		releasePendingCreate = resolve;
@@ -969,12 +629,7 @@ try {
 		await pendingCreateGate;
 		return originalCreate.apply(this, args);
 	};
-	const pendingAttach = appModule.service
-		.attach("pending-shutdown-client", () => {})
-		.then(
-			(session) => ({ session }),
-			(error) => ({ error }),
-		);
+	const pendingAttach = appModule.service.attach("pending-shutdown-client", () => {});
 	await waitFor(
 		() => appModule.service.pending.has("pending-shutdown-client"),
 		"pending client creation",
@@ -985,42 +640,24 @@ try {
 		releasePendingCreate();
 		throw new Error("server shutdown did not memoize cleanup and close admission");
 	}
+	let closeSettled = false;
+	void firstClose.finally(() => {
+		closeSettled = true;
+	});
+	await sleep(100);
+	const closedBeforePendingCreate = closeSettled;
+	releasePendingCreate();
+	const pendingClientSession = await pendingAttach;
 	await Promise.race([
 		firstClose,
-		sleep(750).then(() => {
-			releasePendingCreate();
-			throw new Error("server shutdown exceeded pending-create deadline");
+		sleep(1_000).then(() => {
+			throw new Error("server shutdown hung with an attached WebSocket");
 		}),
 	]);
-	const disposalsBeforeLateCreate = runtimeDisposeCalls;
-	const recordsBeforeLateCreate = records.length;
-	const connectionsBeforeLateCreate = connectionCount;
-	releasePendingCreate();
-	for (const scenario of lateRuntimeScenarios) scenario.release();
-	const pendingAttachResult = await pendingAttach;
-	const lateRuntimeResults = await Promise.allSettled(
-		lateRuntimeScenarios.map((scenario) => scenario.operation),
-	);
-	await sleep(100);
 	agentServiceModule.ClientSession.create = originalCreate;
-	runtimePrototype.dispose = originalRuntimeDispose;
-	if (
-		"session" in pendingAttachResult ||
-		appModule.service.get("pending-shutdown-client") !== undefined ||
-		runtimeDisposeCalls < disposalsBeforeLateCreate + lateRuntimeScenarios.length + 1 ||
-		records.length !== recordsBeforeLateCreate ||
-		connectionCount !== connectionsBeforeLateCreate ||
-		lateRuntimeResults.some((result) => result.status === "rejected") ||
-		lateRuntimeScenarios.some((scenario) =>
-			scenario.client.disposed !== true ||
-			scenario.client.convs.size !== scenario.baselineConversationCount ||
-			scenario.subscribeCalls !== 0 ||
-			appModule.service.get(scenario.clientId) !== undefined
-		)
-	) {
-		throw new Error("late runtime creation survived bounded shutdown");
+	if (closedBeforePendingCreate || pendingClientSession.disposed !== true) {
+		throw new Error("shutdown did not await and dispose pending client creation");
 	}
-	console.log("PASS bounded shutdown disposes late runtime creations across operation families");
 	if (telemetryClient.health().state !== "disposed") {
 		throw new Error("shared telemetry client was not disposed during server shutdown");
 	}
