@@ -25,6 +25,7 @@ export interface PiEventMapperOptions {
 	idNamespace?: string;
 	wallNow?: () => number;
 	monotonicNow?: () => number;
+	stallThresholdMs?: number;
 }
 
 interface SpanCorrelation {
@@ -452,6 +453,7 @@ export class PiEventMapper {
 	private readonly namespaceToolCallIds: boolean;
 	private readonly wallNow: () => number;
 	private readonly monotonicNow: () => number;
+	private readonly stallThresholdMs: number;
 	private runSequence = 0;
 	private turnSequence = 0;
 	private currentRun: RunSpan | null = null;
@@ -470,6 +472,7 @@ export class PiEventMapper {
 		this.namespaceToolCallIds = options.idNamespace !== undefined;
 		this.wallNow = options.wallNow ?? Date.now;
 		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
+		this.stallThresholdMs = options.stallThresholdMs ?? 180_000;
 	}
 
 	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[] {
@@ -479,7 +482,7 @@ export class PiEventMapper {
 		if (validatedContext && !hasJsonToolSchemas(validatedContext)) return [];
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
-		this.lastEventAt = monotonicTime;
+		this.lastEventAt = wallTime;
 		this.stallObserved = false;
 		const records: PiTelemetryRecord[] = [];
 		let duplicateStart = false;
@@ -671,20 +674,18 @@ export class PiEventMapper {
 		return records;
 	}
 
-	observeStall(thresholdMs = 180_000): PiTelemetryRecord[] {
+	observeStall(nowMs: number): PiTelemetryRecord[] {
 		if (
 			this.disposed ||
 			!this.currentRun ||
 			this.lastEventAt === null ||
 			this.stallObserved ||
-			!Number.isFinite(thresholdMs) ||
-			thresholdMs < 0
+			!Number.isFinite(nowMs)
 		) {
 			return [];
 		}
-		const monotonicTime = this.monotonicNow();
-		const silenceMs = monotonicTime - this.lastEventAt;
-		if (silenceMs < thresholdMs) return [];
+		const silenceMs = nowMs - this.lastEventAt;
+		if (silenceMs < this.stallThresholdMs) return [];
 		this.stallObserved = true;
 		const span = this.currentSpan();
 		return [
@@ -693,13 +694,13 @@ export class PiEventMapper {
 				phase: "observation",
 				state: "possibly_stalled",
 				severity: "warning",
-				wallTime: this.wallNow(),
+				wallTime: nowMs,
 				parentId: span.request_id ?? span.trace_id ?? this.sessionId,
 				span,
 				durationMs: silenceMs,
 				attributes: {
 					silence_ms: silenceMs,
-					threshold_ms: thresholdMs,
+					threshold_ms: this.stallThresholdMs,
 				},
 			}),
 		];

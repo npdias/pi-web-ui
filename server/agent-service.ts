@@ -117,6 +117,12 @@ export interface AgentServiceTelemetry {
 	): void;
 }
 
+interface ConversationTelemetryMapper {
+	map(event: AgentSessionEvent): PiTelemetryRecord[];
+	observeStall?(nowMs: number): PiTelemetryRecord[];
+	dispose(): void;
+}
+
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
  *  message_delta — full snapshots become pure reconciliation checkpoints, so
@@ -405,7 +411,7 @@ interface Conversation {
 	/** Stable telemetry identity across concrete Pi session replacements. */
 	telemetryConversationId: string;
 	/** Mapper owned by the currently bound concrete Pi session. */
-	telemetryMapper?: PiEventMapper;
+	telemetryMapper?: ConversationTelemetryMapper;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -1209,6 +1215,24 @@ export class ClientSession {
 			this.noteTelemetryFailure("mapping", 1);
 			return;
 		}
+		this.emitTelemetryRecords(conv, records);
+	}
+
+	private emitStallTelemetry(conv: Conversation, nowMs: number): void {
+		const mapper = conv.telemetryMapper;
+		if (!mapper?.observeStall || !this.telemetry) return;
+		let records: PiTelemetryRecord[];
+		try {
+			records = mapper.observeStall(nowMs);
+		} catch {
+			this.noteTelemetryFailure("mapping", 1);
+			return;
+		}
+		this.emitTelemetryRecords(conv, records);
+	}
+
+	private emitTelemetryRecords(conv: Conversation, records: readonly PiTelemetryRecord[]): void {
+		if (!this.telemetry) return;
 		for (const record of records) {
 			try {
 				this.telemetry.emit({
@@ -1251,6 +1275,7 @@ export class ClientSession {
 					sessionId,
 					conversationId: conv.telemetryConversationId,
 					idNamespace: `${conv.telemetryConversationId}:${sessionId}:${randomUUID()}`,
+					stallThresholdMs: STALL_NOTIFY_MS,
 				});
 			} catch {
 				conv.telemetryMapper = undefined;
@@ -1288,9 +1313,10 @@ export class ClientSession {
 				if (
 					!conv.stallNoticed &&
 					conv.session.isStreaming &&
-					now - conv.lastSdkEventAt > STALL_NOTIFY_MS
+					now - conv.lastSdkEventAt >= STALL_NOTIFY_MS
 				) {
 					conv.stallNoticed = true;
+					this.emitStallTelemetry(conv, now);
 					const mins = Math.round((now - conv.lastSdkEventAt) / 60_000);
 					this.emit({
 						type: "notice",

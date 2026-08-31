@@ -32,6 +32,47 @@ async function waitFor(check, description, timeoutMs = 8_000) {
 	throw new Error(`timeout waiting for ${description}`);
 }
 
+function captureStallTimer(client) {
+	if (client.stallTimer) clearInterval(client.stallTimer);
+	client.stallTimer = null;
+	const originalSetInterval = globalThis.setInterval;
+	let callback;
+	globalThis.setInterval = (fn) => {
+		callback = fn;
+		return { unref() {} };
+	};
+	try {
+		client.startStallTimer();
+	} finally {
+		globalThis.setInterval = originalSetInterval;
+	}
+	if (typeof callback !== "function") throw new Error("stall timer callback was not installed");
+	client.stallTimer = null;
+	return callback;
+}
+
+function forceStreaming(session) {
+	const ownDescriptor = Object.getOwnPropertyDescriptor(session, "isStreaming");
+	Object.defineProperty(session, "isStreaming", {
+		configurable: true,
+		get: () => true,
+	});
+	return () => {
+		if (ownDescriptor) Object.defineProperty(session, "isStreaming", ownDescriptor);
+		else delete session.isStreaming;
+	};
+}
+
+function tickAt(callback, nowMs) {
+	const originalDateNow = Date.now;
+	Date.now = () => nowMs;
+	try {
+		callback();
+	} finally {
+		Date.now = originalDateNow;
+	}
+}
+
 function assistantMessage(content, stopReason, timestamp) {
 	return {
 		role: "assistant",
@@ -183,6 +224,27 @@ async function runNoEnvChild() {
 				message.type === "tool_status" && message.toolCallId === "no-env-tool"),
 			"no-env UI projection",
 		);
+		const stallTick = captureStallTimer(client);
+		const restoreStreaming = forceStreaming(client.session);
+		try {
+			const beforeNoticeCount = projected.filter((message) => message.type === "notice").length;
+			const conversation = client.convs.get(client.activeId);
+			conversation.lastSdkEventAt = 1_000;
+			tickAt(stallTick, 181_000);
+			await waitFor(
+				() => projected.filter((message) => message.type === "notice").length === beforeNoticeCount + 1,
+				"no-env stall warning",
+			);
+			if (!projected.some((message) =>
+				message.type === "notice" &&
+				message.level === "warning" &&
+				message.text.includes("3 分钟"))) {
+				throw new Error("no-env stall warning changed or was not emitted");
+			}
+		} finally {
+			restoreStreaming();
+		}
+		console.log("PASS no env preserves stall warning without telemetry mapper");
 		console.log("PASS no env preserves baseline projection without telemetry objects");
 	} catch (error) {
 		exitCode = 1;
@@ -398,6 +460,101 @@ try {
 		throw new Error("telemetry changed WebSocket snapshot projection");
 	}
 	console.log("PASS ordered records preserve metadata, privacy, and UI snapshot");
+
+	const stallTick = captureStallTimer(client);
+	const restoreStreaming = forceStreaming(firstConversation.session);
+	const originalInterruptRun = client.interruptRun;
+	let stallAbortCalls = 0;
+	client.interruptRun = async () => {
+		stallAbortCalls++;
+	};
+	try {
+		const stallOffset = records.length;
+		firstConversation.session._emit({ type: "agent_start" });
+		firstConversation.session._emit({ type: "turn_start" });
+		const turnStart = await waitFor(
+			() => records.slice(stallOffset).find((record) =>
+				record.kind === "agent.turn" && record.phase === "start"),
+			"stall fixture turn start",
+		);
+		const firstEventAt = turnStart.attributes.source_timestamp_ms;
+		firstConversation.lastSdkEventAt = firstEventAt;
+		const noticeOffset = wire.messages.length;
+		tickAt(stallTick, firstEventAt + 180_000);
+		const firstStall = await waitFor(
+			() => records.slice(stallOffset).find((record) => record.kind === "agent.stall"),
+			"first integrated stall record",
+		);
+		const firstNotice = await waitFor(
+			() => wire.messages.slice(noticeOffset).find((message) =>
+				message.type === "notice" && message.level === "warning"),
+			"first integrated stall warning",
+		);
+		if (
+			firstStall.phase !== "observation" ||
+			firstStall.state !== "possibly_stalled" ||
+			firstStall.severity !== "warning" ||
+			firstStall.duration_ms !== 180_000 ||
+			firstStall.attributes?.silence_ms !== 180_000 ||
+			firstStall.attributes?.threshold_ms !== 180_000 ||
+			!firstNotice.text.includes("3 分钟") ||
+			stallAbortCalls !== 0 ||
+			records.slice(stallOffset).some((record) =>
+				record.phase === "end" || record.state === "completed" || record.state === "cancelled")
+		) {
+			throw new Error("integrated stall changed warning, timing, or lifecycle state");
+		}
+
+		const afterFirstStallCount = records.filter((record) => record.kind === "agent.stall").length;
+		const afterFirstNoticeCount = wire.messages.filter((message) =>
+			message.type === "notice" && message.level === "warning").length;
+		tickAt(stallTick, firstEventAt + 180_001);
+		await sleep(30);
+		if (
+			records.filter((record) => record.kind === "agent.stall").length !== afterFirstStallCount ||
+			wire.messages.filter((message) =>
+				message.type === "notice" && message.level === "warning").length !== afterFirstNoticeCount
+		) {
+			throw new Error("same silence episode emitted duplicate stall output");
+		}
+
+		const secondEpisodeOffset = records.length;
+		firstConversation.session._emit({ type: "turn_start" });
+		const secondTurnStart = await waitFor(
+			() => records.slice(secondEpisodeOffset).find((record) =>
+				record.kind === "agent.turn" && record.phase === "start"),
+			"second stall episode SDK event",
+		);
+		const secondEventAt = secondTurnStart.attributes.source_timestamp_ms;
+		firstConversation.lastSdkEventAt = secondEventAt;
+		tickAt(stallTick, secondEventAt + 180_000);
+		await waitFor(
+			() => records.filter((record) => record.kind === "agent.stall").length === afterFirstStallCount + 1,
+			"second integrated stall record",
+		);
+		if (stallAbortCalls !== 0) throw new Error("stall observation aborted Pi work");
+
+		const mapper = firstConversation.telemetryMapper;
+		firstConversation.telemetryMapper = undefined;
+		firstConversation.stallNoticed = false;
+		firstConversation.lastSdkEventAt = secondEventAt + 1;
+		const mapperlessNoticeOffset = wire.messages.length;
+		const mapperlessRecordOffset = records.length;
+		tickAt(stallTick, secondEventAt + 180_001);
+		await waitFor(
+			() => wire.messages.slice(mapperlessNoticeOffset).some((message) =>
+				message.type === "notice" && message.level === "warning"),
+			"mapperless stall warning",
+		);
+		firstConversation.telemetryMapper = mapper;
+		if (records.length !== mapperlessRecordOffset || stallAbortCalls !== 0) {
+			throw new Error("mapperless stall changed telemetry or aborted work");
+		}
+		console.log("PASS stall timer emits one warning observation per silence episode without abort");
+	} finally {
+		client.interruptRun = originalInterruptRun;
+		restoreStreaming();
+	}
 
 	const rejectedBindMapper = firstConversation.telemetryMapper;
 	const originalBindExtensions = firstConversation.session.bindExtensions.bind(

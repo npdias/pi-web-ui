@@ -537,7 +537,7 @@ async function runScenario(fixture, PiEventMapper, queue) {
 		clock.wall = 1_700_000_000_000 + step.at_ms;
 		const mapped = step.event
 			? mapper.map(sdkEvent(step.event, clock.wall))
-			: mapper.observeStall(step.observe.stall_threshold_ms);
+			: mapper.observeStall(clock.wall);
 		assert.equal(
 			mapped.length,
 			step.expect.length,
