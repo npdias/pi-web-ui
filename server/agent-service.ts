@@ -11,7 +11,6 @@
  * so reconnects just re-request a snapshot.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import {
 	existsSync,
 	readFileSync,
@@ -102,30 +101,6 @@ import {
 	SYSTEM_PROMPT,
 	transcribeImages,
 } from "./vision-bridge.js";
-import {
-	PiEventMapper,
-	type PiEventMapperOptions,
-	type PiTelemetryContext,
-} from "./telemetry/pi-event-mapper.js";
-import type {
-	PiTelemetryRecord,
-	PiTelemetrySource,
-} from "./telemetry/types.js";
-
-interface ConversationTelemetryMapper {
-	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[];
-	dispose(): void;
-}
-
-export interface AgentServiceTelemetry {
-	source: PiTelemetrySource;
-	emit(record: PiTelemetryRecord): void;
-	onFailure?(failure: {
-		kind: "construction" | "mapping" | "enqueue" | "disposal";
-		lostRecords: number;
-	}): void;
-	createMapper?: (options: PiEventMapperOptions) => ConversationTelemetryMapper;
-}
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
@@ -412,8 +387,6 @@ interface Conversation {
 	wizardRunning: boolean;
 	/** Session event subscription — events are routed to THIS conversation. */
 	unsubscribe?: () => void;
-	/** Telemetry correlation state belongs to this conversation/runtime only. */
-	telemetryMapper?: ConversationTelemetryMapper;
 	/** Monotonic sequence for message_delta/tool_delta pushes of this conversation —
 	 *  a gap on the client triggers a get_state resync. */
 	deltaSeq: number;
@@ -860,7 +833,6 @@ export class ClientSession {
 		cwd: string,
 		agentDir: string,
 		stateStore: ClientStateStore,
-		private readonly telemetry?: AgentServiceTelemetry,
 	) {
 		this.clientId = clientId;
 		this.cwd = cwd;
@@ -922,11 +894,10 @@ export class ClientSession {
 		clientId: string,
 		cwd: string,
 		stateStore: ClientStateStore,
-		telemetry?: AgentServiceTelemetry,
 	): Promise<ClientSession> {
 		const agentDir = process.env.PI_CODING_AGENT_DIR ?? getAgentDir();
 
-		const cs = new ClientSession(clientId, cwd, agentDir, stateStore, telemetry);
+		const cs = new ClientSession(clientId, cwd, agentDir, stateStore);
 		const conversationId = cs.nextConversationId();
 		const terminals = cs.makeTerminalManager(conversationId, cwd);
 		const runtime = await createAgentSessionRuntime(cs.makeRuntimeFactory(terminals), {
@@ -1080,7 +1051,6 @@ export class ClientSession {
 		id: string,
 		terminals: TerminalManager,
 	): Conversation {
-		const telemetryMapper = this.makeTelemetryMapper(runtime);
 		return {
 			id,
 			title: conversationTitle(runtime.session),
@@ -1099,7 +1069,6 @@ export class ClientSession {
 			goalGeneration: 0,
 			goalReviewGeneration: 0,
 			wizardRunning: false,
-			telemetryMapper,
 			deltaSeq: 0,
 			terminals,
 			msgIds: new Map(),
@@ -1113,47 +1082,6 @@ export class ClientSession {
 			toolStartTimes: new Map(),
 			toolWatchdogs: new Map(),
 		};
-	}
-
-	private makeTelemetryMapper(
-		runtime: AgentSessionRuntime,
-	): ConversationTelemetryMapper | undefined {
-		let telemetryMapper: ConversationTelemetryMapper | undefined;
-		if (this.telemetry) {
-			try {
-				const options: PiEventMapperOptions = {
-					source: { ...this.telemetry.source },
-					sessionId: runtime.session.sessionId,
-					conversationId: randomUUID(),
-				};
-				telemetryMapper = this.telemetry.createMapper?.(options) ?? new PiEventMapper(options);
-			} catch {
-				// Telemetry construction is optional and must not block a Pi conversation.
-				this.noteTelemetryFailure("construction", 0);
-			}
-		}
-		return telemetryMapper;
-	}
-
-	private disposeTelemetryMapper(conv: Conversation): void {
-		try {
-			conv.telemetryMapper?.dispose();
-		} catch {
-			// Telemetry disposal cannot block Pi runtime cleanup.
-			this.noteTelemetryFailure("disposal", 0);
-		}
-		conv.telemetryMapper = undefined;
-	}
-
-	private noteTelemetryFailure(
-		kind: "construction" | "mapping" | "enqueue" | "disposal",
-		lostRecords: number,
-	): void {
-		try {
-			this.telemetry?.onFailure?.({ kind, lostRecords });
-		} catch {
-			// Health reporting is telemetry too; never throw it into Pi lifecycle.
-		}
 	}
 
 	/** Summaries of conversations currently streaming — captured at shutdown
@@ -1240,10 +1168,9 @@ export class ClientSession {
 				this.emit({ type: "notice", level: "error", text: err.error });
 			},
 		});
-		conv.unsubscribe = conv.session.subscribe((event) => {
-			this.emitTelemetry(conv, event);
-			this.onEvent(conv, event);
-		});
+		conv.unsubscribe = conv.session.subscribe((event) =>
+			this.onEvent(conv, event),
+		);
 		this.scheduleSnapshot();
 		this.webUi.refresh();
 		this.startWidgetsTimer();
@@ -1322,55 +1249,6 @@ export class ClientSession {
 	private clearAllToolWatchdogs(conv: Conversation): void {
 		for (const t of conv.toolWatchdogs.values()) clearTimeout(t);
 		conv.toolWatchdogs.clear();
-	}
-
-	private telemetryContext(conv: Conversation): PiTelemetryContext | undefined {
-		try {
-			const active = new Set(conv.session.getActiveToolNames());
-			return {
-				systemPrompt: conv.session.systemPrompt,
-				toolSchemas: conv.session
-					.getAllTools()
-					.filter((tool) => active.has(tool.name))
-					.map((tool) => ({ name: tool.name, schema: tool.parameters })),
-			};
-		} catch {
-			this.noteTelemetryFailure("mapping", 1);
-			return undefined;
-		}
-	}
-
-	/** Map and enqueue before UI projection. Every failure stays inside this fn. */
-	private emitTelemetry(conv: Conversation, event: AgentSessionEvent): void {
-		const mapper = conv.telemetryMapper;
-		const telemetry = this.telemetry;
-		if (!mapper || !telemetry) return;
-		try {
-			const context =
-				event.type === "agent_start" || event.type === "turn_start"
-					? this.telemetryContext(conv)
-					: undefined;
-			const records = mapper.map(event, context);
-			for (const record of records) {
-				try {
-					telemetry.emit({
-						...record,
-						attributes: {
-							...record.attributes,
-							project_cwd: conv.cwd,
-							project_name: basename(conv.cwd) || conv.cwd,
-							ui_conversation_id: conv.id,
-						},
-					});
-					} catch {
-						// Keep later records in mapper order even if one enqueue fails.
-						this.noteTelemetryFailure("enqueue", 1);
-					}
-				}
-			} catch {
-				// Mapping/context failures cannot alter SDK event projection.
-				this.noteTelemetryFailure("mapping", 1);
-			}
 	}
 
 	private onEvent(conv: Conversation, event: AgentSessionEvent): void {
@@ -2487,7 +2365,6 @@ export class ClientSession {
 			conv.unsubscribe = undefined;
 			this.clearAllToolWatchdogs(conv);
 			conv.toolStartTimes.clear();
-			this.disposeTelemetryMapper(conv);
 			await conv.runtime.dispose();
 			const runtime = await createAgentSessionRuntime(
 				this.makeRuntimeFactory(conv.terminals),
@@ -2499,7 +2376,6 @@ export class ClientSession {
 			);
 			conv.runtime = runtime;
 			conv.session = runtime.session;
-			conv.telemetryMapper = this.makeTelemetryMapper(runtime);
 			this.emit({ type: "notice", level: "warning", text: reason });
 			await this.bindSession();
 			this.emitConversations();
@@ -2655,7 +2531,6 @@ export class ClientSession {
 		conv.terminals.killAll();
 		conv.unsubscribe?.();
 		conv.unsubscribe = undefined;
-		this.disposeTelemetryMapper(conv);
 		void conv.runtime.dispose().catch(() => {});
 	}
 
@@ -3498,7 +3373,6 @@ export class ClientSession {
 		for (const conv of this.convs.values()) {
 			this.clearAllToolWatchdogs(conv);
 			conv.unsubscribe?.();
-			this.disposeTelemetryMapper(conv);
 			try {
 				await conv.runtime.dispose();
 			} catch {
@@ -3540,7 +3414,6 @@ export class AgentService {
 	constructor(
 		private cwd: string,
 		stateFile: string,
-		private readonly telemetry?: AgentServiceTelemetry,
 	) {
 		this.stateStore = new ClientStateStore(stateFile);
 	}
@@ -3648,7 +3521,6 @@ export class AgentService {
 					clientId,
 					cwd,
 					this.stateStore,
-					this.telemetry,
 				).finally(() => {
 					this.pending.delete(clientId);
 				});
@@ -3711,10 +3583,6 @@ export class AgentService {
 	}
 
 	async disposeAll(): Promise<void> {
-		this.quiesce();
-		while (this.pending.size > 0) {
-			await Promise.allSettled([...this.pending.values()]);
-		}
 		// Record still-streaming conversations BEFORE tearing anything down, so
 		// the next attach can tell the user what was lost (SIGTERM / update).
 		for (const [clientId, cs] of [...this.clients]) {

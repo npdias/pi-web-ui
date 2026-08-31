@@ -43,7 +43,6 @@ const ALL = [
 	"plugin-settings-test",
 	"plugin-test",
 	"plugin-update-test",
-	"pi-telemetry-test",
 	"preview-test",
 	"quiesce-test",
 	"recursive-watch-test",
