@@ -3,6 +3,7 @@
 ## Result
 
 - Implementation commit: `f6eb1781637ce785071445c9bc91d4a638338d17` (`test: cover Pi telemetry scenarios`).
+- Claim-review fix: `e7c84dbed1fd041d6520049b1e53283fc3c2896b` (`test: harden telemetry scenario fixtures`).
 - Five content-free JSONL scenarios exercise current Pi SDK lifecycle facts through `PiEventMapper`.
 - Scenario output crosses the real `TelemetrySocketClient` LF queue and acknowledgement boundary.
 - No provider, model, token, UI, or trajectory-view call runs in the scenario test.
@@ -41,9 +42,19 @@ PASS model-stall: 3 normalized records
 PASS normal: 6 normalized records
 PASS tool-error: 4 normalized records
 PASS integrated queue boundary: 21/21 accepted
-PASS fixture loader rejects malformed JSONL, expectations, and name drift
+PASS fixture loader rejects malformed JSONL, expectations, unsafe attributes, and name drift
 exit 0
 ```
+
+Independent claim review found that the first loader version required strings but did not validate expectation enums or restrict expected attribute names. Follow-up RED:
+
+```text
+node tests/pi-telemetry-scenarios-test.mjs
+AssertionError: Missing expected exception: loader accepted invalid expectation enums
+exit 1
+```
+
+Follow-up GREEN validates allowed kind, phase, severity, and state values plus a closed expectation-attribute set. The focused scenario command above then passed again.
 
 Task 3 integration regression:
 
@@ -84,7 +95,7 @@ exit 0
 - Long tool: an observation before threshold emits nothing. Tool end retains its original request parent plus 240,000 ms duration.
 - Tool error: tool end retains `kind=tool.execution`, `state=error`, `severity=error`, `is_error=true`, matching parent. Injected private argument/result sentinels do not appear in telemetry.
 - Cancellation: turn and run end as `cancelled` with warning severity. No record has completed state.
-- Loader: malformed JSONL, missing required expectation state, fixture/file name mismatch, and missing scenario files are rejected.
+- Loader: malformed JSONL, missing required expectation state, invalid expectation enums, unsafe or unknown expectation attributes, fixture/file name mismatch, and missing scenario files are rejected.
 - Queue: all 21 normalized records receive valid FIFO LF acknowledgements. Queue reports zero rejected records, errors, or gaps.
 
 ## Smoke boundary
