@@ -3,6 +3,11 @@ import { FiCheck, FiFolder, FiMessageSquare, FiTrash2 } from "react-icons/fi";
 import type { ConversationSummary, ProjectSummary, SessionSummary } from "../types";
 import type { ConnStatus } from "../use-chat";
 import { useT } from "../i18n";
+import {
+	canonicalConversationTitle,
+	durableSessionTitle,
+	visibleHistorySessions,
+} from "./left-panel-sessions.js";
 
 /** Props are deliberately NARROW (no whole-ChatState object): every field is
  *  stable while tokens stream in, so the shallow-compared memo() below skips
@@ -95,9 +100,9 @@ export const LeftPanel = memo(function LeftPanel({ ready, status, cwd, sessionFi
 	}, [active, ready, status, cwd, send]);
 
 	const displayName = (s: SessionSummary): string => {
-		const title = s.name || s.firstMessage.trim();
-		return title.length > 0 ? title : t("emptyChat");
+		return durableSessionTitle(s, t("emptyChat"));
 	};
+	const historySessions = visibleHistorySessions(conversations, sessions);
 
 	const projectName = (path: string): string =>
 		path.split(/[\\/]/).pop() || path;
@@ -188,19 +193,24 @@ export const LeftPanel = memo(function LeftPanel({ ready, status, cwd, sessionFi
 							)}
 							{g.convs.map((c) => {
 								const active = activeConversationId === c.id;
+								const title = canonicalConversationTitle(
+									c,
+									sessions,
+									t("emptyChat"),
+								);
 								return (
 									<button
 										type="button"
 										key={c.id}
 										className={`session-item ${active ? "active" : ""}`}
-										title={`${c.title}${g.isCurrent ? "" : ` — ${g.cwd}`}`}
+									title={`${title}${g.isCurrent ? "" : ` — ${g.cwd}`}`}
 										onClick={() => {
 											if (!active) send({ type: "switch_conversation", id: c.id });
 										}}
 									>
 										<FiMessageSquare className="session-icon" />
 										<span className="session-info">
-											<span className="session-title">{c.title}</span>
+										<span className="session-title">{title}</span>
 											<span className="session-sub">
 												{active
 													? t("current")
@@ -221,10 +231,10 @@ export const LeftPanel = memo(function LeftPanel({ ready, status, cwd, sessionFi
 			<div className="panel-sessions">
 				<div className="panel-section-title">{t("historySessions")}</div>
 				<div className="sessions-scroll">
-					{sessions.length === 0 && (
+					{historySessions.length === 0 && (
 						<div className="panel-empty">{t("noHistory")}</div>
 					)}
-					{sessions.map((s) => {
+					{historySessions.map((s) => {
 						const active = currentFile === s.path;
 						return (
 							<div

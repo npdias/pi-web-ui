@@ -745,6 +745,8 @@ export interface ConversationSummary {
 	id: string;
 	/** Display title: first user prompt (truncated) or the default. */
 	title: string;
+	/** Durable Pi session path. Lets the client unify running and history identity. */
+	sessionPath?: string;
 	cwd: string;
 	messageCount: number;
 	isStreaming: boolean;

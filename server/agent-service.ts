@@ -2753,6 +2753,7 @@ export class ClientSession {
 			conversations.push({
 				id: conv.id,
 				title: conv.title,
+				sessionPath: conv.session.sessionFile,
 				cwd: conv.cwd,
 				messageCount,
 				isStreaming,
