@@ -25,11 +25,20 @@ Task 3 test adaptations:
 - `tests/virtual-rows.client.spec.ts` -> `tests/unit/trajectory-virtual-rows.test.ts`
 - Search coverage in `tests/unit/trajectory-search.test.ts` is target-native coverage of the adapted `src/client/trajectory-search-index.ts`; the donor has no standalone search-index test.
 
-Later planned adaptation boundary:
+Task 4 copied or substantially adapted these donor files:
 
-- `src/client/timeline.ts` -> Pi-owned timeline projection code
-- `src/client/TrajectoryTimeline.tsx` plus `src/client/TrajectoryTimeline.module.css` -> `web/src/observe/trajectory/TrajectoryTimeline.tsx` plus `web/src/observe/trajectory/TrajectoryTimeline.css`
-- `src/client/TrajectoryCell.tsx`, `src/client/TrajectoryTurn.tsx`, `src/client/TrajectoryTurnHeader.tsx`, selected `src/client/TrajectoryTable.tsx` structure, toolbar structure, CSS tokens -> Pi-owned ledger, inspector, toolbar, responsive styles
+- `src/client/timeline.ts` -> `web/src/observe/trajectory/timeline.ts`
+- `src/client/TrajectoryTimeline.tsx` -> `web/src/observe/trajectory/TrajectoryTimeline.tsx`
+- `src/client/TrajectoryToolbar.tsx` -> `web/src/observe/trajectory/TrajectoryToolbar.tsx`
+- selected `src/client/TrajectoryTable.tsx` structure -> `web/src/observe/trajectory/TrajectoryLedger.tsx`
+- selected `src/client/TrajectoryTable.tsx` inspector structure -> `web/src/observe/trajectory/TrajectoryInspector.tsx`
+- `src/client/TrajectoryCell.tsx`, `src/client/TrajectoryTurn.tsx`, and `src/client/TrajectoryTurnHeader.tsx` structure -> small components inside `web/src/observe/trajectory/TrajectoryLedger.tsx`
+- `src/client/TrajectoryTimeline.module.css`, `src/client/TrajectoryToolbar.module.css`, `src/client/TrajectoryCell.module.css`, `src/client/TrajectoryTurn.module.css`, `src/client/TrajectoryTurnHeader.module.css`, and selected `src/client/TrajectoryTable.module.css` -> donor component CSS -> namespaced sections in `web/src/styles.css`
+
+Task 4 test adaptations:
+
+- `tests/views.client.spec.tsx` -> `tests/unit/trajectory-timeline.test.ts`
+- Timeline, table, and cell server-render contracts -> `tests/unit/trajectory-components.test.ts`
 
 Cordis registration, DSH session projections, DSH conversation bindings, request types, locale framework, attachment authorization, view-ring integration remain outside adaptation boundary.
 
