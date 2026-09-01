@@ -156,14 +156,14 @@ function healthCounterFacts(health: TelemetryHealth | null): readonly string[] {
 	].filter((fact): fact is string => fact !== null);
 }
 
-function deriveHealthSummary(
+export function deriveHealthSummary(
 	active: boolean,
 	snapshot: TelemetrySnapshot,
 	health: TelemetryHealth | null,
 	healthError: boolean,
 	sourcesError: boolean,
 ): ObserveHealthSummary {
-	if (!active) return DISCONNECTED_OBSERVE_HEALTH;
+	void active;
 	if (snapshot.status === "replaying" || snapshot.status === "connecting") {
 		return {
 			tone: "loading",
@@ -340,14 +340,6 @@ export function ObserveView({ active, onHealthChange }: ObserveViewProps) {
 	}, [store]);
 
 	useEffect(() => {
-		if (!active) {
-			store.disconnect();
-			setHealth(null);
-			setSources([]);
-			setHealthError(false);
-			setSourcesError(false);
-			return;
-		}
 		setHealth(null);
 		setSources([]);
 		setHealthError(false);
@@ -382,7 +374,7 @@ export function ObserveView({ active, onHealthChange }: ObserveViewProps) {
 			controller.abort();
 			store.disconnect();
 		};
-	}, [active, store]);
+	}, [store]);
 
 	useEffect(() => {
 		const query = globalThis.matchMedia?.("(max-width: 720px)");
