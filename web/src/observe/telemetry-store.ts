@@ -3,6 +3,7 @@ import { withToken } from "../auth-token.js";
 import {
 	TelemetryProtocolError,
 	parseTelemetryEvent,
+	parseTelemetryEventDetailResponse,
 	parseTelemetryEventsPage,
 	parseTelemetryHealth,
 	parseTelemetryReplayGap,
@@ -31,6 +32,8 @@ export interface TelemetrySnapshot {
 	readonly events: readonly TelemetryEvent[];
 	readonly gaps: readonly TelemetryReplayGap[];
 	readonly cursor: number | null;
+	/** In-memory epoch incremented when retained high-water proves a core reset. */
+	readonly coreGeneration: number;
 	readonly status:
 		| "idle"
 		| "replaying"
@@ -79,8 +82,11 @@ interface SseFrame {
 const CURSOR_STORAGE_KEY = "pi-web-ui.observe.cursor.v1";
 const PREFERENCES_STORAGE_KEY = "pi-web-ui.observe.preferences.v1";
 const MAX_RECORDS = 10_000;
-const REPLAY_PAGE_SIZE = 1_000;
+const MAX_QUERY_PAGE_SIZE = 1_000;
+const REPLAY_PAGE_SIZE = 100;
+const REPLAY_PAGE_LIMITS = [100, 15, 1] as const;
 const MAX_REPLAY_PAGES = 100_000;
+const MAX_DETAIL_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000] as const;
 const DEFAULT_PREFERENCES: TelemetryUiPreferences = {
 	followLive: true,
@@ -211,8 +217,8 @@ function queryUrl(query: TelemetryQuery): string {
 	if (query.after !== undefined && query.cursor !== undefined) {
 		throw new Error("use either after or cursor");
 	}
-	if (query.limit !== undefined && (query.limit < 1 || query.limit > REPLAY_PAGE_SIZE)) {
-		throw new Error(`limit must be between 1 and ${REPLAY_PAGE_SIZE}`);
+	if (query.limit !== undefined && (query.limit < 1 || query.limit > MAX_QUERY_PAGE_SIZE)) {
+		throw new Error(`limit must be between 1 and ${MAX_QUERY_PAGE_SIZE}`);
 	}
 	const params = new URLSearchParams();
 	for (const [name, value] of [
@@ -253,6 +259,63 @@ function aborted(error: unknown, signal: AbortSignal): boolean {
 	return signal.aborted || (error instanceof DOMException && error.name === "AbortError");
 }
 
+class TelemetryHttpError extends TelemetryProtocolError {
+	constructor(
+		readonly status: number,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+function smallerReplayPageSize(limit: number): number | null {
+	return REPLAY_PAGE_LIMITS.find((candidate) => candidate < limit) ?? null;
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+	try {
+		await response.body?.cancel();
+	} catch {
+		// Size rejection remains authoritative even when upstream cancellation fails.
+	}
+}
+
+async function readBoundedResponseText(
+	response: Response,
+	limit: number,
+	name: string,
+): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				try {
+					await reader.cancel();
+				} catch {
+					// Reject oversized content even when upstream cancellation fails.
+				}
+				throw new TelemetryProtocolError(`${name} exceeds 1 MiB`);
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(bytes);
+}
+
 export class TelemetryStore {
 	private readonly fetchImpl: FetchLike;
 	private readonly storage: StorageLike | undefined;
@@ -266,8 +329,10 @@ export class TelemetryStore {
 	private cursor: number | null;
 	private preferences: TelemetryUiPreferences;
 	private status: StoreStatus = "idle";
+	private coreGeneration = 0;
 	private generation = 0;
 	private controller: AbortController | undefined;
+	private replayPageSize = REPLAY_PAGE_SIZE;
 
 	constructor(options: TelemetryStoreOptions = {}) {
 		const validated = validateStoreOptions(options);
@@ -309,6 +374,53 @@ export class TelemetryStore {
 
 	async query(query: TelemetryQuery = {}): Promise<TelemetryEventsPage> {
 		return this.fetchPage(query);
+	}
+
+	/** Fetch one exact selected envelope. It is returned only to the caller. */
+	async fetchEventById(eventId: string, signal?: AbortSignal): Promise<TelemetryEvent> {
+		if (eventId.trim().length === 0) {
+			throw new Error("eventId must be a non-empty string");
+		}
+		const url = withToken(
+			appUrl(`/api/observe/events/${encodeURIComponent(eventId)}`),
+		);
+		const response = await this.fetchImpl(url, {
+			method: "GET",
+			headers: { Accept: "application/json" },
+			credentials: "same-origin",
+			signal,
+		});
+		if (!response.ok) {
+			throw new TelemetryHttpError(
+				response.status,
+				`telemetry event detail failed with HTTP ${response.status}`,
+			);
+		}
+		const declaredLength = response.headers.get("content-length");
+		if (
+			declaredLength !== null &&
+			Number.isFinite(Number(declaredLength)) &&
+			Number(declaredLength) > MAX_DETAIL_RESPONSE_BYTES
+		) {
+			await cancelResponseBody(response);
+			throw new TelemetryProtocolError("telemetry event detail exceeds 1 MiB");
+		}
+		const body = await readBoundedResponseText(
+			response,
+			MAX_DETAIL_RESPONSE_BYTES,
+			"telemetry event detail",
+		);
+		let value: unknown;
+		try {
+			value = JSON.parse(body);
+		} catch {
+			throw new TelemetryProtocolError("telemetry event detail returned invalid JSON");
+		}
+		const event = parseTelemetryEventDetailResponse(value);
+		if (event.event_id !== eventId) {
+			throw new TelemetryProtocolError("telemetry event detail id does not match request");
+		}
+		return event;
 	}
 
 	/** Read current core health through the same authenticated Pi proxy boundary. */
@@ -357,6 +469,7 @@ export class TelemetryStore {
 			),
 			gaps: records.flatMap((record) => (record.type === "gap" ? [record.gap] : [])),
 			cursor: this.cursor,
+			coreGeneration: this.coreGeneration,
 			status: this.status,
 			preferences: { ...this.preferences },
 		};
@@ -374,6 +487,25 @@ export class TelemetryStore {
 		);
 	}
 
+	private async fetchReplayPage(
+		query: TelemetryQuery,
+		signal: AbortSignal,
+	): Promise<{ readonly page: TelemetryEventsPage; readonly limit: number }> {
+		let limit = Math.min(query.limit ?? this.replayPageSize, this.replayPageSize);
+		while (true) {
+			try {
+				const page = await this.fetchPage({ ...query, limit }, signal);
+				return { page, limit };
+			} catch (error) {
+				if (!(error instanceof TelemetryHttpError) || error.status !== 413) throw error;
+				const nextLimit = smallerReplayPageSize(limit);
+				if (nextLimit === null) throw error;
+				limit = nextLimit;
+				this.replayPageSize = Math.min(this.replayPageSize, nextLimit);
+			}
+		}
+	}
+
 	private async fetchJson<T>(
 		url: string,
 		parse: (value: unknown) => T,
@@ -387,7 +519,8 @@ export class TelemetryStore {
 			signal,
 		});
 		if (!response.ok) {
-			throw new TelemetryProtocolError(
+			throw new TelemetryHttpError(
+				response.status,
 				`${name} failed with HTTP ${response.status}`,
 			);
 		}
@@ -403,10 +536,10 @@ export class TelemetryStore {
 	private async replay(generation: number, signal: AbortSignal): Promise<void> {
 		for (let pageNumber = 0; pageNumber < MAX_REPLAY_PAGES; pageNumber++) {
 			const startingCursor = this.cursor;
-			const page = await this.fetchPage(
+			const { page, limit } = await this.fetchReplayPage(
 				{
 					after: startingCursor ?? undefined,
-					limit: REPLAY_PAGE_SIZE,
+					limit: this.replayPageSize,
 				},
 				signal,
 			);
@@ -428,9 +561,9 @@ export class TelemetryStore {
 				this.notify();
 			}
 			if (
-				page.events.length < REPLAY_PAGE_SIZE ||
+				page.events.length < limit ||
 				page.next_cursor === null ||
-				page.next_cursor === startingCursor
+				page.next_cursor <= (startingCursor ?? 0)
 			) {
 				return;
 			}
@@ -444,8 +577,11 @@ export class TelemetryStore {
 		let remaining = this.maxRecords;
 		let firstPage = true;
 		while (remaining > 0) {
-			const limit = Math.min(REPLAY_PAGE_SIZE, remaining);
-			const page = await this.fetchPage({ before, limit }, signal);
+			const requestedLimit = Math.min(this.replayPageSize, remaining);
+			const { page, limit } = await this.fetchReplayPage(
+				{ before, limit: requestedLimit },
+				signal,
+			);
 			if (!this.isActive(generation, signal)) return;
 			if (firstPage) {
 				const highWater = pageHighWater(page);
@@ -632,6 +768,7 @@ export class TelemetryStore {
 		this.records = [];
 		this.eventSequences.clear();
 		this.gapKeys.clear();
+		this.coreGeneration++;
 	}
 
 	private notify(): void {

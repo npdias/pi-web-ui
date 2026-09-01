@@ -2,16 +2,22 @@ import {
 	useCallback,
 	useEffect,
 	useMemo,
+	useRef,
 	useState,
 	type KeyboardEvent,
 } from "react";
 import { useT } from "../i18n.js";
 import { TelemetryStore, type TelemetrySnapshot } from "./telemetry-store.js";
 import type {
+	TelemetryEvent,
 	TelemetryHealth,
 	TelemetrySourceHealth,
 } from "./telemetry-types.js";
-import { flattenTrajectoryRecords, projectTrajectory } from "./trajectory/project.js";
+import {
+	flattenTrajectoryRecords,
+	hydrateTrajectoryRecordDetail,
+	projectTrajectory,
+} from "./trajectory/project.js";
 import type { TrajectoryRecord } from "./trajectory/record.js";
 import { TrajectorySearchIndex } from "./trajectory/search-index.js";
 import { TrajectoryInspector } from "./trajectory/TrajectoryInspector.js";
@@ -76,6 +82,50 @@ const SUBVIEW_LABEL_KEYS = {
 	logs: "observeLogs",
 	changes: "observeChanges",
 } as const;
+
+interface SelectedDetailState {
+	readonly key: string;
+	readonly status: "loading" | "exact" | "partial" | "error";
+	readonly events: readonly TelemetryEvent[];
+	readonly missingCount: number;
+}
+
+const DETAIL_FETCH_CONCURRENCY = 4;
+const MAX_SELECTED_DETAIL_EVENTS = 4;
+
+export function trajectoryDetailSelectionKey(
+	record: TrajectoryRecord | null,
+	coreGeneration = 0,
+): string | null {
+	return record === null || record.kind === "GAP"
+		? null
+		: `${coreGeneration}\u0000${record.id}\u0000${JSON.stringify(record.sourceEventIds)}`;
+}
+
+export function trajectoryDetailEventSelection(
+	record: Exclude<TrajectoryRecord, { readonly kind: "GAP" }>,
+): { readonly eventIds: readonly string[]; readonly omittedCount: number } {
+	const sourceIds = [...new Set(record.sourceEventIds)];
+	if (sourceIds.length <= MAX_SELECTED_DETAIL_EVENTS) {
+		return { eventIds: sourceIds, omittedCount: 0 };
+	}
+	const selected = new Set<string>();
+	const add = (eventId: string | undefined) => {
+		if (eventId !== undefined && selected.size < MAX_SELECTED_DETAIL_EVENTS) {
+			selected.add(eventId);
+		}
+	};
+	add(sourceIds[0]);
+	add(record.sourceEnvelopes.find((event) => event.phase === "start")?.event_id);
+	add(record.sourceEnvelopes.findLast((event) => event.phase === "end")?.event_id);
+	add(sourceIds.at(-1));
+	for (const eventId of sourceIds) add(eventId);
+	const eventIds = sourceIds.filter((eventId) => selected.has(eventId));
+	return {
+		eventIds,
+		omittedCount: sourceIds.length - eventIds.length,
+	};
+}
 
 function sourceKey(source: TelemetrySourceHealth["source"]): string {
 	return [
@@ -273,6 +323,8 @@ export function ObserveView({ active, onHealthChange }: ObserveViewProps) {
 	const [sourcesError, setSourcesError] = useState(false);
 	const [subview, setSubview] = useState<ObserveSubview>("trajectory");
 	const [selectedRecordId, setSelectedRecordId] = useState<string | null>(null);
+	const [selectedDetail, setSelectedDetail] = useState<SelectedDetailState | null>(null);
+	const detailGeneration = useRef(0);
 	const [searchQuery, setSearchQuery] = useState("");
 	const [filters, setFilters] = useState<TrajectoryFilters>(DEFAULT_FILTERS);
 	const [timelineRange, setTimelineRange] = useState<TrajectoryTimeRange | null>(null);
@@ -366,6 +418,76 @@ export function ObserveView({ active, onHealthChange }: ObserveViewProps) {
 		() => records.find((record) => record.id === selectedRecordId) ?? null,
 		[records, selectedRecordId],
 	);
+	const selectedDetailKey = trajectoryDetailSelectionKey(
+		selectedRecord,
+		snapshot.coreGeneration,
+	);
+	useEffect(() => {
+		const generation = ++detailGeneration.current;
+		setSelectedDetail(null);
+		if (
+			!active ||
+			selectedRecord === null ||
+			selectedRecord.kind === "GAP" ||
+			selectedDetailKey === null
+		) return;
+		const selection = trajectoryDetailEventSelection(selectedRecord);
+		const eventIds = selection.eventIds;
+		if (eventIds.length === 0) return;
+		const controller = new AbortController();
+		setSelectedDetail({
+			key: selectedDetailKey,
+			status: "loading",
+			events: [],
+			missingCount: 0,
+		});
+		void (async () => {
+			const events: TelemetryEvent[] = [];
+			let missingCount = selection.omittedCount;
+			for (let offset = 0; offset < eventIds.length; offset += DETAIL_FETCH_CONCURRENCY) {
+				const batch = eventIds.slice(offset, offset + DETAIL_FETCH_CONCURRENCY);
+				const results = await Promise.allSettled(
+					batch.map((eventId) => store.fetchEventById(eventId, controller.signal)),
+				);
+				if (
+					controller.signal.aborted ||
+					generation !== detailGeneration.current
+				) return;
+				for (const result of results) {
+					if (result.status === "fulfilled") events.push(result.value);
+					else missingCount++;
+				}
+			}
+			if (
+				controller.signal.aborted ||
+				generation !== detailGeneration.current
+			) return;
+			setSelectedDetail({
+				key: selectedDetailKey,
+				status: events.length === 0
+					? "error"
+					: missingCount === 0
+						? "exact"
+						: "partial",
+				events,
+				missingCount,
+			});
+		})();
+		return () => {
+			detailGeneration.current++;
+			controller.abort();
+		};
+	}, [active, selectedDetailKey, store]);
+	const inspectorRecord = useMemo(() => {
+		if (
+			selectedRecord === null ||
+			selectedRecord.kind === "GAP" ||
+			selectedDetail === null ||
+			selectedDetail.key !== selectedDetailKey ||
+			selectedDetail.events.length === 0
+		) return selectedRecord;
+		return hydrateTrajectoryRecordDetail(selectedRecord, selectedDetail.events);
+	}, [selectedDetail, selectedDetailKey, selectedRecord]);
 	const sourceFacts = useMemo(() => mergeSources(health, sources), [health, sources]);
 	const sourceMetadataPending =
 		health === null && sources.length === 0 && !healthError && !sourcesError;
@@ -534,7 +656,17 @@ export function ObserveView({ active, onHealthChange }: ObserveViewProps) {
 							</aside>
 						) : (
 							<TrajectoryInspector
-								record={selectedRecord}
+								record={inspectorRecord}
+								detailStatus={
+									selectedDetail?.key === selectedDetailKey
+										? selectedDetail.status
+										: undefined
+								}
+								detailMissingCount={
+									selectedDetail?.key === selectedDetailKey
+										? selectedDetail.missingCount
+										: undefined
+								}
 								drawerMode={isNarrow}
 								drawerOpen={selectedRecord !== null}
 								nowMs={nowMs}

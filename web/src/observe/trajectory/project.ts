@@ -1247,3 +1247,50 @@ export function flattenTrajectoryRecords(
 		return compareText(left.id, right.id);
 	});
 }
+
+/**
+ * Replace only selected row envelopes returned by exact-ID reads, then rerun
+ * projection for detail fields. Row identity, grouping, timing, and gap state
+ * remain owned by the bounded ledger projection.
+ */
+export function hydrateTrajectoryRecordDetail(
+	record: TelemetryTrajectoryRecord,
+	exactEvents: readonly TelemetryEvent[],
+): TelemetryTrajectoryRecord {
+	if (exactEvents.length === 0 || record.sourceEnvelopes.length === 0) return record;
+	const sourceIds = new Set(record.sourceEventIds);
+	const replacements = new Map(
+		exactEvents
+			.filter((event) => sourceIds.has(event.event_id))
+			.map((event) => [event.event_id, event] as const),
+	);
+	if (replacements.size === 0) return record;
+	const envelopes = record.sourceEnvelopes.map(
+		(event) => replacements.get(event.event_id) ?? event,
+	);
+	const candidates = flattenTrajectoryRecords(projectTrajectory(envelopes));
+	const hydrated = candidates.find(
+		(candidate): candidate is TelemetryTrajectoryRecord =>
+			candidate.kind !== "GAP" &&
+			(candidate.id === record.id ||
+				(candidate.sourceEventIds.length === record.sourceEventIds.length &&
+					candidate.sourceEventIds.every(
+						(eventId, index) => eventId === record.sourceEventIds[index],
+					))),
+	);
+	if (hydrated === undefined) return record;
+	return {
+		...record,
+		attributes: hydrated.attributes,
+		sourceEnvelopes: hydrated.sourceEnvelopes,
+		inputDetail: hydrated.inputDetail,
+		outputDetail: hydrated.outputDetail,
+		thinkingDetail: hydrated.thinkingDetail,
+		schemaDetail: hydrated.schemaDetail,
+		result: hydrated.result,
+		privacyClass: hydrated.privacyClass,
+		privacyIncomplete: hydrated.privacyIncomplete,
+		payloadRefs: hydrated.payloadRefs,
+		redaction: hydrated.redaction,
+	};
+}

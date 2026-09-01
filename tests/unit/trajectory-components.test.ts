@@ -11,6 +11,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { TrajectoryInspector } from "../../web/src/observe/trajectory/TrajectoryInspector.js";
 import {
+	trajectoryDetailEventSelection,
+	trajectoryDetailSelectionKey,
+} from "../../web/src/observe/ObserveView.js";
+import {
 	nextTrajectoryLedgerRecordId,
 	trajectoryLedgerTailKey,
 	TrajectoryLedger,
@@ -23,6 +27,7 @@ import type {
 	TrajectoryRecord,
 	TrajectoryTurn,
 } from "../../web/src/observe/trajectory/record.js";
+import type { TelemetryEvent } from "../../web/src/observe/telemetry-types.js";
 
 const SOURCE = {
 	robot_id: "robot-01",
@@ -78,6 +83,25 @@ function gap(): GapTrajectoryRecord {
 		sourceEventIds: [],
 		sourceSequences: [],
 		gap: { requested: 2, earliest_available: 3, resume_after: 2 },
+	};
+}
+
+function sourceEnvelope(
+	eventId: string,
+	sequence: number,
+	phase: TelemetryEvent["phase"],
+): TelemetryEvent {
+	return {
+		schema_version: 1,
+		event_id: eventId,
+		sequence,
+		observed_at: new Date(sequence * 1_000).toISOString(),
+		monotonic_ns: sequence,
+		kind: "tool.execution",
+		severity: "info",
+		source: SOURCE,
+		attributes: {},
+		phase,
 	};
 }
 
@@ -169,6 +193,122 @@ describe("TrajectoryTimeline", () => {
 });
 
 describe("TrajectoryInspector", () => {
+	it("changes detail selection generation only when stable row source event ids change", () => {
+		const open = record("stable-attempt", 6, {
+			sourceEventIds: ["start-event"],
+		});
+		const unrelatedProjection = { ...open, summary: "unrelated live projection rebuild" };
+		const closed = {
+			...open,
+			sourceEventIds: ["start-event", "end-event"],
+		};
+
+		expect(trajectoryDetailSelectionKey(unrelatedProjection)).toBe(
+			trajectoryDetailSelectionKey(open),
+		);
+		expect(trajectoryDetailSelectionKey(closed)).not.toBe(
+			trajectoryDetailSelectionKey(open),
+		);
+		expect(trajectoryDetailSelectionKey(open, 1)).not.toBe(
+			trajectoryDetailSelectionKey(open, 0),
+		);
+	});
+
+	it("bounds exact selection while retaining start and terminal envelopes", () => {
+		const envelopes = [
+			sourceEnvelope("observation-1", 1, "observation"),
+			sourceEnvelope("start-1", 2, "start"),
+			sourceEnvelope("middle-1", 3, "observation"),
+			sourceEnvelope("middle-2", 4, "observation"),
+			sourceEnvelope("end-1", 5, "end"),
+			sourceEnvelope("observation-2", 6, "observation"),
+		];
+		const selected = record("dense-attempt", 6, {
+			sourceEventIds: envelopes.map((event) => event.event_id),
+			sourceEnvelopes: envelopes,
+		});
+
+		const selection = trajectoryDetailEventSelection(selected);
+
+		expect(selection.eventIds).toHaveLength(4);
+		expect(selection.eventIds).toContain("start-1");
+		expect(selection.eventIds).toContain("end-1");
+		expect(selection.omittedCount).toBe(2);
+	});
+
+	it("renders full exact tool evidence and tokens while keeping raw detail collapsed", () => {
+		const fullArguments = `--fixture=${"x".repeat(70 * 1024)}-arguments-tail`;
+		const fullResult = `result-${"y".repeat(70 * 1024)}-result-tail`;
+		const selected = record("exact-tool-detail", 7, {
+			kind: "TOOL",
+			eventKind: "tool.execution",
+			inputDetail: fullArguments,
+			outputDetail: fullResult,
+			attributes: {
+				input_tokens: 1_001,
+				output_tokens: 2_002,
+				cache_write_1h_tokens: 3_003,
+				reasoning_tokens: 4_004,
+				authorization: "[REDACTED]",
+			},
+			payloadRefs: ["payloads/sha256/inert-exact-detail"],
+			redaction: { applied: true, fields: ["attributes.authorization"] },
+		});
+		const html = renderToStaticMarkup(createElement(TrajectoryInspector, {
+			record: selected,
+			detailStatus: "exact",
+		}));
+
+		expect(html).toContain("Exact event detail loaded");
+		expect(html).toContain("arguments-tail");
+		expect(html).toContain("result-tail");
+		expect(html).toContain("1,001");
+		expect(html).toContain("2,002");
+		expect(html).toContain("Cache write 1h");
+		expect(html).toContain("3,003");
+		expect(html).toContain("Reasoning");
+		expect(html).toContain("4,004");
+		expect(html).toContain("[REDACTED]");
+		expect(html).not.toContain("Bearer ");
+		expect(html).toContain("payloads/sha256/inert-exact-detail");
+		expect(html).not.toContain("href=");
+		expect(html).toContain("<details");
+		expect(html).not.toContain("<details open");
+	});
+
+	it("states when exact detail is loading while retaining bounded projection evidence", () => {
+		const html = renderToStaticMarkup(createElement(TrajectoryInspector, {
+			record: record("loading-detail", 8, { inputDetail: "bounded input fallback" }),
+			detailStatus: "loading",
+		}));
+
+		expect(html).toContain("Loading exact event detail");
+		expect(html).toContain("bounded input fallback");
+	});
+
+	it("states partial exact detail and names fallback envelope count", () => {
+		const html = renderToStaticMarkup(createElement(TrajectoryInspector, {
+			record: record("partial-detail", 9, { outputDetail: "exact available output" }),
+			detailStatus: "partial",
+			detailMissingCount: 1,
+		}));
+
+		expect(html).toContain("1 event unavailable");
+		expect(html).toContain("bounded projection for missing evidence");
+		expect(html).toContain("exact available output");
+	});
+
+	it("states exact detail failure while retaining bounded projection evidence", () => {
+		const html = renderToStaticMarkup(createElement(TrajectoryInspector, {
+			record: record("failed-detail", 10, { result: "bounded result fallback" }),
+			detailStatus: "error",
+		}));
+
+		expect(html).toContain("Exact event detail unavailable");
+		expect(html).toContain("Showing bounded projection");
+		expect(html).toContain("bounded result fallback");
+	});
+
 	it("shows only available evidence in named sections and leaves raw details collapsed", () => {
 		const selected = record("selected-detail", 8, {
 			summary: "bash completed",

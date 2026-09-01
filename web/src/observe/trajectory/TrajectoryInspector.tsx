@@ -15,10 +15,42 @@ import { trajectoryRecordLiveElapsedMs } from "./timeline.js";
 
 export interface TrajectoryInspectorProps {
 	readonly record: TrajectoryRecord | null;
+	readonly detailStatus?: "loading" | "exact" | "partial" | "error";
+	readonly detailMissingCount?: number;
 	readonly drawerOpen?: boolean;
 	readonly drawerMode?: boolean;
 	readonly nowMs?: number;
 	readonly onClose?: () => void;
+}
+
+function DetailStatus({
+	status,
+	missingCount = 0,
+}: {
+	readonly status: TrajectoryInspectorProps["detailStatus"];
+	readonly missingCount?: number;
+}) {
+	if (status === undefined) return null;
+	let message: string;
+	switch (status) {
+		case "loading":
+			message = "Loading exact event detail. Showing bounded projection meanwhile.";
+			break;
+		case "exact":
+			message = "Exact event detail loaded.";
+			break;
+		case "partial":
+			message = `${missingCount.toLocaleString("en-US")} ${missingCount === 1 ? "event" : "events"} unavailable. Showing exact detail where available and bounded projection for missing evidence.`;
+			break;
+		case "error":
+			message = "Exact event detail unavailable. Showing bounded projection.";
+			break;
+	}
+	return (
+		<p className="observe-trajectory-inspector__detail-status" data-status={status} role="status">
+			{message}
+		</p>
+	);
 }
 
 interface EvidenceRow {
@@ -31,6 +63,8 @@ const TOKEN_FIELDS = [
 	["output_tokens", "Output"],
 	["cache_read_tokens", "Cache read"],
 	["cache_write_tokens", "Cache write"],
+	["cache_write_1h_tokens", "Cache write 1h"],
+	["reasoning_tokens", "Reasoning"],
 	["total_tokens", "Total"],
 ] as const;
 
@@ -184,6 +218,8 @@ function rawEvidence(record: TrajectoryRecord): unknown {
 /** Read-only event details. Payload references remain inert text. */
 export const TrajectoryInspector = memo(function TrajectoryInspector({
 	record,
+	detailStatus,
+	detailMissingCount,
 	drawerOpen = record !== null,
 	drawerMode = false,
 	nowMs,
@@ -273,6 +309,7 @@ export const TrajectoryInspector = memo(function TrajectoryInspector({
 					<button type="button" aria-label="Close record details" onClick={onClose}>Close</button>
 				)}
 			</header>
+			<DetailStatus status={detailStatus} missingCount={detailMissingCount} />
 
 			<Section title="Summary">
 				<p>{record.summary}</p>

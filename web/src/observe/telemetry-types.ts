@@ -128,6 +128,25 @@ const MAX_ARRAY_ITEMS = 1_000;
 const MAX_JSON_DEPTH = 12;
 const TRUNCATED_MARKER = "[TRUNCATED]";
 const TRUNCATED_OBJECT_KEY = "__telemetry_truncated__";
+const SECRET_KEY_SUFFIXES = [
+	"_authorization",
+	"_authentication",
+	"_auth",
+	"_cookie",
+	"_api_key",
+	"_apikey",
+	"_access_key",
+	"_access_key_id",
+	"_private_key",
+	"_token",
+	"_password",
+	"_passwd",
+	"_passphrase",
+	"_secret",
+	"_secret_key",
+	"_credential",
+	"_credentials",
+] as const;
 
 export class TelemetryProtocolError extends Error {
 	constructor(message: string) {
@@ -237,10 +256,9 @@ function isSecretKey(value: string): boolean {
 		key === "client_secret" ||
 		key === "credential" ||
 		key === "credentials" ||
-		key.endsWith("_api_key") ||
-		key.endsWith("_access_token") ||
-		key.endsWith("_refresh_token") ||
-		key.endsWith("_client_secret")
+		SECRET_KEY_SUFFIXES.some(
+			(suffix) => key === suffix.slice(1) || key.endsWith(suffix),
+		)
 	);
 }
 
@@ -278,6 +296,58 @@ function sanitizeJson(value: unknown, name: string, depth = 0): TelemetryJson {
 	return output;
 }
 
+interface DetailSanitizeFrame {
+	readonly input: readonly unknown[] | Record<string, unknown>;
+	readonly output: TelemetryJson[] | Record<string, TelemetryJson>;
+	readonly name: string;
+}
+
+function detailJsonNode(
+	value: unknown,
+	name: string,
+): { readonly value: TelemetryJson; readonly frame?: DetailSanitizeFrame } {
+	if (value === null || typeof value === "boolean") return { value };
+	if (typeof value === "number") return { value: finiteNumber(value, name) };
+	if (typeof value === "string") return { value };
+	if (Array.isArray(value)) {
+		const output: TelemetryJson[] = [];
+		return { value: output, frame: { input: value, output, name } };
+	}
+	const input = objectValue(value, name);
+	const output: Record<string, TelemetryJson> = {};
+	return { value: output, frame: { input, output, name } };
+}
+
+function sanitizeDetailJson(value: unknown, name: string): TelemetryJson {
+	const root = detailJsonNode(value, name);
+	const stack = root.frame === undefined ? [] : [root.frame];
+	while (stack.length > 0) {
+		const frame = stack.pop();
+		if (frame === undefined) break;
+		if (Array.isArray(frame.input)) {
+			const output = frame.output as TelemetryJson[];
+			for (const item of frame.input) {
+				const parsed = detailJsonNode(item, frame.name);
+				output.push(parsed.value);
+				if (parsed.frame !== undefined) stack.push(parsed.frame);
+			}
+			continue;
+		}
+		const output = frame.output as Record<string, TelemetryJson>;
+		for (const [key, item] of Object.entries(frame.input)) {
+			if (key === "__proto__" || key === "prototype" || key === "constructor") continue;
+			if (isSecretKey(key)) {
+				output[key] = REDACTED;
+				continue;
+			}
+			const parsed = detailJsonNode(item, frame.name);
+			output[key] = parsed.value;
+			if (parsed.frame !== undefined) stack.push(parsed.frame);
+		}
+	}
+	return root.value;
+}
+
 function structuredRecord(
 	value: unknown,
 	name: string,
@@ -289,6 +359,17 @@ function structuredRecord(
 	// Array.isArray narrows mutable arrays only; TelemetryJson exposes arrays as
 	// readonly. Runtime guard above excludes both forms, so this cast records the
 	// already-proven object branch for TypeScript.
+	return sanitized as Readonly<Record<string, TelemetryJson>>;
+}
+
+function structuredDetailRecord(
+	value: unknown,
+	name: string,
+): Readonly<Record<string, TelemetryJson>> {
+	const sanitized = sanitizeDetailJson(value, name);
+	if (sanitized === null || typeof sanitized !== "object" || Array.isArray(sanitized)) {
+		throw new TelemetryProtocolError(`${name} must be an object`);
+	}
 	return sanitized as Readonly<Record<string, TelemetryJson>>;
 }
 
@@ -313,7 +394,7 @@ function parseCorrelation(value: unknown): TelemetryCorrelation {
 	return output;
 }
 
-export function parseTelemetryEvent(value: unknown): TelemetryEvent {
+function parseTelemetryEventValue(value: unknown, exactDetail: boolean): TelemetryEvent {
 	const input = objectValue(value, "event");
 	if (input.schema_version !== 1) {
 		throw new TelemetryProtocolError("event.schema_version must be 1");
@@ -331,7 +412,9 @@ export function parseTelemetryEvent(value: unknown): TelemetryEvent {
 	const redaction =
 		input.redaction === undefined
 			? undefined
-			: structuredRecord(input.redaction, "event.redaction");
+			: exactDetail
+				? structuredDetailRecord(input.redaction, "event.redaction")
+				: structuredRecord(input.redaction, "event.redaction");
 	return {
 		schema_version: 1,
 		event_id: requiredString(input.event_id, "event.event_id"),
@@ -341,16 +424,28 @@ export function parseTelemetryEvent(value: unknown): TelemetryEvent {
 		kind: requiredString(input.kind, "event.kind"),
 		severity,
 		source: parseSource(input.source),
-		attributes: structuredRecord(input.attributes ?? {}, "event.attributes"),
+		attributes: exactDetail
+			? structuredDetailRecord(input.attributes ?? {}, "event.attributes")
+			: structuredRecord(input.attributes ?? {}, "event.attributes"),
 		phase: optionalString(input.phase, "event.phase"),
 		state: optionalString(input.state, "event.state"),
-		summary: optionalDisplayString(input.summary, "event.summary"),
+		summary: exactDetail
+			? optionalString(input.summary, "event.summary")
+			: optionalDisplayString(input.summary, "event.summary"),
 		correlation,
 		duration_ms: duration,
 		privacy_class: optionalString(input.privacy_class, "event.privacy_class"),
 		payload_ref: optionalString(input.payload_ref, "event.payload_ref"),
 		redaction,
 	};
+}
+
+export function parseTelemetryEvent(value: unknown): TelemetryEvent {
+	return parseTelemetryEventValue(value, false);
+}
+
+export function parseTelemetryEventDetail(value: unknown): TelemetryEvent {
+	return parseTelemetryEventValue(value, true);
 }
 
 function nullableCursor(value: unknown, name: string): number | null {
@@ -383,6 +478,10 @@ export function parseTelemetryEventsPage(value: unknown): TelemetryEventsPage {
 
 export function parseTelemetryEventResponse(value: unknown): TelemetryEvent {
 	return parseTelemetryEvent(objectValue(value, "event response").event);
+}
+
+export function parseTelemetryEventDetailResponse(value: unknown): TelemetryEvent {
+	return parseTelemetryEventDetail(objectValue(value, "event response").event);
 }
 
 function parseSourceHealth(value: unknown): TelemetrySourceHealth {

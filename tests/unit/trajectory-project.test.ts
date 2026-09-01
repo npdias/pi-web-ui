@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
 	flattenTrajectoryRecords,
+	hydrateTrajectoryRecordDetail,
 	projectTrajectory,
 } from "../../web/src/observe/trajectory/project.js";
 import {
@@ -21,7 +22,10 @@ import type {
 	TelemetryEvent,
 	TelemetryReplayGap,
 } from "../../web/src/observe/telemetry-types.js";
-import { parseTelemetryEvent } from "../../web/src/observe/telemetry-types.js";
+import {
+	parseTelemetryEvent,
+	parseTelemetryEventDetail,
+} from "../../web/src/observe/telemetry-types.js";
 
 const FIXTURE_NAMES = [
 	"normal",
@@ -140,6 +144,110 @@ function records(events: readonly TrajectoryProjectionInput[]) {
 }
 
 describe("projectTrajectory", () => {
+	it("reprojects a paired row from exact selected start and end envelopes", () => {
+		const scope = {
+			trace_id: "exact-run",
+			turn_id: "exact-turn",
+			step_id: "exact-step",
+			request_id: "exact-request",
+			tool_call_id: "exact-call",
+		};
+		const fullArguments = `args-${"x".repeat(70 * 1024)}-arguments-tail`;
+		const fullResult = `result-${"y".repeat(70 * 1024)}-result-tail`;
+		const rawStart = {
+			...envelope(1, "tool.execution", {
+				phase: "start",
+				state: "running",
+				correlation: scope,
+				attributes: {
+					lifecycle_attempt_id: "exact-attempt",
+					tool_name: "bash",
+					input: { command: fullArguments, authorization: "private-secret" },
+				},
+			}),
+			attributes: {
+				lifecycle_attempt_id: "exact-attempt",
+				tool_name: "bash",
+				input: { command: fullArguments, authorization: "private-secret" },
+			},
+		};
+		const rawEnd = {
+			...envelope(2, "tool.execution", {
+				phase: "end",
+				state: "completed",
+				correlation: scope,
+				attributes: {
+					lifecycle_attempt_id: "exact-attempt",
+					tool_name: "bash",
+					matched_start: true,
+					output: { content: fullResult, token: "private-token" },
+				},
+			}),
+			attributes: {
+				lifecycle_attempt_id: "exact-attempt",
+				tool_name: "bash",
+				matched_start: true,
+				output: { content: fullResult, token: "private-token" },
+			},
+		};
+		const boundedEvents = [parseTelemetryEvent(rawStart), parseTelemetryEvent(rawEnd)];
+		const exactEvents = [
+			parseTelemetryEventDetail(rawStart),
+			parseTelemetryEventDetail(rawEnd),
+		];
+		const [boundedRecord] = records(boundedEvents) as readonly TelemetryTrajectoryRecord[];
+
+		const hydrated = hydrateTrajectoryRecordDetail(boundedRecord, exactEvents);
+
+		expect(hydrated.id).toBe(boundedRecord.id);
+		expect(hydrated.index).toBe(boundedRecord.index);
+		expect(hydrated.sourceEventIds).toEqual(boundedRecord.sourceEventIds);
+		expect(hydrated.inputDetail).toContain("arguments-tail");
+		expect(hydrated.result).toContain("result-tail");
+		expect(hydrated.inputDetail).toContain('"authorization": "[REDACTED]"');
+		expect(hydrated.result).toContain('"token": "[REDACTED]"');
+		expect(hydrated.sourceEnvelopes[0].attributes.input).toMatchObject({
+			command: fullArguments,
+			authorization: "[REDACTED]",
+		});
+	});
+
+	it("keeps bounded envelope fallback when only part of a paired row hydrates", () => {
+		const scope = { tool_call_id: "partial-call" };
+		const start = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation: scope,
+			attributes: {
+				lifecycle_attempt_id: "partial-attempt",
+				tool_name: "read",
+				input: "bounded-start",
+			},
+		});
+		const end = envelope(2, "tool.execution", {
+			phase: "end",
+			state: "completed",
+			correlation: scope,
+			attributes: {
+				lifecycle_attempt_id: "partial-attempt",
+				tool_name: "read",
+				matched_start: true,
+				output: "bounded-end-fallback",
+			},
+		});
+		const [boundedRecord] = records([start, end]) as readonly TelemetryTrajectoryRecord[];
+		const exactStart = parseTelemetryEventDetail({
+			...start,
+			attributes: { ...start.attributes, input: "exact-start-detail" },
+		});
+
+		const hydrated = hydrateTrajectoryRecordDetail(boundedRecord, [exactStart]);
+
+		expect(hydrated.inputDetail).toBe("exact-start-detail");
+		expect(hydrated.result).toBe("bounded-end-fallback");
+		expect(hydrated.sourceEnvelopes[1]).toEqual(end);
+	});
+
 	it("projects redacted user, model, tool, and result details plus model token evidence", () => {
 		const scope = {
 			trace_id: "content-run",

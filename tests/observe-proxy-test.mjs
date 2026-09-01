@@ -75,6 +75,11 @@ const upstream = createServer((req, res) => {
 	}
 	if (url.pathname.startsWith("/telemetry/events/")) {
 		const eventId = decodeURIComponent(url.pathname.slice("/telemetry/events/".length));
+		if (eventId === "oversize-detail") {
+			res.setHeader("Content-Length", String(16 * 1024 * 1024 + 1));
+			res.end("{}");
+			return;
+		}
 		res.end(JSON.stringify({ event: { ...telemetryEvent, event_id: eventId } }));
 		return;
 	}
@@ -307,8 +312,13 @@ try {
 	]) {
 		const response = await fetch(authenticatedUiUrl(path));
 		assert.equal(response.status, 200, path);
+		assert.match(response.headers.get("content-type") ?? "", /^application\/json/u, path);
+		assert.equal(response.headers.get("cache-control"), "no-store", path);
 		const body = await response.json();
 		assert.ok(expected in body || body.status === expected, path);
+		if (path === "/api/observe/events/tel_8") {
+			assert.deepEqual(body, { event: telemetryEvent });
+		}
 	}
 
 	for (const eventId of LONG_EVENT_IDS) {
@@ -354,6 +364,10 @@ try {
 
 	const oversized = await fetch(authenticatedUiUrl("/api/observe/events?kind=oversize"));
 	assert.equal(oversized.status, 413);
+	const oversizedDetail = await fetch(
+		authenticatedUiUrl("/api/observe/events/oversize-detail"),
+	);
+	assert.equal(oversizedDetail.status, 413);
 
 	holdHealth = true;
 	const occupied = Array.from({ length: 16 }, () =>

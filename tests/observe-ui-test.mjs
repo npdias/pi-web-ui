@@ -25,6 +25,9 @@ const screenshotDir = process.env.OBSERVE_UI_SCREENSHOT_DIR;
 if (screenshotDir) mkdirSync(screenshotDir, { recursive: true });
 const streams = new Set();
 const seen = [];
+const pageLimits = [];
+const detailRequests = [];
+const heldDetailResponses = new Set();
 let streamRequests = 0;
 let activeStreams = 0;
 let maxActiveStreams = 0;
@@ -34,6 +37,7 @@ let failures = 0;
 let sequence = 0;
 let holdHealth = true;
 let failNextSources = false;
+let staleDetailAborted = false;
 const heldHealthResponses = [];
 const fixtureEpoch = Date.now() - 60_000;
 
@@ -106,6 +110,7 @@ const events = [
 		attributes: {
 			tool_name: "fixture_tool",
 			lifecycle_attempt_id: "tool-attempt-observe",
+			input: { command: "bounded tool arguments preview" },
 		},
 	}),
 	event("tool.execution", {
@@ -126,6 +131,7 @@ const events = [
 			lifecycle_attempt_id: "tool-attempt-observe",
 			is_error: false,
 			matched_start: true,
+			output: { content: "bounded tool result preview" },
 		},
 		payload_ref: "payloads/sha256/inert-observe-reference",
 	}),
@@ -136,6 +142,34 @@ const events = [
 		attributes: { load_state: "sampled" },
 	}),
 ];
+
+const exactArguments = `exact-args-${"x".repeat(70 * 1024)}-exact-arguments-tail`;
+const exactResult = `exact-result-${"y".repeat(70 * 1024)}-exact-result-tail`;
+const exactEvents = new Map(events.map((item) => [item.event_id, item]));
+exactEvents.set(events[2].event_id, {
+	...events[2],
+	attributes: {
+		...events[2].attributes,
+		input: {
+			command: exactArguments,
+			"headers.authorization": "Bearer selected-detail-secret",
+		},
+	},
+	redaction: {
+		applied: true,
+		fields: ["attributes.input.headers.authorization"],
+	},
+});
+exactEvents.set(events[3].event_id, {
+	...events[3],
+	attributes: {
+		...events[3].attributes,
+		output: {
+			content: exactResult,
+			token: "selected-result-secret",
+		},
+	},
+});
 
 let health = {
 	status: "healthy",
@@ -211,7 +245,35 @@ const telemetryServer = createServer((req, res) => {
 	seen.push({ path: url.pathname, headers: { ...req.headers } });
 	if (url.pathname === "/telemetry/events") {
 		res.setHeader("Content-Type", "application/json");
+		const limit = Number(url.searchParams.get("limit") ?? 100);
+		pageLimits.push(limit);
+		if (limit > 1) {
+			res.statusCode = 413;
+			res.end(JSON.stringify({ error: "fixture page too large" }));
+			return;
+		}
 		res.end(JSON.stringify(pageFor(url)));
+		return;
+	}
+	if (url.pathname.startsWith("/telemetry/events/")) {
+		const eventId = decodeURIComponent(url.pathname.slice("/telemetry/events/".length));
+		detailRequests.push(eventId);
+		res.setHeader("Content-Type", "application/json");
+		if (eventId === events[0].event_id) {
+			heldDetailResponses.add(res);
+			res.on("close", () => {
+				heldDetailResponses.delete(res);
+				staleDetailAborted = true;
+			});
+			return;
+		}
+		const selected = exactEvents.get(eventId);
+		if (selected === undefined) {
+			res.statusCode = 404;
+			res.end(JSON.stringify({ error: "event not found" }));
+			return;
+		}
+		res.end(JSON.stringify({ event: selected }));
 		return;
 	}
 	if (url.pathname === "/telemetry/health") {
@@ -358,6 +420,8 @@ try {
 	const consoleErrors = [];
 	const externalRequests = [];
 	const pageRequestPaths = [];
+	const adaptive413Responses = [];
+	const unexpected413Responses = [];
 	page.on("pageerror", (error) => pageErrors.push(error.message));
 	page.on("console", (message) => {
 		if (message.type() === "error") consoleErrors.push(message.text());
@@ -366,6 +430,15 @@ try {
 		const requestUrl = new URL(request.url());
 		pageRequestPaths.push(requestUrl.pathname);
 		if (requestUrl.origin !== uiOrigin) externalRequests.push(request.url());
+	});
+	page.on("response", (response) => {
+		if (response.status() !== 413) return;
+		const responseUrl = new URL(response.url());
+		if (responseUrl.origin === uiOrigin && responseUrl.pathname === "/api/observe/events") {
+			adaptive413Responses.push(response.url());
+		} else {
+			unexpected413Responses.push(response.url());
+		}
 	});
 	await page.goto(uiOrigin, { waitUntil: "domcontentloaded" });
 	await page.waitForSelector(".topbar", { timeout: 20_000 });
@@ -421,11 +494,23 @@ try {
 	check("ledger shows live elapsed for open record", (await openRunRow.textContent())?.includes("Open · elapsed"));
 	await openRunRow.click();
 	check("inspector shares live elapsed evidence", (await page.getByLabel("Trajectory record details").textContent())?.includes("Live elapsed"));
+	await waitFor(() => detailRequests.includes(events[0].event_id), "stale selected detail request");
 
 	const retainedRow = page.locator(".observe-trajectory-ledger__row", { hasText: "Retained fixture tool finished" });
 	await retainedRow.click();
 	await page.waitForSelector(".observe-trajectory-inspector[data-open='true']");
 	check("selection opens inspector", (await page.getByLabel("Trajectory record details").textContent())?.includes("Retained fixture tool finished"));
+	await page.getByText("Exact event detail loaded.", { exact: true }).waitFor();
+	const retainedInspectorText = await page.getByLabel("Trajectory record details").textContent();
+	check("paired selection fetches exact start and end envelopes", detailRequests.includes(events[2].event_id) && detailRequests.includes(events[3].event_id), detailRequests.join(", "));
+	check("selected inspector renders full arguments beyond ledger truncation", retainedInspectorText?.includes("exact-arguments-tail"));
+	check("selected inspector renders full result beyond ledger truncation", retainedInspectorText?.includes("exact-result-tail"));
+	check("selected detail browser sanitizer redacts known secret keys", retainedInspectorText?.includes("[REDACTED]") && !retainedInspectorText.includes("selected-detail-secret") && !retainedInspectorText.includes("selected-result-secret"));
+	check("selected detail preserves upstream redaction fields", retainedInspectorText?.includes("attributes.input.headers.authorization"));
+	await waitFor(() => staleDetailAborted, "stale selected detail abort");
+	check("selection change aborts stale exact detail request", staleDetailAborted);
+	const inspectorAfterStaleAbort = await page.getByLabel("Trajectory record details").textContent();
+	check("stale selected detail cannot overwrite current inspector", inspectorAfterStaleAbort?.includes("Retained fixture tool finished") && !inspectorAfterStaleAbort.includes("Retained run started"));
 	check("inspection pauses live follow", await page.getByRole("button", { name: "Jump to live" }).isEnabled());
 	if (screenshotDir) {
 		await page.screenshot({ path: join(screenshotDir, "observe-desktop.png"), fullPage: true });
@@ -607,9 +692,14 @@ try {
 	check("empty Trajectory offers no repair button", await page.locator(".observe-empty-state button").count() === 0);
 
 	check("payload references remain inert across every browser request", !pageRequestPaths.some((path) => path.includes("/payload")), pageRequestPaths.filter((path) => path.includes("/payload")).join(", "));
+	check("adaptive replay retries 413 pages then reuses limit 1", pageLimits[0] === 100 && pageLimits[1] === 15 && pageLimits.slice(2).includes(1), pageLimits.join(", "));
+	check("all browser 413 responses belong to adaptive event pages", adaptive413Responses.length >= 2 && unexpected413Responses.length === 0, unexpected413Responses.join(", "));
 	check("browser made no external/provider request", externalRequests.length === 0, externalRequests.join(", "));
 	check("browser raised no page errors", pageErrors.length === 0, pageErrors.join(" | "));
-	check("browser console raised no errors", consoleErrors.length === 0, consoleErrors.join(" | "));
+	const unexpectedConsoleErrors = consoleErrors.filter(
+		(message) => message !== "Failed to load resource: the server responded with a status of 413 (Payload Too Large)",
+	);
+	check("browser console raised no unexpected errors", unexpectedConsoleErrors.length === 0, unexpectedConsoleErrors.join(" | "));
 	check("Observe connected at least twice for explicit re-entry", streamRequests >= 2, `requests=${streamRequests}`);
 } catch (error) {
 	console.error("Observe UI acceptance failed:", error);
@@ -618,6 +708,7 @@ try {
 	if (browser) await browser.close();
 	await stopUi();
 	for (const res of heldHealthResponses.splice(0)) res.destroy();
+	for (const res of [...heldDetailResponses]) res.destroy();
 	for (const res of [...streams]) res.destroy();
 	await new Promise((resolve) => telemetryServer.close(() => resolve()));
 	rmSync(runRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
