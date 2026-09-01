@@ -55,6 +55,11 @@ import {
 	type SoundSettings,
 } from "./sounds";
 import { useTheme } from "./theme";
+import {
+	DISCONNECTED_OBSERVE_HEALTH,
+	ObserveView,
+	type ObserveHealthSummary,
+} from "./observe/ObserveView";
 
 export interface PendingAttachment {
 	path: string;
@@ -182,8 +187,8 @@ function ResizeHandle({
 	);
 }
 
-/** 顶栏视图：内置三个 + 每个已装插件一个 `plugin:<id>`。 */
-type ViewName = "chat" | "terminal" | "git" | `plugin:${string}`;
+/** 顶栏视图：内置四个 + 每个已装插件一个 `plugin:<id>`。 */
+type ViewName = "chat" | "terminal" | "git" | "observe" | `plugin:${string}`;
 
 export function App() {
 	const t = useT();
@@ -195,6 +200,9 @@ export function App() {
 	 *  its own stopPropagation handlers. */
 	const [appDragOver, setAppDragOver] = useState(false);
 	const [view, setView] = useState<ViewName>("chat");
+	const [observeHealth, setObserveHealth] = useState<ObserveHealthSummary>(
+		DISCONNECTED_OBSERVE_HEALTH,
+	);
 	// 已安装且未在设置面板禁用的插件（决定 tab 与视图加载）。
 	const enabledPlugins = useMemo(
 		() =>
@@ -615,6 +623,7 @@ export function App() {
 				chat={chat}
 				send={send}
 				view={view}
+				observeHealth={observeHealth}
 				plugins={enabledPlugins}
 				onViewChange={(v: ViewName) => {
 					// The terminal panel stays mounted while hidden. Create the first
@@ -751,6 +760,17 @@ export function App() {
 						terminal={terminal}
 						active={view === "git"}
 						onSwitchToTerminal={() => setView("terminal")}
+					/>
+				</div>
+				<div
+					id="observe-view-pane"
+					className={`view-pane ${view === "observe" ? "" : "hidden"}`}
+					role="tabpanel"
+					aria-labelledby="observe-view-tab"
+				>
+					<ObserveView
+						active={view === "observe"}
+						onHealthChange={setObserveHealth}
 					/>
 				</div>
 				{pluginViews.map((entry) => {

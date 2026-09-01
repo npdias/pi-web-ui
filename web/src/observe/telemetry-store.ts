@@ -4,11 +4,15 @@ import {
 	TelemetryProtocolError,
 	parseTelemetryEvent,
 	parseTelemetryEventsPage,
+	parseTelemetryHealth,
 	parseTelemetryReplayGap,
+	parseTelemetrySourcesResponse,
 	type TelemetryEvent,
 	type TelemetryEventsPage,
+	type TelemetryHealth,
 	type TelemetryReplayGap,
 	type TelemetrySeverity,
+	type TelemetrySourceHealth,
 } from "./telemetry-types.js";
 
 export interface TelemetryUiPreferences {
@@ -307,6 +311,26 @@ export class TelemetryStore {
 		return this.fetchPage(query);
 	}
 
+	/** Read current core health through the same authenticated Pi proxy boundary. */
+	async getHealth(signal?: AbortSignal): Promise<TelemetryHealth> {
+		return this.fetchJson(
+			withToken(appUrl("/api/observe/health")),
+			parseTelemetryHealth,
+			"telemetry health",
+			signal,
+		);
+	}
+
+	/** Read current source health through the same authenticated Pi proxy boundary. */
+	async getSources(signal?: AbortSignal): Promise<readonly TelemetrySourceHealth[]> {
+		return this.fetchJson(
+			withToken(appUrl("/api/observe/sources")),
+			parseTelemetrySourcesResponse,
+			"telemetry sources",
+			signal,
+		);
+	}
+
 	setPreferences(preferences: TelemetryUiPreferences): void {
 		const parsed = parsePreferences(preferences);
 		if (!parsed) throw new Error("preferences are invalid");
@@ -342,7 +366,21 @@ export class TelemetryStore {
 		query: TelemetryQuery,
 		signal?: AbortSignal,
 	): Promise<TelemetryEventsPage> {
-		const response = await this.fetchImpl(withToken(queryUrl(query)), {
+		return this.fetchJson(
+			withToken(queryUrl(query)),
+			parseTelemetryEventsPage,
+			"telemetry query",
+			signal,
+		);
+	}
+
+	private async fetchJson<T>(
+		url: string,
+		parse: (value: unknown) => T,
+		name: string,
+		signal?: AbortSignal,
+	): Promise<T> {
+		const response = await this.fetchImpl(url, {
 			method: "GET",
 			headers: { Accept: "application/json" },
 			credentials: "same-origin",
@@ -350,16 +388,16 @@ export class TelemetryStore {
 		});
 		if (!response.ok) {
 			throw new TelemetryProtocolError(
-				`telemetry query failed with HTTP ${response.status}`,
+				`${name} failed with HTTP ${response.status}`,
 			);
 		}
 		let value: unknown;
 		try {
 			value = await response.json();
 		} catch {
-			throw new TelemetryProtocolError("telemetry query returned invalid JSON");
+			throw new TelemetryProtocolError(`${name} returned invalid JSON`);
 		}
-		return parseTelemetryEventsPage(value);
+		return parse(value);
 	}
 
 	private async replay(generation: number, signal: AbortSignal): Promise<void> {

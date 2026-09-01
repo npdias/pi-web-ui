@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+	FiActivity,
 	FiFolder,
 	FiGitBranch,
 	FiMenu,
@@ -19,12 +20,15 @@ import { Dropdown, DropdownItem } from "./Dropdown";
 import { SoundSettingsPanel } from "./SoundSettings";
 import type { SoundKind, SoundSettings } from "../sounds";
 import { useT } from "../i18n";
+import type { ObserveHealthSummary } from "../observe/ObserveView";
 
 interface TopBarProps {
 	chat: ChatState;
 	send: (msg: ClientMessage) => boolean;
-	view: "chat" | "terminal" | "git" | `plugin:${string}`;
-	onViewChange: (view: "chat" | "terminal" | "git" | `plugin:${string}`) => void;
+	view: "chat" | "terminal" | "git" | "observe" | `plugin:${string}`;
+	onViewChange: (view: "chat" | "terminal" | "git" | "observe" | `plugin:${string}`) => void;
+	/** Runtime-derived Observe status. Model text never contributes to this badge. */
+	observeHealth: ObserveHealthSummary;
 	/** Installed optional plugins (<dataDir>/plugins) — one view tab each. */
 	plugins: { id: string; name: string; icon?: string; description?: string; error?: string }[];
 	/** Open a side panel as a mobile drawer ("left" = history, "right" = files). */
@@ -49,6 +53,7 @@ export function TopBar({
 	chat,
 	send,
 	view,
+	observeHealth,
 	plugins,
 	onViewChange,
 	onOpenPanel,
@@ -127,6 +132,26 @@ export function TopBar({
 					>
 						<FiGitBranch />
 						<span>{t("scmTab")}</span>
+					</button>
+					<button
+						id="observe-view-tab"
+						type="button"
+						role="tab"
+						aria-controls="observe-view-pane"
+						aria-selected={view === "observe"}
+						className={`observe-tab${view === "observe" ? " active" : ""}`}
+						title={`${observeHealth.label}: ${observeHealth.detail}`}
+						onClick={() => onViewChange("observe")}
+					>
+						<FiActivity />
+						<span>{t("observe")}</span>
+						<span
+							className="observe-tab__badge"
+							data-tone={observeHealth.tone}
+							aria-label={`Observe status: ${observeHealth.label}`}
+						>
+							{observeHealth.label}
+						</span>
 					</button>
 					{plugins.map((p) => {
 						const tip = p.error
