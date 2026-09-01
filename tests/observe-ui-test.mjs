@@ -145,6 +145,8 @@ const events = [
 
 const exactArguments = `exact-args-${"x".repeat(70 * 1024)}-exact-arguments-tail`;
 const exactResult = `exact-result-${"y".repeat(70 * 1024)}-exact-result-tail`;
+const deepDetailPlaceholder = "__PI_OBSERVE_DEEP_DETAIL_PLACEHOLDER__";
+const deepDetailJson = `${"[".repeat(20_000)}"deep-browser-leaf"${"]".repeat(20_000)}`;
 const exactEvents = new Map(events.map((item) => [item.event_id, item]));
 exactEvents.set(events[2].event_id, {
 	...events[2],
@@ -153,6 +155,7 @@ exactEvents.set(events[2].event_id, {
 		input: {
 			command: exactArguments,
 			"headers.authorization": "Bearer selected-detail-secret",
+			deep: deepDetailPlaceholder,
 		},
 	},
 	redaction: {
@@ -273,7 +276,11 @@ const telemetryServer = createServer((req, res) => {
 			res.end(JSON.stringify({ error: "event not found" }));
 			return;
 		}
-		res.end(JSON.stringify({ event: selected }));
+		let body = JSON.stringify({ event: selected });
+		if (eventId === events[2].event_id) {
+			body = body.replace(JSON.stringify(deepDetailPlaceholder), deepDetailJson);
+		}
+		res.end(body);
 		return;
 	}
 	if (url.pathname === "/telemetry/health") {
@@ -505,6 +512,7 @@ try {
 	check("paired selection fetches exact start and end envelopes", detailRequests.includes(events[2].event_id) && detailRequests.includes(events[3].event_id), detailRequests.join(", "));
 	check("selected inspector renders full arguments beyond ledger truncation", retainedInspectorText?.includes("exact-arguments-tail"));
 	check("selected inspector renders full result beyond ledger truncation", retainedInspectorText?.includes("exact-result-tail"));
+	check("selected inspector bounds 20k nested exact detail honestly", retainedInspectorText?.includes("[TRUNCATED: depth]"));
 	check("selected detail browser sanitizer redacts known secret keys", retainedInspectorText?.includes("[REDACTED]") && !retainedInspectorText.includes("selected-detail-secret") && !retainedInspectorText.includes("selected-result-secret"));
 	check("selected detail preserves upstream redaction fields", retainedInspectorText?.includes("attributes.input.headers.authorization"));
 	await waitFor(() => staleDetailAborted, "stale selected detail abort");

@@ -248,6 +248,63 @@ describe("projectTrajectory", () => {
 		expect(hydrated.sourceEnvelopes[1]).toEqual(end);
 	});
 
+	it("formats deeply nested exact input without recursive JSON serialization", () => {
+		let deep: unknown = "deep-project-leaf";
+		for (let index = 0; index < 20_000; index++) deep = [deep];
+		const base = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation: { tool_call_id: "deep-call" },
+			attributes: {
+				lifecycle_attempt_id: "deep-attempt",
+				tool_name: "read",
+			},
+		});
+		const exact = parseTelemetryEventDetail({
+			...base,
+			attributes: {
+				...base.attributes,
+				input: {
+					authorization: "[REDACTED]",
+					deep,
+				},
+			},
+		});
+
+		const [projected] = records([exact]);
+
+		expect(projected.inputDetail).toContain('"authorization": "[REDACTED]"');
+		expect(projected.inputDetail).toContain("[TRUNCATED: depth]");
+	});
+
+	it("marks oversized selected detail while preserving early redacted evidence", () => {
+		const base = envelope(1, "tool.execution", {
+			phase: "start",
+			state: "running",
+			correlation: { tool_call_id: "oversized-call" },
+			attributes: {
+				lifecycle_attempt_id: "oversized-attempt",
+				tool_name: "read",
+			},
+		});
+		const exact = parseTelemetryEventDetail({
+			...base,
+			attributes: {
+				...base.attributes,
+				input: {
+					authorization: "[REDACTED]",
+					content: "x".repeat(2 * 1024 * 1024),
+				},
+			},
+		});
+
+		const [projected] = records([exact]);
+
+		expect(projected.inputDetail).toContain('"authorization": "[REDACTED]"');
+		expect(projected.inputDetail).toContain("[TRUNCATED: size]");
+		expect(projected.inputDetail?.length).toBeLessThanOrEqual(1024 * 1024);
+	});
+
 	it("projects redacted user, model, tool, and result details plus model token evidence", () => {
 		const scope = {
 			trace_id: "content-run",

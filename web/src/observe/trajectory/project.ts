@@ -21,6 +21,7 @@ import type {
 	TrajectoryStep,
 	TrajectoryTurn,
 } from "./record.js";
+import { formatTelemetryDetail } from "./detail-format.js";
 
 const SUPPORTED_EVENT_KINDS = new Set([
 	"agent.run",
@@ -307,7 +308,7 @@ function stringAttribute(
 function detailValue(value: TelemetryJson | undefined): string | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value === "string") return value.length === 0 ? undefined : value;
-	return JSON.stringify(value, null, 2);
+	return formatTelemetryDetail(value);
 }
 
 function detailFields(

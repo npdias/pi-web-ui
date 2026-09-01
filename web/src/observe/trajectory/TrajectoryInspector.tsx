@@ -11,6 +11,7 @@ import {
 	type TelemetryTrajectoryRecord,
 	type TrajectoryRecord,
 } from "./record.js";
+import { formatTelemetryDetail } from "./detail-format.js";
 import { trajectoryRecordLiveElapsedMs } from "./timeline.js";
 
 export interface TrajectoryInspectorProps {
@@ -332,7 +333,7 @@ export const TrajectoryInspector = memo(function TrajectoryInspector({
 			)}
 			<details className="observe-trajectory-inspector__raw">
 				<summary>Raw details</summary>
-				<pre>{JSON.stringify(rawEvidence(record), null, 2)}</pre>
+				<pre>{formatTelemetryDetail(rawEvidence(record))}</pre>
 			</details>
 		</aside>
 	);

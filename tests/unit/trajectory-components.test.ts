@@ -309,6 +309,28 @@ describe("TrajectoryInspector", () => {
 		expect(html).toContain("bounded result fallback");
 	});
 
+	it("renders deeply nested raw exact evidence without recursive JSON serialization", () => {
+		let deep: unknown = "deep-inspector-leaf";
+		for (let index = 0; index < 20_000; index++) deep = [deep];
+		const envelope = sourceEnvelope("deep-raw-event", 11, "observation");
+		const selected = record("deep-raw-detail", 11, {
+			attributes: { authorization: "[REDACTED]", deep } as TelemetryEvent["attributes"],
+			sourceEnvelopes: [{
+				...envelope,
+				attributes: { authorization: "[REDACTED]", deep } as TelemetryEvent["attributes"],
+			}],
+		});
+
+		const html = renderToStaticMarkup(createElement(TrajectoryInspector, {
+			record: selected,
+			detailStatus: "exact",
+		}));
+
+		expect(html).toContain("[REDACTED]");
+		expect(html).toContain("[TRUNCATED: depth]");
+		expect(html).toContain("Raw details");
+	});
+
 	it("shows only available evidence in named sections and leaves raw details collapsed", () => {
 		const selected = record("selected-detail", 8, {
 			summary: "bash completed",
