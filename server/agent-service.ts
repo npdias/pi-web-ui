@@ -1514,13 +1514,13 @@ export class ClientSession {
 				conv.queueSteering = [...event.steering];
 				conv.queueFollowUp = [...event.followUp];
 				break;
-			// 手动 /compact 或阈值/溢出自动压缩开始——立即反馈，避免「没反应」
-			// （此前 compaction_start/end 事件被 switch 静默丢弃，issue #33）。
+			// Manual /compact plus threshold/overflow compaction report progress
+			// immediately. The summary itself remains a durable chat message.
 			case "compaction_start": {
 				this.emit({
 					type: "notice",
 					level: "info",
-					text: "正在压缩上下文…（压缩摘要将显示在消息区）",
+					text: "Compacting context… (summary will appear in chat)",
 				});
 				break;
 			}
@@ -1529,13 +1529,13 @@ export class ClientSession {
 					this.emit({
 						type: "notice",
 						level: "error",
-						text: `压缩上下文失败：${event.errorMessage}`,
+						text: `Context compaction failed: ${event.errorMessage}`,
 					});
 				} else if (event.aborted) {
 					this.emit({
 						type: "notice",
 						level: "warning",
-						text: "压缩上下文已取消",
+						text: "Context compaction cancelled",
 					});
 				} else if (event.result) {
 					const { tokensBefore, estimatedTokensAfter } = event.result;
@@ -1543,7 +1543,7 @@ export class ClientSession {
 					this.emit({
 						type: "notice",
 						level: "info",
-						text: `上下文压缩完成：${tokensBefore.toLocaleString()} → ${after.toLocaleString()} tokens（摘要已插入消息区）`,
+						text: `Context compacted: ${tokensBefore.toLocaleString()} → ${after.toLocaleString()} tokens (summary added to chat)`,
 					});
 				}
 				break;

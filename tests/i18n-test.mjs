@@ -3,7 +3,7 @@
  * Run:  npm run build && node i18n-test.mjs */
 import { CHROME_PATH } from "./lib/chrome.mjs";
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium } from "playwright-core";
@@ -91,6 +91,22 @@ async function main() {
 		"no language selector is rendered",
 		(await page.locator("text=Language").count()) === 0 &&
 			(await page.locator("text=中文").count()) === 0,
+	);
+	const agentServiceSource = readFileSync(
+		join(new URL("..", import.meta.url).pathname, "server", "agent-service.ts"),
+		"utf8",
+	);
+	const compactionStart = agentServiceSource.indexOf('case "compaction_start"');
+	const compactionEnd = agentServiceSource.indexOf('case "agent_end"', compactionStart);
+	const compactionNotices = agentServiceSource.slice(compactionStart, compactionEnd);
+	check(
+		"compaction start/result/error/cancel notices are English",
+		compactionStart >= 0 &&
+			compactionEnd > compactionStart &&
+			compactionNotices.includes("Compacting context") &&
+			compactionNotices.includes("Context compaction failed:") &&
+			compactionNotices.includes("Context compaction cancelled") &&
+			compactionNotices.includes("Context compacted:"),
 	);
 
 	// -- reload cannot restore a saved non-English locale ---------------------
