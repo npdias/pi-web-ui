@@ -34,6 +34,7 @@ export interface TelemetrySnapshot {
 	readonly cursor: number | null;
 	/** In-memory epoch incremented when retained high-water proves a core reset. */
 	readonly coreGeneration: number;
+	readonly loadedBytes: number;
 	readonly status:
 		| "idle"
 		| "replaying"
@@ -69,6 +70,7 @@ export interface TelemetryStoreOptions {
 	readonly fetch?: FetchLike;
 	readonly storage?: StorageLike;
 	readonly maxRecords?: number;
+	readonly maxBytes?: number;
 	readonly backoffMs?: readonly number[];
 	readonly sleep?: (delayMs: number, signal: AbortSignal) => Promise<void>;
 }
@@ -82,11 +84,12 @@ interface SseFrame {
 const CURSOR_STORAGE_KEY = "pi-web-ui.observe.cursor.v1";
 const PREFERENCES_STORAGE_KEY = "pi-web-ui.observe.preferences.v1";
 const MAX_RECORDS = 10_000;
+const MAX_STORE_BYTES = 32 * 1024 * 1024;
 const MAX_QUERY_PAGE_SIZE = 1_000;
 const REPLAY_PAGE_SIZE = 100;
 const REPLAY_PAGE_LIMITS = [100, 15, 1] as const;
 const MAX_REPLAY_PAGES = 100_000;
-const MAX_DETAIL_RESPONSE_BYTES = 1024 * 1024;
+const MAX_DETAIL_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000] as const;
 const DEFAULT_PREFERENCES: TelemetryUiPreferences = {
 	followLive: true,
@@ -175,11 +178,16 @@ function loadPreferences(storage: StorageLike | undefined): TelemetryUiPreferenc
 
 function validateStoreOptions(options: TelemetryStoreOptions): {
 	maxRecords: number;
+	maxBytes: number;
 	backoffMs: readonly number[];
 } {
 	const maxRecords = options.maxRecords ?? MAX_RECORDS;
 	if (!Number.isInteger(maxRecords) || maxRecords < 1 || maxRecords > MAX_RECORDS) {
 		throw new Error(`maxRecords must be between 1 and ${MAX_RECORDS}`);
+	}
+	const maxBytes = options.maxBytes ?? MAX_STORE_BYTES;
+	if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_STORE_BYTES) {
+		throw new Error(`maxBytes must be between 1 and ${MAX_STORE_BYTES}`);
 	}
 	const backoffMs = options.backoffMs ?? DEFAULT_BACKOFF_MS;
 	if (
@@ -194,7 +202,7 @@ function validateStoreOptions(options: TelemetryStoreOptions): {
 	) {
 		throw new Error("backoffMs must contain delays between 0 and 60000");
 	}
-	return { maxRecords, backoffMs: [...backoffMs] };
+	return { maxRecords, maxBytes, backoffMs: [...backoffMs] };
 }
 
 function queryInteger(value: number | undefined, name: string): string | undefined {
@@ -243,6 +251,10 @@ function recordSequence(record: TelemetryRecord): number {
 
 function recordOrder(record: TelemetryRecord): number {
 	return record.type === "gap" ? 0 : 1;
+}
+
+function recordByteSize(record: TelemetryRecord): number {
+	return new TextEncoder().encode(JSON.stringify(record)).byteLength;
 }
 
 function gapKey(gap: TelemetryReplayGap): string {
@@ -300,7 +312,9 @@ async function readBoundedResponseText(
 				} catch {
 					// Reject oversized content even when upstream cancellation fails.
 				}
-				throw new TelemetryProtocolError(`${name} exceeds 1 MiB`);
+				throw new TelemetryProtocolError(
+					`${name} exceeds ${limit / (1024 * 1024)} MiB`,
+				);
 			}
 			chunks.push(value);
 		}
@@ -320,12 +334,15 @@ export class TelemetryStore {
 	private readonly fetchImpl: FetchLike;
 	private readonly storage: StorageLike | undefined;
 	private readonly maxRecords: number;
+	private readonly maxBytes: number;
 	private readonly backoffMs: readonly number[];
 	private readonly sleepImpl: (delayMs: number, signal: AbortSignal) => Promise<void>;
 	private readonly listeners = new Set<Listener>();
 	private readonly eventSequences = new Set<number>();
 	private readonly gapKeys = new Set<string>();
+	private readonly recordSizes = new WeakMap<object, number>();
 	private records: TelemetryRecord[] = [];
+	private loadedBytes = 0;
 	private cursor: number | null;
 	private preferences: TelemetryUiPreferences;
 	private status: StoreStatus = "idle";
@@ -339,6 +356,7 @@ export class TelemetryStore {
 		this.fetchImpl = options.fetch ?? ((url, init) => fetch(url, init));
 		this.storage = options.storage ?? browserStorage();
 		this.maxRecords = validated.maxRecords;
+		this.maxBytes = validated.maxBytes;
 		this.backoffMs = validated.backoffMs;
 		this.sleepImpl = options.sleep ?? defaultSleep;
 		const loadedCursor = loadCursor(this.storage);
@@ -403,7 +421,7 @@ export class TelemetryStore {
 			Number(declaredLength) > MAX_DETAIL_RESPONSE_BYTES
 		) {
 			await cancelResponseBody(response);
-			throw new TelemetryProtocolError("telemetry event detail exceeds 1 MiB");
+			throw new TelemetryProtocolError("telemetry event detail exceeds 2 MiB");
 		}
 		const body = await readBoundedResponseText(
 			response,
@@ -470,6 +488,7 @@ export class TelemetryStore {
 			gaps: records.flatMap((record) => (record.type === "gap" ? [record.gap] : [])),
 			cursor: this.cursor,
 			coreGeneration: this.coreGeneration,
+			loadedBytes: this.loadedBytes,
 			status: this.status,
 			preferences: { ...this.preferences },
 		};
@@ -741,9 +760,19 @@ export class TelemetryStore {
 			}
 		}
 		this.records.splice(low, 0, record);
-		while (this.records.length > this.maxRecords) {
+		const size = recordByteSize(record);
+		this.recordSizes.set(record, size);
+		this.loadedBytes += size;
+		while (
+			this.records.length > this.maxRecords ||
+			this.loadedBytes > this.maxBytes
+		) {
 			const removed = this.records.shift();
 			if (!removed) break;
+			this.loadedBytes = Math.max(
+				0,
+				this.loadedBytes - (this.recordSizes.get(removed) ?? 0),
+			);
 			if (removed.type === "event") this.eventSequences.delete(removed.event.sequence);
 			else this.gapKeys.delete(gapKey(removed.gap));
 		}
@@ -766,6 +795,7 @@ export class TelemetryStore {
 
 	private clearRecords(): void {
 		this.records = [];
+		this.loadedBytes = 0;
 		this.eventSequences.clear();
 		this.gapKeys.clear();
 		this.coreGeneration++;

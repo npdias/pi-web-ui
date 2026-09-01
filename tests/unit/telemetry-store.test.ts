@@ -244,7 +244,7 @@ describe("TelemetryStore", () => {
 		);
 	});
 
-	it("aborts selected detail fetch and rejects responses over 1 MiB", async () => {
+	it("aborts selected detail fetch and rejects responses over 2 MiB", async () => {
 		const pendingStore = new TelemetryStore({
 			fetch: async (_url, init) => pendingResponse(init?.signal),
 		});
@@ -254,24 +254,37 @@ describe("TelemetryStore", () => {
 		await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 
 		const oversizedStore = new TelemetryStore({
-			fetch: async () => new Response("x".repeat(1024 * 1024 + 1), {
+			fetch: async () => new Response("x".repeat(2 * 1024 * 1024 + 1), {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			}),
 		});
 		await expect(oversizedStore.fetchEventById("tel_oversized")).rejects.toThrow(
-			/1 MiB/,
+			/2 MiB/,
 		);
 	});
 
-	it("cancels a chunked exact detail response as soon as it crosses 1 MiB", async () => {
+	it("accepts a near-limit core event after envelope and response wrapping", async () => {
+		const output = "x".repeat(1024 * 1024 - 1_024);
+		const item = event(1, { attributes: { output_detail: output } });
+		const wrapped = JSON.stringify({ event: item });
+		expect(new TextEncoder().encode(wrapped).byteLength).toBeGreaterThan(1_000_000);
+		expect(new TextEncoder().encode(wrapped).byteLength).toBeLessThan(2 * 1024 * 1024);
+		const store = new TelemetryStore({ fetch: async () => eventResponse(item) });
+
+		const detail = await store.fetchEventById(item.event_id);
+
+		expect(detail.attributes.output_detail).toBe(output);
+	});
+
+	it("cancels a chunked exact detail response as soon as it crosses 2 MiB", async () => {
 		let cancelled = false;
 		let pulls = 0;
 		const body = new ReadableStream<Uint8Array>({
 			pull(controller) {
 				pulls++;
-				if (pulls <= 3) {
-					controller.enqueue(new Uint8Array(600 * 1024));
+				if (pulls <= 5) {
+					controller.enqueue(new Uint8Array(800 * 1024));
 					return;
 				}
 				controller.close();
@@ -288,10 +301,10 @@ describe("TelemetryStore", () => {
 		});
 
 		await expect(store.fetchEventById("tel_chunked_oversized")).rejects.toThrow(
-			/1 MiB/,
+			/2 MiB/,
 		);
 		expect(cancelled).toBe(true);
-		expect(pulls).toBeLessThan(4);
+		expect(pulls).toBeLessThan(6);
 	});
 
 	it("retries 413 pages at the same boundary then reuses the safe size for replay and SSE", async () => {
@@ -678,6 +691,32 @@ describe("TelemetryStore", () => {
 		const older = await store.query({ before: 2, limit: 1 });
 		expect(older.events.map((item) => item.sequence)).toEqual([1]);
 		expect(store.snapshot().events.map((item) => item.sequence)).toEqual([3, 4, 5]);
+		store.disconnect();
+	});
+
+	it("bounds loaded records by serialized bytes while preserving newest cursor", async () => {
+		const largeEvents = Array.from({ length: 40 }, (_, index) =>
+			event(index + 1, {
+				summary: `large-${index}-${"x".repeat(32 * 1024)}`,
+				attributes: { output_detail: "y".repeat(32 * 1024) },
+			}),
+		);
+		const store = new TelemetryStore({
+			maxRecords: 10_000,
+			maxBytes: 512 * 1024,
+			fetch: async (url, init) =>
+				url.includes("/events")
+					? page(largeEvents, null, 40)
+					: pendingResponse(init?.signal),
+		});
+
+		await store.connect();
+		const snapshot = store.snapshot();
+
+		expect(snapshot.loadedBytes).toBeLessThanOrEqual(512 * 1024);
+		expect(snapshot.events.length).toBeLessThan(40);
+		expect(snapshot.events.at(-1)?.sequence).toBe(40);
+		expect(snapshot.cursor).toBe(40);
 		store.disconnect();
 	});
 
