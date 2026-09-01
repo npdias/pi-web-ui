@@ -23,6 +23,14 @@ export function stripAnsi(s: string): string {
 	return s.replace(ANSI_RE, "");
 }
 
+function isStartupReadyNotice(message: string): boolean {
+	const normalized = stripAnsi(message).trim();
+	return (
+		!/\bnot ready\b/iu.test(normalized) &&
+		(/\bready\b/iu.test(normalized) || /\bloaded\s*:/iu.test(normalized))
+	);
+}
+
 /** Mock theme: TUI color functions degrade to identity so widget text survives. */
 const mockTheme = new Proxy(
 	{
@@ -74,6 +82,7 @@ export class WebUIContext {
 	private widgets = new Map<string, WidgetEntry>();
 	private lastLines = new Map<string, string[]>();
 	private emit: (msg: ServerMessage) => void;
+	private readonly seenStartupNotices = new Set<string>();
 
 	constructor(emit: (msg: ServerMessage) => void) {
 		this.emit = emit;
@@ -156,7 +165,13 @@ export class WebUIContext {
 	// Instance arrows so these survive the SDK's wrapUIPromptContext `{ ...ui }`
 	// (object spread copies own properties only, not class prototype methods).
 	notify: ExtensionUIContext["notify"] = (message, type) => {
-		this.emit({ type: "notice", level: type ?? "info", text: message });
+		const level = type ?? "info";
+		if (level === "info" && isStartupReadyNotice(message)) {
+			const key = stripAnsi(message).trim();
+			if (this.seenStartupNotices.has(key)) return;
+			this.seenStartupNotices.add(key);
+		}
+		this.emit({ type: "notice", level, text: message });
 	};
 
 	// -- footer status (pi-lens "LSP Inactive", pi-cache-optimizer cache stats) --

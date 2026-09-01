@@ -37,4 +37,39 @@ describe("WebUIContext SDK wrap", () => {
 			text: "hello",
 		});
 	});
+
+	it("emits each identical startup-ready notice only once", () => {
+		const msgs: ServerMessage[] = [];
+		const ui = new WebUIContext((msg) => msgs.push(msg));
+
+		ui.notify("web-tools ready (local)", "info");
+		ui.notify("web-tools ready (local)", "info");
+		ui.notify("homeclaw ready", "info");
+		ui.notify("homeclaw ready", "info");
+		ui.notify("Ponytail loaded: full", "info");
+		ui.notify("Ponytail loaded: full", "info");
+
+		expect(msgs.filter((msg) => msg.type === "notice")).toEqual([
+			{ type: "notice", level: "info", text: "web-tools ready (local)" },
+			{ type: "notice", level: "info", text: "homeclaw ready" },
+			{ type: "notice", level: "info", text: "Ponytail loaded: full" },
+		]);
+	});
+
+	it("does not suppress failures, warnings, normal info, or not-ready notices", () => {
+		const msgs: ServerMessage[] = [];
+		const ui = new WebUIContext((msg) => msgs.push(msg));
+
+		for (const [text, level] of [
+			["extension failed", "error"],
+			["extension warning", "warning"],
+			["ordinary update", "info"],
+			["pi-computer-use is not ready yet", "info"],
+		] as const) {
+			ui.notify(text, level);
+			ui.notify(text, level);
+		}
+
+		expect(msgs.filter((msg) => msg.type === "notice")).toHaveLength(8);
+	});
 });
