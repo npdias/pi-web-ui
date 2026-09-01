@@ -93,6 +93,50 @@ function fixture(summary = "Deploy Widget") {
 }
 
 describe("TrajectorySearchIndex", () => {
+	it("searches bounded projected prompt, response, and server-redacted tool details", () => {
+		const scope = {
+			trace_id: "trace-content",
+			turn_id: "turn-content",
+			step_id: "step-content",
+			request_id: "request-content",
+		};
+		const index = new TrajectorySearchIndex();
+		index.update(projectTrajectory([
+			event(1, "user.message", {
+				phase: "observation",
+				state: "emitted",
+				correlation: scope,
+				attributes: { input_detail: "Inspect telemetry fixture" },
+			}),
+			event(2, "model.response", {
+				phase: "end",
+				state: "completed",
+				correlation: scope,
+				attributes: {
+					lifecycle_attempt_id: "search-model-attempt",
+					output_detail: "Final diagnostic response",
+				},
+			}),
+			event(3, "tool.result", {
+				phase: "observation",
+				state: "completed",
+				correlation: { ...scope, tool_call_id: "search-content-call" },
+				attributes: {
+					tool_name: "read",
+					output: {
+						content: [{ type: "text", text: "Bounded result evidence" }],
+						authorization: "[REDACTED]",
+					},
+				},
+			}),
+		]));
+
+		expect(index.search("telemetry fixture")?.size).toBe(1);
+		expect(index.search("diagnostic response")?.size).toBe(1);
+		expect(index.search("bounded result")?.size).toBe(1);
+		expect(index.search("redacted")?.size).toBe(1);
+	});
+
 	it("matches all terms across permitted redacted display fields", () => {
 		const index = new TrajectorySearchIndex();
 		const turns = projectTrajectory(fixture());

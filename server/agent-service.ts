@@ -1317,6 +1317,7 @@ export class ClientSession {
 					conversationId: conv.telemetryConversationId,
 					idNamespace: `${conv.telemetryConversationId}:${sessionId}:${randomUUID()}`,
 					stallThresholdMs: STALL_NOTIFY_MS,
+					onFailure: () => this.noteTelemetryFailure("mapping", 1),
 				});
 			} catch {
 				conv.telemetryMapper = undefined;

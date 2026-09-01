@@ -6,9 +6,13 @@ import {
 } from "../../server/telemetry/pi-event-mapper.js";
 
 type AgentEndEvent = Extract<AgentSessionEvent, { type: "agent_end" }>;
+type MessageEndEvent = Extract<AgentSessionEvent, { type: "message_end" }>;
+type MessageStartEvent = Extract<AgentSessionEvent, { type: "message_start" }>;
 type MessageUpdateEvent = Extract<AgentSessionEvent, { type: "message_update" }>;
 type TurnEndEvent = Extract<AgentSessionEvent, { type: "turn_end" }>;
 type AssistantMessage = Extract<TurnEndEvent["message"], { role: "assistant" }>;
+type ToolResultMessage = Extract<MessageEndEvent["message"], { role: "toolResult" }>;
+type UserMessage = Extract<MessageEndEvent["message"], { role: "user" }>;
 
 const usage = {
 	input: 1,
@@ -49,14 +53,27 @@ function turnEnd(stopReason: Parameters<typeof assistant>[0]): TurnEndEvent {
 function toolEnd(
 	toolCallId = "call-1",
 	isError = false,
+	result: unknown = { content: [], details: {} },
 ): Extract<AgentSessionEvent, { type: "tool_execution_end" }> {
 	return {
 		type: "tool_execution_end",
 		toolCallId,
 		toolName: "bash",
-		result: { content: [], details: {} },
+		result,
 		isError,
 	};
+}
+
+function userMessage(content: UserMessage["content"]): UserMessage {
+	return { role: "user", content, timestamp: 1_000 };
+}
+
+function messageStart(message: MessageStartEvent["message"]): MessageStartEvent {
+	return { type: "message_start", message };
+}
+
+function messageEnd(message: MessageEndEvent["message"]): MessageEndEvent {
+	return { type: "message_end", message };
 }
 
 function mapper(clock = { wall: 1_700_000_000_000, mono: 100 }): PiEventMapper {
@@ -226,6 +243,130 @@ describe("PiEventMapper", () => {
 				...(want.tool_call_id ? { tool_call_id: want.tool_call_id } : {}),
 			},
 			attributes: { source_timestamp_ms: 1_700_000_000_000 },
+		});
+	});
+
+	it("maps completed user input text and image count without image bytes", () => {
+		const subject = mapper();
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+
+		const [record] = subject.map(messageEnd(userMessage([
+			{ type: "text", text: "Inspect fixture" },
+			{ type: "image", data: "PRIVATE_IMAGE_BYTES", mimeType: "image/png" },
+			{ type: "text", text: "Report status" },
+		])));
+
+		expect(record).toMatchObject({
+			kind: "user.message",
+			phase: "observation",
+			state: "emitted",
+			correlation: {
+				trace_id: "conversation-1:run:1",
+				turn_id: "conversation-1:turn:1",
+				request_id: "conversation-1:request:1",
+			},
+			attributes: {
+				input_detail: "Inspect fixture\nReport status",
+				image_count: 1,
+			},
+		});
+		expect(JSON.stringify(record)).not.toContain("PRIVATE_IMAGE_BYTES");
+	});
+
+	it("pairs assistant response lifecycle and emits final metadata, output, tokens, state, and duration", () => {
+		const clock = { wall: 1_700_000_000_000, mono: 100 };
+		const subject = mapper(clock);
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		const pending = assistant("pending");
+		const finished: AssistantMessage = {
+			...assistant("stop", [
+				{ type: "thinking", thinking: "PRIVATE_HIDDEN_REASONING" },
+				{ type: "text", text: "Fixture final response" },
+			]),
+			usage: {
+				...usage,
+				input: 11,
+				output: 7,
+				cacheRead: 3,
+				cacheWrite: 2,
+				reasoning: 4,
+				totalTokens: 23,
+			},
+		};
+
+		const [start] = subject.map(messageStart(pending));
+		clock.mono = 145;
+		const [end] = subject.map(messageEnd(finished));
+
+		expect(start).toMatchObject({
+			kind: "model.response",
+			phase: "start",
+			state: "running",
+			attributes: {
+				lifecycle_attempt_id: "conversation-1:model-attempt:1",
+				api: "openai-responses",
+				provider: "openai",
+				model: "test-model",
+			},
+		});
+		expect(end).toMatchObject({
+			kind: "model.response",
+			phase: "end",
+			state: "completed",
+			duration_ms: 45,
+			attributes: {
+				lifecycle_attempt_id: "conversation-1:model-attempt:1",
+				matched_start: true,
+				api: "openai-responses",
+				provider: "openai",
+				model: "test-model",
+				output_detail: "Fixture final response",
+				input_tokens: 11,
+				output_tokens: 7,
+				cache_read_tokens: 3,
+				cache_write_tokens: 2,
+				reasoning_tokens: 4,
+				total_tokens: 23,
+				stop_reason: "stop",
+			},
+		});
+		expect(JSON.stringify([start, end])).not.toContain("PRIVATE_HIDDEN_REASONING");
+	});
+
+	it("maps completed tool-result messages with structured output and source tool correlation", () => {
+		const subject = mapper();
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "Fixture tool result" }],
+			details: { path: "README.md", line_count: 4 },
+			isError: false,
+			timestamp: 1_001,
+		};
+
+		const [record] = subject.map(messageEnd(result));
+
+		expect(record).toMatchObject({
+			kind: "tool.result",
+			phase: "observation",
+			state: "completed",
+			correlation: {
+				tool_call_id: "call-1",
+				request_id: "conversation-1:request:1",
+			},
+			attributes: {
+				tool_name: "read",
+				is_error: false,
+				output: {
+					content: [{ type: "text", text: "Fixture tool result" }],
+					details: { line_count: 4, path: "README.md" },
+				},
+			},
 		});
 	});
 
@@ -409,7 +550,7 @@ describe("PiEventMapper", () => {
 		expect(duplicateEnd.attributes).toMatchObject({ matched_start: false });
 	});
 
-	it("owns stable tool attempt IDs across duplicate start and matched end", () => {
+	it("owns stable tool attempt IDs while preserving structured input and output for core redaction", () => {
 		const subject = mapper();
 		subject.map({ type: "agent_start" });
 		subject.map({ type: "turn_start" });
@@ -417,14 +558,21 @@ describe("PiEventMapper", () => {
 			type: "tool_execution_start",
 			toolCallId: "reused-call",
 			toolName: "read",
-			args: { private_argument: "DO_NOT_SERIALIZE" },
+			args: {
+				authorization: "PRIVATE_TOOL_ARGUMENT",
+				path: "README.md",
+			},
 		} satisfies AgentSessionEvent;
+		const result = {
+			content: [{ type: "text", text: "Fixture output" }],
+			details: { password: "PRIVATE_TOOL_RESULT", lines: 4 },
+		};
 
 		const [firstStart] = subject.map(start);
 		const [duplicateStart] = subject.map(start);
-		const [firstEnd] = subject.map(toolEnd("reused-call"));
+		const [firstEnd] = subject.map(toolEnd("reused-call", false, result));
 		const [secondStart] = subject.map(start);
-		const [secondEnd] = subject.map(toolEnd("reused-call"));
+		const [secondEnd] = subject.map(toolEnd("reused-call", false, result));
 
 		expect(firstStart.attributes?.lifecycle_attempt_id).toBe(
 			"conversation-1:tool-attempt:1",
@@ -441,9 +589,134 @@ describe("PiEventMapper", () => {
 		expect(secondEnd.attributes?.lifecycle_attempt_id).toBe(
 			secondStart.attributes?.lifecycle_attempt_id,
 		);
-		expect(JSON.stringify([firstStart, duplicateStart, firstEnd])).not.toContain(
-			"DO_NOT_SERIALIZE",
-		);
+		expect(firstStart.attributes?.input).toEqual({
+			authorization: "PRIVATE_TOOL_ARGUMENT",
+			path: "README.md",
+		});
+		expect(firstEnd.attributes?.output).toEqual({
+			content: [{ text: "Fixture output", type: "text" }],
+			details: { lines: 4, password: "PRIVATE_TOOL_RESULT" },
+		});
+		expect(typeof firstStart.attributes?.input).toBe("object");
+	});
+
+	it("replaces tool input over 256 KiB with a hash marker and no preview", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_OVERSIZE_PREVIEW";
+		const args = { payload: `${privatePrefix}${"x".repeat(300 * 1024)}` };
+		const expectedBytes = Buffer.byteLength(JSON.stringify(args), "utf8");
+
+		const [record] = subject.map({
+			type: "tool_execution_start",
+			toolCallId: "large-call",
+			toolName: "fixture",
+			args,
+		});
+
+		expect(record.attributes?.input).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: expectedBytes,
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+	});
+
+	it("replaces tool output over 256 KiB with a hash marker and no preview", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_OVERSIZE_RESULT";
+		const result = { content: [{ type: "text", text: `${privatePrefix}${"x".repeat(300 * 1024)}` }] };
+		const expectedBytes = Buffer.byteLength(JSON.stringify(result), "utf8");
+
+		const [record] = subject.map(toolEnd("large-result", false, result));
+
+		expect(record.attributes?.output).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: expectedBytes,
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+	});
+
+	it("serializes deeply nested structured input without recursive stack failure", () => {
+		const subject = mapper();
+		const args: { child?: unknown } = {};
+		let cursor = args;
+		for (let depth = 0; depth < 20_000; depth++) {
+			const child: { child?: unknown } = {};
+			cursor.child = child;
+			cursor = child;
+		}
+		cursor.child = "leaf";
+		let records: ReturnType<PiEventMapper["map"]> = [];
+
+		expect(() => {
+			records = subject.map({
+				type: "tool_execution_start",
+				toolCallId: "deep-call",
+				toolName: "fixture",
+				args,
+			});
+		}).not.toThrow();
+		const [record] = records;
+		let output = record.attributes?.input;
+		let depth = 0;
+		while (typeof output === "object" && output !== null && !Array.isArray(output)) {
+			output = output.child;
+			depth++;
+		}
+		expect(depth).toBe(20_001);
+		expect(output).toBe("leaf");
+	});
+
+	it("replaces user text over the record-safe bound with a hash marker and no preview", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_TEXT_PREVIEW";
+		const content = `${privatePrefix}${"x".repeat(800 * 1024)}`;
+		const expectedBytes = Buffer.byteLength(content, "utf8");
+
+		const [record] = subject.map(messageEnd(userMessage(content)));
+
+		expect(record.attributes?.input_detail).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: expectedBytes,
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+		expect(Buffer.byteLength(JSON.stringify(record), "utf8")).toBeLessThan(1024 * 1024);
+	});
+
+	it("bounds text by encoded record bytes instead of raw string bytes", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_ESCAPED_PREVIEW";
+		const content = `${privatePrefix}${"\"".repeat(600 * 1024)}`;
+
+		const [record] = subject.map(messageEnd(userMessage(content)));
+
+		expect(record.attributes?.input_detail).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: Buffer.byteLength(content, "utf8"),
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+		expect(Buffer.byteLength(JSON.stringify(record), "utf8")).toBeLessThan(1024 * 1024);
+	});
+
+	it("replaces final model text over the record-safe bound with a hash marker and no preview", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_MODEL_PREVIEW";
+		const content = `${privatePrefix}${"x".repeat(800 * 1024)}`;
+		const expectedBytes = Buffer.byteLength(content, "utf8");
+		subject.map(messageStart(assistant("pending")));
+
+		const [record] = subject.map(messageEnd(assistant("stop", [{ type: "text", text: content }])));
+
+		expect(record.attributes?.output_detail).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: expectedBytes,
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+		expect(Buffer.byteLength(JSON.stringify(record), "utf8")).toBeLessThan(1024 * 1024);
 	});
 
 	it("allocates local attempt IDs for unmatched tool terminals", () => {
@@ -585,6 +858,33 @@ describe("PiEventMapper", () => {
 				attributes: expect.objectContaining({ content: "provider summary", content_index: 0 }),
 			}),
 		]);
+	});
+
+	it("replaces provider thinking over the record-safe bound with a hash marker and no preview", () => {
+		const subject = mapper();
+		const privatePrefix = "PRIVATE_THINKING_PREVIEW";
+		const content = `${privatePrefix}${"x".repeat(800 * 1024)}`;
+		const message = assistant("pending", [{ type: "thinking", thinking: content }]);
+		const event: MessageUpdateEvent = {
+			type: "message_update",
+			message,
+			assistantMessageEvent: {
+				type: "thinking_end",
+				contentIndex: 0,
+				content,
+				partial: message,
+			},
+		};
+
+		const [record] = subject.map(event);
+
+		expect(record.attributes?.content).toEqual({
+			truncated: true,
+			sha256: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			original_bytes: Buffer.byteLength(content, "utf8"),
+		});
+		expect(JSON.stringify(record)).not.toContain(privatePrefix);
+		expect(Buffer.byteLength(JSON.stringify(record), "utf8")).toBeLessThan(1024 * 1024);
 	});
 
 	it.each([
@@ -812,9 +1112,10 @@ describe("PiEventMapper", () => {
 		["Map", () => new Map([["type", "object"]])],
 		["Date", () => new Date("2026-08-31T00:00:00Z")],
 		["RegExp", () => /object/],
-	] as const)("rejects %s before clocks, state, or context emission", (_name, makeSchema) => {
+	] as const)("reports invalid %s context while preserving lifecycle", (_name, makeSchema) => {
 		let wallCalls = 0;
 		let monotonicCalls = 0;
+		const failures: string[] = [];
 		const subject = new PiEventMapper({
 			source: { host_id: "robot-01", component: "pi" },
 			sessionId: "session-1",
@@ -827,6 +1128,7 @@ describe("PiEventMapper", () => {
 				monotonicCalls++;
 				return 100;
 			},
+			onFailure: (reason) => failures.push(reason),
 		});
 		const invalidContext: PiTelemetryContext = {
 			systemPrompt: "prompt",
@@ -837,8 +1139,9 @@ describe("PiEventMapper", () => {
 		expect(() => {
 			records = subject.map({ type: "agent_start" }, invalidContext);
 		}).not.toThrow();
-		expect(records).toEqual([]);
-		expect({ wallCalls, monotonicCalls }).toEqual({ wallCalls: 0, monotonicCalls: 0 });
+		expect(records.map((record) => record.kind)).toEqual(["agent.run"]);
+		expect({ wallCalls, monotonicCalls }).toEqual({ wallCalls: 1, monotonicCalls: 1 });
+		expect(failures).toEqual(["invalid_context_schema"]);
 
 		const validRecords = subject.map(
 			{ type: "agent_start" },
@@ -846,7 +1149,7 @@ describe("PiEventMapper", () => {
 		);
 		expect(validRecords.map((record) => record.kind)).toEqual(["context.changed", "agent.run"]);
 		expect(validRecords[0].correlation).toMatchObject({ trace_id: "conversation-1:run:1" });
-		expect(validRecords[1].attributes).not.toHaveProperty("duplicate_start");
+		expect(validRecords[1].attributes).toMatchObject({ duplicate_start: true });
 	});
 
 	it("does not consume a matched tool start when malformed tool end arrives", () => {
@@ -965,6 +1268,37 @@ describe("PiEventMapper", () => {
 		const unmatchedEnd = subject.map(toolEnd());
 		expect(unmatchedEnd[0].duration_ms).toBeUndefined();
 		expect(unmatchedEnd[0].correlation).not.toHaveProperty("turn_id");
+	});
+
+	it("terminates an open model response before its turn and run during forced reset", () => {
+		const clock = { wall: 1_700_000_000_000, mono: 100 };
+		const subject = mapper(clock);
+		subject.map({ type: "agent_start" });
+		subject.map({ type: "turn_start" });
+		const [modelStart] = subject.map(messageStart(assistant("pending")));
+		clock.mono = 125;
+
+		const records = subject.forceReset();
+
+		expect(records.map((record) => `${record.kind}:${record.phase}:${record.state}`)).toEqual([
+			"model.response:end:cancelled",
+			"agent.turn:end:cancelled",
+			"agent.run:end:aborted",
+		]);
+		expect(records[0]).toMatchObject({
+			duration_ms: 25,
+			attributes: {
+				cause_class: "forced_reset",
+				matched_start: true,
+				lifecycle_attempt_id: modelStart.attributes?.lifecycle_attempt_id,
+			},
+		});
+
+		const [unmatchedEnd] = subject.map(messageEnd(assistant("stop")));
+		expect(unmatchedEnd.attributes).toMatchObject({ matched_start: false });
+		expect(unmatchedEnd.attributes?.lifecycle_attempt_id).not.toBe(
+			modelStart.attributes?.lifecycle_attempt_id,
+		);
 	});
 
 	it("emits an explicit forced-reset observation when no span is open", () => {

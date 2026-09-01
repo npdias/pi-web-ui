@@ -24,21 +24,41 @@ const FIXTURE_NAMES = [
 	"cancelled",
 ];
 const FORBIDDEN_FIXTURE_KEYS = new Set([
-	"args",
-	"apiKey",
 	"authorization",
-	"content",
+	"access_token",
+	"accessToken",
+	"api_key",
+	"apiKey",
+	"apikey",
+	"auth_token",
+	"authToken",
+	"bearer_token",
+	"bearerToken",
+	"client_secret",
+	"clientSecret",
 	"cookie",
 	"credential",
+	"credentials",
 	"headers",
 	"messages",
+	"password",
+	"passwd",
 	"payload",
 	"prompt",
+	"proxy_authorization",
+	"proxyAuthorization",
 	"raw",
-	"result",
+	"refresh_token",
+	"refreshToken",
 	"secret",
+	"session_token",
+	"sessionToken",
+	"set_cookie",
+	"setCookie",
 	"systemPrompt",
-	"token",
+	"system_prompt",
+	"toolSchemas",
+	"tool_schemas",
 	"toolResults",
 ]);
 const EXPECTATION_KEYS = new Set([
@@ -59,7 +79,10 @@ const EXPECTATION_KINDS = new Set([
 	"agent.run",
 	"agent.stall",
 	"agent.turn",
+	"model.response",
+	"tool.result",
 	"tool.execution",
+	"user.message",
 ]);
 const EXPECTATION_PHASES = new Set(["start", "end", "observation"]);
 const EXPECTATION_SEVERITIES = new Set(["debug", "info", "warning", "error", "critical"]);
@@ -68,14 +91,31 @@ const EXPECTATION_STATES = new Set([
 	"completed",
 	"error",
 	"cancelled",
+	"emitted",
 	"possibly_stalled",
+	"tool_use",
 ]);
 const EXPECTATION_ATTRIBUTES = new Set([
+	"api",
+	"cache_read_tokens",
+	"cache_write_tokens",
+	"image_count",
+	"input",
+	"input_detail",
+	"input_tokens",
 	"is_error",
 	"lifecycle_attempt_id",
 	"matched_start",
+	"model",
+	"output",
+	"output_detail",
+	"output_tokens",
+	"provider",
+	"reasoning_tokens",
 	"silence_ms",
+	"stop_reason",
 	"threshold_ms",
+	"total_tokens",
 	"tool_name",
 	"will_retry",
 ]);
@@ -84,6 +124,8 @@ const EVENT_TYPES = new Set([
 	"agent_end",
 	"turn_start",
 	"turn_end",
+	"message_start",
+	"message_end",
 	"tool_execution_start",
 	"tool_execution_end",
 ]);
@@ -101,6 +143,24 @@ function isRecord(value) {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function normalizedKey(value) {
+	return value
+		.replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+		.replace(/[.\s-]+/g, "_")
+		.toLowerCase();
+}
+
+function isForbiddenFixtureKey(key) {
+	const normalized = normalizedKey(key);
+	return FORBIDDEN_FIXTURE_KEYS.has(key) ||
+		FORBIDDEN_FIXTURE_KEYS.has(normalized) ||
+		normalized.endsWith("_headers") ||
+		normalized.endsWith("_api_key") ||
+		normalized.endsWith("_access_token") ||
+		normalized.endsWith("_refresh_token") ||
+		normalized.endsWith("_client_secret");
+}
+
 function assertNoForbiddenFixtureData(value, location) {
 	if (Array.isArray(value)) {
 		value.forEach((item, index) =>
@@ -110,8 +170,71 @@ function assertNoForbiddenFixtureData(value, location) {
 	}
 	if (!isRecord(value)) return;
 	for (const [key, field] of Object.entries(value)) {
-		assert.ok(!FORBIDDEN_FIXTURE_KEYS.has(key), `${location} contains forbidden ${key}`);
+		assert.ok(!isForbiddenFixtureKey(key), `${location} contains forbidden ${key}`);
 		assertNoForbiddenFixtureData(field, `${location}.${key}`);
+	}
+}
+
+function validateContent(content, location, allowedTypes) {
+	assert.ok(Array.isArray(content), `${location} must be an array`);
+	for (const [index, block] of content.entries()) {
+		assert.ok(isRecord(block), `${location}[${index}] must be an object`);
+		assert.ok(allowedTypes.has(block.type), `${location}[${index}].type is unsupported`);
+		if (block.type === "text") {
+			assert.equal(typeof block.text, "string", `${location}[${index}].text is invalid`);
+		} else if (block.type === "image") {
+			assert.equal(typeof block.data, "string", `${location}[${index}].data is invalid`);
+			assert.equal(typeof block.mimeType, "string", `${location}[${index}].mimeType is invalid`);
+		} else if (block.type === "thinking") {
+			assert.equal(typeof block.thinking, "string", `${location}[${index}].thinking is invalid`);
+		} else if (block.type === "toolCall") {
+			assert.equal(typeof block.id, "string", `${location}[${index}].id is invalid`);
+			assert.equal(typeof block.name, "string", `${location}[${index}].name is invalid`);
+			assert.ok(isRecord(block.arguments), `${location}[${index}].arguments is invalid`);
+		}
+	}
+}
+
+function validateUsage(usage, location) {
+	assert.ok(isRecord(usage), `${location} must be an object`);
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]) {
+		assert.equal(typeof usage[key], "number", `${location}.${key} is invalid`);
+		assert.ok(Number.isFinite(usage[key]) && usage[key] >= 0, `${location}.${key} is invalid`);
+	}
+	if (Object.hasOwn(usage, "reasoning")) {
+		assert.equal(typeof usage.reasoning, "number", `${location}.reasoning is invalid`);
+		assert.ok(Number.isFinite(usage.reasoning) && usage.reasoning >= 0, `${location}.reasoning is invalid`);
+	}
+}
+
+function validateMessage(message, location) {
+	assert.ok(isRecord(message), `${location} must be an object`);
+	switch (message.role) {
+		case "user":
+			if (typeof message.content !== "string") {
+				validateContent(message.content, `${location}.content`, new Set(["text", "image"]));
+			}
+			break;
+		case "assistant":
+			validateContent(
+				message.content,
+				`${location}.content`,
+				new Set(["text", "thinking", "toolCall"]),
+			);
+			for (const key of ["api", "provider", "model"]) {
+				assert.equal(typeof message[key], "string", `${location}.${key} is invalid`);
+			}
+			assert.ok(STOP_REASONS.has(message.stopReason), `${location}.stopReason is invalid`);
+			validateUsage(message.usage, `${location}.usage`);
+			break;
+		case "toolResult":
+			assert.equal(typeof message.toolCallId, "string", `${location}.toolCallId is invalid`);
+			assert.equal(typeof message.toolName, "string", `${location}.toolName is invalid`);
+			assert.equal(typeof message.isError, "boolean", `${location}.isError is invalid`);
+			validateContent(message.content, `${location}.content`, new Set(["text", "image"]));
+			break;
+		default:
+			assert.fail(`${location}.role is unsupported`);
 	}
 }
 
@@ -141,19 +264,26 @@ function validateEvent(event, location) {
 			);
 			assert.ok(STOP_REASONS.has(event.stopReason), `${location}.stopReason is invalid`);
 			break;
-		case "tool_execution_start":
+		case "message_start":
+		case "message_end":
 			assert.deepEqual(
 				keys.sort(),
-				["toolCallId", "toolName", "type"],
+				["message", "type"],
+				`${location}.event has unexpected fields`,
+			);
+			validateMessage(event.message, `${location}.event.message`);
+			break;
+		case "tool_execution_start":
+			assert.ok(
+				keys.every((key) => ["args", "toolCallId", "toolName", "type"].includes(key)),
 				`${location}.event has unexpected fields`,
 			);
 			assert.equal(typeof event.toolCallId, "string", `${location}.toolCallId is invalid`);
 			assert.equal(typeof event.toolName, "string", `${location}.toolName is invalid`);
 			break;
 		case "tool_execution_end":
-			assert.deepEqual(
-				keys.sort(),
-				["isError", "toolCallId", "toolName", "type"],
+			assert.ok(
+				keys.every((key) => ["isError", "result", "toolCallId", "toolName", "type"].includes(key)),
 				`${location}.event has unexpected fields`,
 			);
 			assert.equal(typeof event.toolCallId, "string", `${location}.toolCallId is invalid`);
@@ -197,9 +327,24 @@ function validateExpectation(expectation, location) {
 		assert.ok(isRecord(expectation.attributes), `${location}.attributes must be an object`);
 		for (const [key, value] of Object.entries(expectation.attributes)) {
 			assert.ok(EXPECTATION_ATTRIBUTES.has(key), `${location} contains unknown attribute ${key}`);
-			if (key === "tool_name" || key === "lifecycle_attempt_id") {
+			if ([
+				"api",
+				"input_detail",
+				"lifecycle_attempt_id",
+				"model",
+				"output_detail",
+				"provider",
+				"stop_reason",
+				"tool_name",
+			].includes(key)) {
 				assert.equal(typeof value, "string", `${location}.attributes.${key} is invalid`);
-			} else if (key.endsWith("_ms")) {
+			} else if (key === "input" || key === "output") {
+				assert.ok(
+					value === null || typeof value === "string" || typeof value === "number" ||
+					typeof value === "boolean" || Array.isArray(value) || isRecord(value),
+					`${location}.attributes.${key} is invalid`,
+				);
+			} else if (key.endsWith("_ms") || key.endsWith("_tokens") || key === "image_count") {
 				assert.equal(typeof value, "number", `${location}.attributes.${key} is invalid`);
 				assert.ok(Number.isFinite(value) && value >= 0, `${location}.attributes.${key} is invalid`);
 			} else {
@@ -389,24 +534,39 @@ function buildServer() {
 	}
 }
 
-function assistantMessage(stopReason, timestamp) {
+function assistantMessage(stopReason, timestamp, overrides = {}) {
+	const fixtureUsage = overrides.usage ?? {};
 	return {
 		role: "assistant",
-		content: [],
-		api: "fixture-api",
-		provider: "fixture-provider",
-		model: "fixture-model",
+		content: overrides.content ?? [],
+		api: overrides.api ?? "fixture-api",
+		provider: overrides.provider ?? "fixture-provider",
+		model: overrides.model ?? "fixture-model",
 		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
+			input: fixtureUsage.input ?? 0,
+			output: fixtureUsage.output ?? 0,
+			cacheRead: fixtureUsage.cacheRead ?? 0,
+			cacheWrite: fixtureUsage.cacheWrite ?? 0,
+			...(fixtureUsage.reasoning === undefined ? {} : { reasoning: fixtureUsage.reasoning }),
+			totalTokens: fixtureUsage.totalTokens ?? 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
 		timestamp,
 	};
+}
+
+function sdkMessage(message, timestamp) {
+	switch (message.role) {
+		case "user":
+			return { ...message, timestamp };
+		case "assistant":
+			return assistantMessage(message.stopReason, timestamp, message);
+		case "toolResult":
+			return { ...message, timestamp };
+		default:
+			throw new Error(`unsupported fixture message ${message.role}`);
+	}
 }
 
 function sdkEvent(event, timestamp) {
@@ -426,13 +586,13 @@ function sdkEvent(event, timestamp) {
 				message: assistantMessage(event.stopReason, timestamp),
 				toolResults: [],
 			};
+		case "message_start":
+		case "message_end":
+			return { type: event.type, message: sdkMessage(event.message, timestamp) };
 		case "tool_execution_start":
-			return { ...event, args: { privateFixtureArgument: "DO_NOT_SERIALIZE" } };
+			return { ...event, args: event.args ?? {} };
 		case "tool_execution_end":
-			return {
-				...event,
-				result: { privateFixtureResult: "DO_NOT_SERIALIZE" },
-			};
+			return { ...event, result: event.result ?? {} };
 		default:
 			throw new Error(`unsupported fixture event ${event.type}`);
 	}
@@ -550,10 +710,18 @@ async function runScenario(fixture, PiEventMapper, queue) {
 				step.expect[recordIndex],
 				`${fixture.name} step ${index + 1} record ${recordIndex + 1}`,
 			);
-			assert.equal(record.privacy_class, "operator");
-			const serialized = JSON.stringify(record);
-			assert.ok(!serialized.includes("DO_NOT_SERIALIZE"), `${fixture.name} leaked tool payload`);
-			assert.ok(!serialized.includes("headers"), `${fixture.name} leaked provider headers`);
+				assert.equal(record.privacy_class, "operator");
+				const serialized = JSON.stringify(record);
+				assert.ok(!serialized.includes("headers"), `${fixture.name} leaked provider headers`);
+				assert.ok(!serialized.includes("systemPrompt"), `${fixture.name} leaked system prompt`);
+				assert.ok(!serialized.includes("toolSchemas"), `${fixture.name} leaked tool schemas`);
+				if (fixture.name === "normal") {
+					assert.ok(!serialized.includes("safe-image-placeholder"), "normal leaked user image bytes");
+					assert.ok(
+						!serialized.includes("safe hidden fixture reasoning"),
+						"normal duplicated assistant thinking into response evidence",
+					);
+				}
 			queue.client.emit(record);
 			records.push(record);
 		});
@@ -585,12 +753,51 @@ try {
 		[
 			"agent.run:start:running",
 			"agent.turn:start:running",
+			"user.message:observation:emitted",
+			"model.response:start:running",
+			"model.response:end:tool_use",
 			"tool.execution:start:running",
 			"tool.execution:end:completed",
+			"tool.result:observation:completed",
+			"agent.turn:end:tool_use",
+			"agent.turn:start:running",
+			"model.response:start:running",
+			"model.response:end:completed",
 			"agent.turn:end:completed",
 			"agent.run:end:completed",
 		],
 		"normal lifecycle lost causal order",
+	);
+	const user = normal.find((record) => record.kind === "user.message");
+	const models = normal.filter((record) => record.kind === "model.response" && record.phase === "end");
+	const toolStart = normal.find(
+		(record) => record.kind === "tool.execution" && record.phase === "start",
+	);
+	const toolEnd = normal.find(
+		(record) => record.kind === "tool.execution" && record.phase === "end",
+	);
+	const toolResult = normal.find((record) => record.kind === "tool.result");
+	assert.equal(user.attributes.input_detail, "Inspect fixture status");
+	assert.equal(user.attributes.image_count, 1);
+	assert.deepEqual(toolStart.attributes.input, { path: "README.md" });
+	assert.deepEqual(toolEnd.attributes.output, {
+		content: [{ text: "Fixture tool output", type: "text" }],
+		details: { line_count: 4 },
+	});
+	assert.deepEqual(toolResult.attributes.output, toolEnd.attributes.output);
+	assert.equal(models.at(-1).attributes.output_detail, "Fixture final response");
+	assert.deepEqual(
+		Object.fromEntries(
+			["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"]
+				.map((key) => [key, models.at(-1).attributes[key]]),
+		),
+		{
+			input_tokens: 11,
+			output_tokens: 7,
+			cache_read_tokens: 3,
+			cache_write_tokens: 2,
+			total_tokens: 23,
+		},
 	);
 
 	const stalled = results.get("model-stall");

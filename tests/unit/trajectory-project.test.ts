@@ -140,6 +140,126 @@ function records(events: readonly TrajectoryProjectionInput[]) {
 }
 
 describe("projectTrajectory", () => {
+	it("projects redacted user, model, tool, and result details plus model token evidence", () => {
+		const scope = {
+			trace_id: "content-run",
+			turn_id: "content-turn",
+			step_id: "content-step",
+			request_id: "content-request",
+		};
+		const projected = records([
+			envelope(1, "user.message", {
+				phase: "observation",
+				state: "emitted",
+				correlation: scope,
+				attributes: { input_detail: "Inspect fixture", image_count: 1 },
+			}),
+			envelope(2, "model.response", {
+				phase: "start",
+				state: "running",
+				correlation: scope,
+				attributes: {
+					lifecycle_attempt_id: "model-attempt-1",
+					api: "openai-responses",
+					provider: "openai",
+					model: "fixture-model",
+				},
+			}),
+			envelope(3, "model.response", {
+				phase: "end",
+				state: "completed",
+				duration_ms: 25,
+				correlation: scope,
+				attributes: {
+					lifecycle_attempt_id: "model-attempt-1",
+					matched_start: true,
+					output_detail: "Fixture final response",
+					input_tokens: 11,
+					output_tokens: 7,
+					cache_read_tokens: 3,
+					cache_write_tokens: 2,
+					total_tokens: 23,
+				},
+			}),
+			envelope(4, "tool.execution", {
+				phase: "start",
+				state: "running",
+				correlation: { ...scope, tool_call_id: "content-call" },
+				attributes: {
+					lifecycle_attempt_id: "tool-attempt-1",
+					tool_name: "read",
+					input: { path: "README.md", authorization: "[REDACTED]" },
+				},
+			}),
+			envelope(5, "tool.execution", {
+				phase: "end",
+				state: "completed",
+				duration_ms: 5,
+				correlation: { ...scope, tool_call_id: "content-call" },
+				attributes: {
+					lifecycle_attempt_id: "tool-attempt-1",
+					tool_name: "read",
+					matched_start: true,
+					output: { details: { password: "[REDACTED]", lines: 4 } },
+				},
+			}),
+			envelope(6, "tool.result", {
+				phase: "observation",
+				state: "completed",
+				correlation: { ...scope, tool_call_id: "content-call" },
+				attributes: {
+					tool_name: "read",
+					is_error: false,
+					output: { content: [{ type: "text", text: "Fixture tool result" }] },
+				},
+			}),
+		]);
+
+		expect(projected.map((record) => record.kind)).toEqual([
+			"USER",
+			"ASSISTANT",
+			"TOOL",
+			"RESULT",
+		]);
+		expect(projected[0]).toMatchObject({ inputDetail: "Inspect fixture" });
+		expect(projected[1]).toMatchObject({
+			outputDetail: "Fixture final response",
+			durationMs: 25,
+			attributes: {
+				input_tokens: 11,
+				output_tokens: 7,
+				cache_read_tokens: 3,
+				cache_write_tokens: 2,
+				total_tokens: 23,
+			},
+		});
+		expect(projected[2].inputDetail).toContain('"authorization": "[REDACTED]"');
+		expect(projected[2].result).toContain('"password": "[REDACTED]"');
+		expect(projected[3]).toMatchObject({ kind: "RESULT", toolName: "read" });
+		expect(projected[3].result).toContain("Fixture tool result");
+	});
+
+	it("projects a bounded thinking truncation marker into labeled thinking detail", () => {
+		const [record] = records([
+			envelope(1, "provider.thinking", {
+				phase: "end",
+				state: "emitted",
+				attributes: {
+					content: {
+						truncated: true,
+						sha256: "sha256:thinking-marker",
+						original_bytes: 900_000,
+					},
+					content_index: 0,
+				},
+			}),
+		]);
+
+		expect(record).toMatchObject({ kind: "ASSISTANT" });
+		expect(record.thinkingDetail).toContain('"truncated": true');
+		expect(record.thinkingDetail).toContain("sha256:thinking-marker");
+	});
+
 	it("groups the normal fixture by explicit Turn and Step IDs and pairs its tool", () => {
 		const turns = projectTrajectory(fixtureEvents("normal"));
 		const turn = turns.find((candidate) => candidate.turnId === "normal:turn:1");
@@ -150,6 +270,9 @@ describe("projectTrajectory", () => {
 				record.eventKind === "agent.turn" &&
 				record.turnId === "normal:turn:1",
 		);
+		const contentRecords = all.filter((record) =>
+			["user.message", "model.response", "tool.result"].includes(record.eventKind ?? ""),
+		);
 
 		expect(turn?.steps).toHaveLength(1);
 		expect(turn?.steps[0]).toMatchObject({
@@ -159,10 +282,25 @@ describe("projectTrajectory", () => {
 		expect(tool).toMatchObject({
 			kind: "TOOL",
 			state: "completed",
-			durationMs: 50,
+			durationMs: 30,
 			isOpen: false,
-			sourceEventIds: ["normal:event:3", "normal:event:4"],
+			sourceEventIds: ["normal:event:6", "normal:event:7"],
 			parentRecordId: request?.id,
+			inputDetail: expect.stringContaining("README.md"),
+			result: expect.stringContaining("Fixture tool output"),
+		});
+		expect(contentRecords.map((record) => record.kind)).toEqual([
+			"USER",
+			"ASSISTANT",
+			"RESULT",
+			"ASSISTANT",
+		]);
+		expect(contentRecords[0].inputDetail).toBe("Inspect fixture status");
+		expect(contentRecords[1].outputDetail).toBe("Checking fixture.");
+		expect(contentRecords[2].result).toContain("Fixture tool output");
+		expect(contentRecords[3]).toMatchObject({
+			outputDetail: "Fixture final response",
+			attributes: { input_tokens: 11, output_tokens: 7, total_tokens: 23 },
 		});
 	});
 

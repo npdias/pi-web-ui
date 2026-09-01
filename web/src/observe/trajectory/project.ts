@@ -25,7 +25,10 @@ import type {
 const SUPPORTED_EVENT_KINDS = new Set([
 	"agent.run",
 	"agent.turn",
+	"user.message",
+	"model.response",
 	"tool.execution",
+	"tool.result",
 	"provider.thinking",
 	"agent.stall",
 	"agent.reset",
@@ -274,6 +277,12 @@ function recordKind(event: TelemetryEvent): Exclude<TrajectoryRecordKind, "GAP">
 			) as Exclude<TrajectoryRecordKind, "GAP">;
 		case "tool.execution":
 			return terminalKind(event, "TOOL") as Exclude<TrajectoryRecordKind, "GAP">;
+		case "user.message":
+			return "USER";
+		case "model.response":
+			return "ASSISTANT";
+		case "tool.result":
+			return "RESULT";
 		case "provider.thinking":
 			return "ASSISTANT";
 		case "agent.stall":
@@ -295,6 +304,29 @@ function stringAttribute(
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function detailValue(value: TelemetryJson | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string") return value.length === 0 ? undefined : value;
+	return JSON.stringify(value, null, 2);
+}
+
+function detailFields(
+	attributes: Readonly<Record<string, TelemetryJson>>,
+): {
+	readonly inputDetail?: string;
+	readonly outputDetail?: string;
+	readonly result?: string;
+} {
+	const inputDetail = detailValue(attributes.input_detail ?? attributes.input);
+	const outputDetail = detailValue(attributes.output_detail);
+	const result = detailValue(attributes.output);
+	return {
+		...(inputDetail === undefined ? {} : { inputDetail }),
+		...(outputDetail === undefined ? {} : { outputDetail }),
+		...(result === undefined ? {} : { result }),
+	};
+}
+
 function defaultSummary(event: TelemetryEvent): string {
 	const terminal = event.state === undefined ? "updated" : event.state.replaceAll("_", " ");
 	switch (event.kind) {
@@ -302,9 +334,17 @@ function defaultSummary(event: TelemetryEvent): string {
 			return event.phase === "start" ? "Agent run started" : `Agent run ${terminal}`;
 		case "agent.turn":
 			return event.phase === "start" ? "Agent Turn started" : `Agent Turn ${terminal}`;
+		case "user.message":
+			return "User message";
+		case "model.response":
+			return event.phase === "start" ? "Model response started" : `Model response ${terminal}`;
 		case "tool.execution": {
 			const tool = stringAttribute(event.attributes, "tool_name") ?? "Tool";
 			return event.phase === "start" ? `${tool} started` : `${tool} ${terminal}`;
+		}
+		case "tool.result": {
+			const tool = stringAttribute(event.attributes, "tool_name") ?? "Tool";
+			return `${tool} result ${terminal}`;
 		}
 		case "provider.thinking":
 			return "Provider thinking";
@@ -465,6 +505,7 @@ function openAttemptRecord(
 		severity: event.severity,
 		source: event.source,
 		attributes: event.attributes,
+		...detailFields(event.attributes),
 		attemptOrdinal: ordinal,
 		attemptOrdinalKnown: false,
 		closureUnknown: false,
@@ -490,9 +531,11 @@ function mergeOpenAttemptEvidence(
 	record: TelemetryTrajectoryRecord,
 	events: readonly TelemetryEvent[],
 ): TelemetryTrajectoryRecord {
+	const attributes = mergedAttributes(events);
 	return {
 		...record,
-		attributes: mergedAttributes(events),
+		attributes,
+		...detailFields(attributes),
 		diagnostic: diagnosticEvidence(
 			events,
 			record.diagnostic || record.identityReuse || record.terminalConflict,
@@ -518,6 +561,7 @@ function settleAttempt(
 		isError: eventIsError(terminal),
 		severity: event.severity,
 		attributes,
+		...detailFields(attributes),
 		closureUnknown: false,
 		gapTainted: false,
 		gapEvidence: [],
@@ -577,6 +621,7 @@ function reconcileTerminalBeforeStart(
 		isError: eventIsError(normalizedTerminal),
 		severity: terminal.severity,
 		attributes,
+		...detailFields(attributes),
 		closureUnknown: false,
 		gapTainted: false,
 		gapEvidence: [],
@@ -639,6 +684,7 @@ function terminalOnlyAttempt(
 		severity: event.severity,
 		source: event.source,
 		attributes: event.attributes,
+		...detailFields(event.attributes),
 		attemptOrdinal: ordinal,
 		attemptOrdinalKnown: false,
 		closureUnknown,
@@ -660,6 +706,9 @@ function terminalOnlyAttempt(
 
 function standaloneEventRecord(event: TelemetryEvent): TelemetryTrajectoryRecord {
 	const toolName = stringAttribute(event.attributes, "tool_name");
+	const thinkingDetail = event.kind === "provider.thinking"
+		? detailValue(event.attributes.content)
+		: undefined;
 	return {
 		id: eventRecordId(event),
 		index: 0,
@@ -673,6 +722,7 @@ function standaloneEventRecord(event: TelemetryEvent): TelemetryTrajectoryRecord
 		severity: event.severity,
 		source: event.source,
 		attributes: event.attributes,
+		...detailFields(event.attributes),
 		attemptOrdinalKnown: false,
 		closureUnknown: false,
 		gapTainted: false,
@@ -688,10 +738,7 @@ function standaloneEventRecord(event: TelemetryEvent): TelemetryTrajectoryRecord
 		...scopeFields(event.correlation),
 		...(event.phase === "start" ? { startedAt: event.observed_at } : {}),
 		...(event.phase === "end" ? { endedAt: event.observed_at } : {}),
-		...(event.kind === "provider.thinking" &&
-			stringAttribute(event.attributes, "content") !== undefined
-			? { thinkingDetail: stringAttribute(event.attributes, "content") }
-			: {}),
+		...(thinkingDetail === undefined ? {} : { thinkingDetail }),
 		...(toolName === undefined ? {} : { toolName }),
 	};
 }

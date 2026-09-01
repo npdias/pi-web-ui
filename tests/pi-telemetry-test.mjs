@@ -73,7 +73,7 @@ function tickAt(callback, nowMs) {
 	}
 }
 
-function assistantMessage(content, stopReason, timestamp) {
+function assistantMessage(content, stopReason, timestamp, usageOverrides = {}) {
 	return {
 		role: "assistant",
 		content,
@@ -81,11 +81,14 @@ function assistantMessage(content, stopReason, timestamp) {
 		provider: "fixture-provider",
 		model: "fixture-model",
 		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
+			input: usageOverrides.input ?? 0,
+			output: usageOverrides.output ?? 0,
+			cacheRead: usageOverrides.cacheRead ?? 0,
+			cacheWrite: usageOverrides.cacheWrite ?? 0,
+			...(usageOverrides.reasoning === undefined
+				? {}
+				: { reasoning: usageOverrides.reasoning }),
+			totalTokens: usageOverrides.totalTokens ?? 0,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason,
@@ -99,21 +102,38 @@ function emitFixture(session, toolCallId) {
 		"pending",
 		1_000,
 	);
-	const finished = assistantMessage(
-		[{ type: "text", text: "fixture answer" }],
-		"stop",
+	const toolUse = assistantMessage(
+		[
+			{ type: "thinking", thinking: "fixture thought" },
+			{ type: "text", text: "checking fixture" },
+			{ type: "toolCall", id: toolCallId, name: "fixture_tool", arguments: { path: "README.md" } },
+		],
+		"toolUse",
 		1_001,
+		{ input: 5, output: 3, cacheRead: 1, cacheWrite: 0, reasoning: 2, totalTokens: 9 },
 	);
 	const toolResult = {
 		role: "toolResult",
 		toolCallId,
 		toolName: "fixture_tool",
-		content: [{ type: "text", text: "PRIVATE_TOOL_RESULT" }],
+		content: [{ type: "text", text: "fixture tool output" }],
+		details: { line_count: 4 },
 		isError: false,
 		timestamp: 1_002,
 	};
+	const finished = assistantMessage(
+		[{ type: "text", text: "fixture final response" }],
+		"stop",
+		1_003,
+		{ input: 11, output: 7, cacheRead: 3, cacheWrite: 2, reasoning: 4, totalTokens: 23 },
+	);
 	session._emit({ type: "agent_start" });
 	session._emit({ type: "turn_start" });
+	session._emit({
+		type: "message_end",
+		message: { role: "user", content: "inspect fixture status", timestamp: 999 },
+	});
+	session._emit({ type: "message_start", message: assistantMessage([], "pending", 1_000) });
 	session._emit({
 		type: "message_update",
 		message: thinking,
@@ -124,20 +144,26 @@ function emitFixture(session, toolCallId) {
 			partial: thinking,
 		},
 	});
+	session._emit({ type: "message_end", message: toolUse });
 	session._emit({
 		type: "tool_execution_start",
 		toolCallId,
 		toolName: "fixture_tool",
-		args: { secret: "PRIVATE_TOOL_ARGUMENT" },
+		args: { path: "README.md" },
 	});
 	session._emit({
 		type: "tool_execution_end",
 		toolCallId,
 		toolName: "fixture_tool",
-		result: { content: toolResult.content, details: {} },
+		result: { content: toolResult.content, details: toolResult.details },
 		isError: false,
 	});
-	session._emit({ type: "turn_end", message: finished, toolResults: [toolResult] });
+	session._emit({ type: "message_end", message: toolResult });
+	session._emit({ type: "turn_end", message: toolUse, toolResults: [toolResult] });
+	session._emit({ type: "turn_start" });
+	session._emit({ type: "message_start", message: assistantMessage([], "pending", 1_003) });
+	session._emit({ type: "message_end", message: finished });
+	session._emit({ type: "turn_end", message: finished, toolResults: [] });
 	session._emit({ type: "agent_end", messages: [finished], willRetry: false });
 }
 
@@ -580,13 +606,13 @@ try {
 	emitFixture(client.session, "normal-tool");
 	await wire.next("tool_status", (message) => message.toolCallId === "normal-tool");
 	await waitFor(
-		() => records.slice(normalOffset).filter((record) => record.kind !== "context.changed").length >= 7,
+		() => records.slice(normalOffset).filter((record) => record.kind !== "context.changed").length >= 15,
 		"ordered telemetry records",
 	);
 	const normalRecords = records
 		.slice(normalOffset)
 		.filter((record) => record.kind !== "context.changed")
-		.slice(0, 7);
+		.slice(0, 15);
 	const normalContextRecord = records
 		.slice(normalOffset)
 		.find((record) => record.kind === "context.changed");
@@ -597,9 +623,17 @@ try {
 	const expectedOrder = [
 		"agent.run:start",
 		"agent.turn:start",
+		"user.message:observation",
+		"model.response:start",
 		"provider.thinking:end",
+		"model.response:end",
 		"tool.execution:start",
 		"tool.execution:end",
+		"tool.result:observation",
+		"agent.turn:end",
+		"agent.turn:start",
+		"model.response:start",
+		"model.response:end",
 		"agent.turn:end",
 		"agent.run:end",
 	];
@@ -615,12 +649,30 @@ try {
 		record.source.instance_id !== "fixture-agent")) {
 		throw new Error("normal telemetry metadata mismatch");
 	}
-	const serializedNormal = JSON.stringify(normalRecords);
+	const userRecord = normalRecords.find((record) => record.kind === "user.message");
+	const modelRecords = normalRecords.filter((record) => record.kind === "model.response");
+	const finalModel = modelRecords.find((record) => record.phase === "end" && record.state === "completed");
+	const toolStartRecord = normalRecords.find(
+		(record) => record.kind === "tool.execution" && record.phase === "start",
+	);
+	const toolEndRecord = normalRecords.find(
+		(record) => record.kind === "tool.execution" && record.phase === "end",
+	);
+	const toolResultRecord = normalRecords.find((record) => record.kind === "tool.result");
+	const thinkingRecord = normalRecords.find((record) => record.kind === "provider.thinking");
 	if (
-		serializedNormal.includes("PRIVATE_TOOL_ARGUMENT") ||
-		serializedNormal.includes("PRIVATE_TOOL_RESULT")
+		userRecord?.attributes.input_detail !== "inspect fixture status" ||
+		JSON.stringify(toolStartRecord?.attributes.input) !== JSON.stringify({ path: "README.md" }) ||
+		toolEndRecord?.attributes.output?.details?.line_count !== 4 ||
+		toolResultRecord?.attributes.output?.details?.line_count !== 4 ||
+		finalModel?.attributes.output_detail !== "fixture final response" ||
+		finalModel?.attributes.input_tokens !== 11 ||
+		finalModel?.attributes.output_tokens !== 7 ||
+		finalModel?.attributes.total_tokens !== 23 ||
+		thinkingRecord?.attributes.content !== "fixture thought" ||
+		modelRecords.some((record) => JSON.stringify(record).includes("fixture thought"))
 	) {
-		throw new Error("telemetry exposed tool payload content");
+		throw new Error("normal telemetry content, token, or thinking separation mismatch");
 	}
 	wire.send({ type: "get_state" });
 	const projectedSnapshot = await wire.next("snapshot");
@@ -985,7 +1037,7 @@ try {
 			type: "tool_execution_start",
 			toolCallId,
 			toolName,
-			args: { private: forcedResetReason },
+			args: { path: "README.md" },
 		});
 	}
 	await waitFor(
@@ -1178,7 +1230,7 @@ try {
 		throw new Error("server shutdown did not dispose conversation and shared telemetry");
 	}
 	console.log("PASS shutdown disposes saturated shared telemetry client");
-	console.log("PASS normal zero-token telemetry fixture");
+	console.log("PASS normal telemetry content fixture");
 } catch (error) {
 	exitCode = 1;
 	console.error(`FAIL ${error.stack ?? error}`);

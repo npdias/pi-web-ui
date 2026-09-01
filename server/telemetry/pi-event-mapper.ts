@@ -26,6 +26,7 @@ export interface PiEventMapperOptions {
 	wallNow?: () => number;
 	monotonicNow?: () => number;
 	stallThresholdMs?: number;
+	onFailure?: (reason: "invalid_context_schema") => void;
 }
 
 interface SpanCorrelation {
@@ -55,10 +56,19 @@ interface ToolSpan {
 	toolName: string;
 }
 
+interface ModelSpan {
+	attemptId: string;
+	correlation: SpanCorrelation;
+	startedAt: number;
+}
+
 interface FinalState {
 	state: string;
 	severity: TelemetrySeverity;
 }
+
+const MAX_STRUCTURED_DETAIL_BYTES = 256 * 1024;
+const MAX_TEXT_DETAIL_BYTES = 768 * 1024;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -297,6 +307,9 @@ function isSupportedEvent(value: unknown): value is AgentSessionEvent {
 			);
 		case "turn_end":
 			return isAgentMessage(value.message) && isDenseArrayOf(value.toolResults, isToolResultMessage);
+		case "message_start":
+		case "message_end":
+			return isAgentMessage(value.message);
 		case "tool_execution_start":
 			return (
 				typeof value.toolCallId === "string" &&
@@ -391,26 +404,212 @@ function hasJsonToolSchemas(context: PiTelemetryContext): boolean {
 	}
 }
 
-function stableValue(value: unknown, seen = new Set<object>()): JsonValue {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-	if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
-	if (typeof value === "bigint") return value.toString();
-	if (Array.isArray(value)) return value.map((item) => stableValue(item, seen));
-	if (typeof value !== "object") return String(value);
-	if (seen.has(value)) return "[Circular]";
-	seen.add(value);
-	const normalized: { [key: string]: JsonValue } = {};
-	for (const key of Object.keys(value).sort()) {
-		const field = (value as Record<string, unknown>)[key];
-		if (field === undefined || typeof field === "function" || typeof field === "symbol") continue;
-		normalized[key] = stableValue(field, seen);
+type CanonicalJsonFrame =
+	| { kind: "value"; value: unknown }
+	| { kind: "text"; value: string }
+	| { kind: "leave"; value: object };
+
+interface CanonicalJsonResult {
+	sha256: string;
+	originalBytes: number;
+	serialized?: string;
+}
+
+function jsonPrimitive(value: unknown): string | undefined {
+	if (value === null || typeof value === "string" || typeof value === "boolean") {
+		return JSON.stringify(value);
 	}
-	seen.delete(value);
-	return normalized;
+	if (typeof value === "number") {
+		return JSON.stringify(Number.isFinite(value) ? value : String(value));
+	}
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
+	if (typeof value !== "object") return JSON.stringify(String(value));
+	return undefined;
+}
+
+function canonicalJson(value: unknown, retainThroughBytes: number): CanonicalJsonResult {
+	const digest = createHash("sha256");
+	let originalBytes = 0;
+	let retained: string[] | undefined = [];
+	const append = (text: string) => {
+		digest.update(text);
+		originalBytes += Buffer.byteLength(text, "utf8");
+		if (!retained) return;
+		if (originalBytes > retainThroughBytes) {
+			retained = undefined;
+			return;
+		}
+		retained.push(text);
+	};
+	const ancestors = new Set<object>();
+	const stack: CanonicalJsonFrame[] = [{ kind: "value", value }];
+	while (stack.length > 0) {
+		const frame = stack.pop();
+		if (!frame) break;
+		if (frame.kind === "text") {
+			append(frame.value);
+			continue;
+		}
+		if (frame.kind === "leave") {
+			ancestors.delete(frame.value);
+			continue;
+		}
+		const primitive = jsonPrimitive(frame.value);
+		if (primitive !== undefined) {
+			append(primitive);
+			continue;
+		}
+		const object = frame.value as object;
+		if (ancestors.has(object)) {
+			append(JSON.stringify("[Circular]"));
+			continue;
+		}
+		if (Array.isArray(object)) {
+			ancestors.add(object);
+			append("[");
+			stack.push({ kind: "leave", value: object });
+			stack.push({ kind: "text", value: "]" });
+			for (let index = object.length - 1; index >= 0; index--) {
+				let item: unknown = null;
+				try {
+					const descriptor = Object.getOwnPropertyDescriptor(object, String(index));
+					if (descriptor && "value" in descriptor) item = descriptor.value;
+				} catch {
+					item = "[Unserializable]";
+				}
+				stack.push({ kind: "value", value: item });
+				if (index > 0) stack.push({ kind: "text", value: "," });
+			}
+			continue;
+		}
+		let entries: Array<readonly [string, unknown]> = [];
+		try {
+			entries = Object.keys(object)
+				.sort()
+				.flatMap((key) => {
+					const descriptor = Object.getOwnPropertyDescriptor(object, key);
+					if (!descriptor || !("value" in descriptor)) return [];
+					const field = descriptor.value;
+					return field === undefined || typeof field === "function" || typeof field === "symbol"
+						? []
+						: [[key, field] as const];
+				});
+		} catch {
+			append(JSON.stringify("[Unserializable]"));
+			continue;
+		}
+		ancestors.add(object);
+		append("{");
+		stack.push({ kind: "leave", value: object });
+		stack.push({ kind: "text", value: "}" });
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const [key, field] = entries[index];
+			stack.push({ kind: "value", value: field });
+			stack.push({ kind: "text", value: ":" });
+			stack.push({ kind: "text", value: JSON.stringify(key) });
+			if (index > 0) stack.push({ kind: "text", value: "," });
+		}
+	}
+	return {
+		sha256: `sha256:${digest.digest("hex")}`,
+		originalBytes,
+		...(retained ? { serialized: retained.join("") } : {}),
+	};
 }
 
 function hash(value: unknown): string {
-	return `sha256:${createHash("sha256").update(JSON.stringify(stableValue(value))).digest("hex")}`;
+	return canonicalJson(value, 0).sha256;
+}
+
+function truncationMarker(serialized: string): JsonValue {
+	return {
+		truncated: true,
+		sha256: `sha256:${createHash("sha256").update(serialized).digest("hex")}`,
+		original_bytes: Buffer.byteLength(serialized, "utf8"),
+	};
+}
+
+function boundedStructured(value: unknown): JsonValue {
+	const result = canonicalJson(value, MAX_STRUCTURED_DETAIL_BYTES);
+	return result.serialized === undefined
+		? {
+			truncated: true,
+			sha256: result.sha256,
+			original_bytes: result.originalBytes,
+		}
+		: JSON.parse(result.serialized) as JsonValue;
+}
+
+function boundedText(value: string): JsonValue {
+	return Buffer.byteLength(JSON.stringify(value), "utf8") <= MAX_TEXT_DETAIL_BYTES
+		? value
+		: truncationMarker(value);
+}
+
+function textContent(message: unknown): string {
+	if (!isRecord(message)) return "";
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter(isTextBlock)
+		.map((block) => (block as { text: string }).text)
+		.join("\n");
+}
+
+function imageCount(message: unknown): number {
+	if (!isRecord(message) || !Array.isArray(message.content)) return 0;
+	return message.content.filter(isImageBlock).length;
+}
+
+function assistantMetadata(message: AssistantMessageShape): { [key: string]: JsonValue } {
+	return {
+		api: message.api,
+		provider: message.provider,
+		model: message.model,
+	};
+}
+
+interface AssistantMessageShape {
+	api: string;
+	provider: string;
+	model: string;
+	usage: {
+		input: number;
+		output: number;
+		cacheRead: number;
+		cacheWrite: number;
+		cacheWrite1h?: number;
+		reasoning?: number;
+		totalTokens: number;
+	};
+	stopReason: string;
+}
+
+function assistantUsage(message: AssistantMessageShape): { [key: string]: JsonValue } {
+	const usage = message.usage;
+	return {
+		input_tokens: usage.input,
+		output_tokens: usage.output,
+		cache_read_tokens: usage.cacheRead,
+		cache_write_tokens: usage.cacheWrite,
+		...(isFiniteNumber(usage.cacheWrite1h)
+			? { cache_write_1h_tokens: usage.cacheWrite1h }
+			: {}),
+		...(isFiniteNumber(usage.reasoning) ? { reasoning_tokens: usage.reasoning } : {}),
+		total_tokens: usage.totalTokens,
+	};
+}
+
+function toolResultOutput(message: unknown): JsonValue {
+	if (!isRecord(message)) return null;
+	return boundedStructured({
+		content: message.content,
+		...(Object.hasOwn(message, "details") ? { details: message.details } : {}),
+		...(Object.hasOwn(message, "usage") ? { usage: message.usage } : {}),
+		...(Object.hasOwn(message, "addedToolNames")
+			? { added_tool_names: message.addedToolNames }
+			: {}),
+	});
 }
 
 function assistantStopReason(message: unknown): string | undefined {
@@ -459,13 +658,16 @@ export class PiEventMapper {
 	private readonly wallNow: () => number;
 	private readonly monotonicNow: () => number;
 	private readonly stallThresholdMs: number;
+	private readonly onFailure?: (reason: "invalid_context_schema") => void;
 	private runSequence = 0;
 	private turnSequence = 0;
 	private runAttemptSequence = 0;
 	private turnAttemptSequence = 0;
 	private toolAttemptSequence = 0;
+	private modelAttemptSequence = 0;
 	private currentRun: RunSpan | null = null;
 	private currentTurn: TurnSpan | null = null;
+	private currentModelResponse: ModelSpan | null = null;
 	private readonly toolStarts = new Map<string, ToolSpan>();
 	private contextHashes: { systemPrompt: string; toolSchemas: string } | null = null;
 	private lastEventAt: number | null = null;
@@ -481,13 +683,24 @@ export class PiEventMapper {
 		this.wallNow = options.wallNow ?? Date.now;
 		this.monotonicNow = options.monotonicNow ?? (() => performance.now());
 		this.stallThresholdMs = options.stallThresholdMs ?? 180_000;
+		this.onFailure = options.onFailure;
 	}
 
 	map(event: AgentSessionEvent, context?: PiTelemetryContext): PiTelemetryRecord[] {
 		if (this.disposed) return [];
 		if (!isSupportedEvent(event)) return [];
-		const validatedContext = isTelemetryContextShape(context) ? context : undefined;
-		if (validatedContext && !hasJsonToolSchemas(validatedContext)) return [];
+		let validatedContext: PiTelemetryContext | undefined;
+		if (context !== undefined) {
+			if (isTelemetryContextShape(context) && hasJsonToolSchemas(context)) {
+				validatedContext = context;
+			} else {
+				try {
+					this.onFailure?.("invalid_context_schema");
+				} catch {
+					// Telemetry-health reporting cannot interrupt Pi lifecycle mapping.
+				}
+			}
+		}
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
 		this.recordActivity(wallTime);
@@ -519,6 +732,15 @@ export class PiEventMapper {
 						request_id: `${this.idNamespace}:request:${sequence}`,
 					},
 					attemptId: `${this.idNamespace}:turn-attempt:${++this.turnAttemptSequence}`,
+					startedAt: monotonicTime,
+				};
+			}
+		} else if (event.type === "message_start" && event.message.role === "assistant") {
+			duplicateStart = this.currentModelResponse !== null;
+			if (!this.currentModelResponse) {
+				this.currentModelResponse = {
+					attemptId: `${this.idNamespace}:model-attempt:${++this.modelAttemptSequence}`,
+					correlation: this.currentSpan(),
 					startedAt: monotonicTime,
 				};
 			}
@@ -572,6 +794,7 @@ export class PiEventMapper {
 					}),
 				);
 				this.currentTurn = null;
+				this.currentModelResponse = null;
 				this.toolStarts.clear();
 				if (event.willRetry && this.currentRun) {
 					this.currentRun.attemptId =
@@ -626,6 +849,101 @@ export class PiEventMapper {
 				this.currentTurn = null;
 				break;
 			}
+			case "message_start": {
+				if (event.message.role !== "assistant") break;
+				const response = this.currentModelResponse;
+				const span = response?.correlation ?? this.currentSpan();
+				records.push(
+					this.record({
+						kind: "model.response",
+						phase: "start",
+						state: "running",
+						severity: "info",
+						wallTime,
+						parentId: span.request_id ?? span.trace_id ?? this.sessionId,
+						span,
+						attributes: {
+							lifecycle_attempt_id: response?.attemptId ??
+								`${this.idNamespace}:model-attempt:${++this.modelAttemptSequence}`,
+							...assistantMetadata(event.message),
+							...(duplicateStart ? { duplicate_start: true } : {}),
+						},
+					}),
+				);
+				break;
+			}
+			case "message_end": {
+				if (event.message.role === "user") {
+					const span = this.currentSpan();
+					records.push(
+						this.record({
+							kind: "user.message",
+							phase: "observation",
+							state: "emitted",
+							severity: "info",
+							wallTime,
+							parentId: span.request_id ?? span.trace_id ?? this.sessionId,
+							span,
+							attributes: {
+								input_detail: boundedText(textContent(event.message)),
+								image_count: imageCount(event.message),
+							},
+						}),
+					);
+					break;
+				}
+				if (event.message.role === "assistant") {
+					const response = this.currentModelResponse;
+					const span = response?.correlation ?? this.currentSpan();
+					const attemptId = response?.attemptId ??
+						`${this.idNamespace}:model-attempt:${++this.modelAttemptSequence}`;
+					const outcome = finalState(event.message.stopReason);
+					records.push(
+						this.record({
+							kind: "model.response",
+							phase: "end",
+							...outcome,
+							wallTime,
+							parentId: span.request_id ?? span.trace_id ?? this.sessionId,
+							span,
+							durationMs: response
+								? Math.max(0, monotonicTime - response.startedAt)
+								: undefined,
+							attributes: {
+								lifecycle_attempt_id: attemptId,
+								matched_start: response !== null,
+								...assistantMetadata(event.message),
+								output_detail: boundedText(textContent(event.message)),
+								...assistantUsage(event.message),
+								stop_reason: event.message.stopReason,
+							},
+						}),
+					);
+					this.currentModelResponse = null;
+					break;
+				}
+				if (event.message.role === "toolResult") {
+					const span = this.currentSpan();
+					records.push(
+						this.record({
+							kind: "tool.result",
+							phase: "observation",
+							state: event.message.isError ? "error" : "completed",
+							severity: event.message.isError ? "error" : "info",
+							wallTime,
+							parentId: span.request_id ?? span.trace_id ?? this.sessionId,
+							span,
+							toolCallId: event.message.toolCallId,
+							attributes: {
+								tool_name: event.message.toolName,
+								is_error: event.message.isError,
+								output: toolResultOutput(event.message),
+							},
+						}),
+					);
+				}
+				break;
+			}
 			case "tool_execution_start": {
 				const existing = this.toolStarts.get(event.toolCallId);
 				const span: ToolSpan = existing ?? {
@@ -648,6 +966,7 @@ export class PiEventMapper {
 						attributes: {
 							lifecycle_attempt_id: span.attemptId,
 							tool_name: event.toolName,
+							input: boundedStructured(event.args),
 							...(existing ? { duplicate_start: true } : {}),
 						},
 					}),
@@ -678,6 +997,7 @@ export class PiEventMapper {
 							tool_name: event.toolName,
 							is_error: event.isError,
 							matched_start: started !== undefined,
+							output: boundedStructured(event.result),
 						},
 					}),
 				);
@@ -697,7 +1017,7 @@ export class PiEventMapper {
 						parentId: span.request_id ?? span.trace_id ?? this.sessionId,
 						span,
 						attributes: {
-							content: update.content,
+							content: boundedText(update.content),
 							content_index: update.contentIndex,
 						},
 					}),
@@ -759,6 +1079,29 @@ export class PiEventMapper {
 		const wallTime = this.wallNow();
 		const monotonicTime = this.monotonicNow();
 		const records: PiTelemetryRecord[] = [];
+		if (this.currentModelResponse) {
+			const model = this.currentModelResponse;
+			records.push(
+				this.record({
+					kind: "model.response",
+					phase: "end",
+					state: "cancelled",
+					severity: "warning",
+					wallTime,
+					parentId:
+						model.correlation.request_id ??
+						model.correlation.trace_id ??
+						this.sessionId,
+					span: model.correlation,
+					durationMs: Math.max(0, monotonicTime - model.startedAt),
+					attributes: {
+						cause_class: "forced_reset",
+						lifecycle_attempt_id: model.attemptId,
+						matched_start: true,
+					},
+				}),
+			);
+		}
 		for (const [toolCallId, tool] of this.toolStarts) {
 			records.push(
 				this.record({
@@ -855,6 +1198,7 @@ export class PiEventMapper {
 	private clearOpenSpans(): void {
 		this.currentRun = null;
 		this.currentTurn = null;
+		this.currentModelResponse = null;
 		this.toolStarts.clear();
 		this.lastEventAt = null;
 		this.stallObserved = false;
